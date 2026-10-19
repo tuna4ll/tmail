@@ -13,6 +13,7 @@ pub struct Delivery {
     pub mail: Mail,
     pub command: Vec<String>,
     pub account: String,
+    pub remote: Option<crate::remote::RemoteConfig>,
 }
 
 impl Delivery {
@@ -44,6 +45,7 @@ impl Delivery {
             mail,
             command,
             account,
+            remote: None,
         })
     }
 
@@ -89,16 +91,39 @@ impl Delivery {
                     "Message was rejected. Correct the message before sending another copy.".into(),
                 );
             }
-            State::Sent => {}
+            State::Sent | State::CopyingSent | State::CopiedSent => {}
             _ => {
                 journal.transition(State::Sending, None)?;
-                if let Err(error) = sender::send(&self.command, &contents).await {
+                let sent = match &self.remote {
+                    Some(remote) => sender::send_smtp(remote.clone(), contents.clone()).await,
+                    None => sender::send(&self.command, &contents).await,
+                };
+                if let Err(error) = sent {
                     journal.transition(State::Failed(error.kind), Some(error.to_string()))?;
                     return Err(format!("Send failed: {error}. Message remains in Outbox."));
                 }
                 journal.transition(State::Sent, None).map_err(|error| {
                     format!("Message sent, but {error}. Check delivery before retrying.")
                 })?;
+            }
+        }
+        if let Some(remote) = &self.remote
+            && journal.record.state != State::CopiedSent
+        {
+            let allow_append = journal.record.state != State::CopyingSent;
+            journal.transition(State::CopyingSent, None)?;
+            let remote = remote.clone();
+            let copy = contents.clone();
+            let result = tokio::task::spawn_blocking(move || crate::imap_client::copy_sent(&remote, &copy, allow_append))
+                    .await.map_err(|_| "Message sent; remote Sent-copy worker stopped. Retry will check the remote folder.")?;
+            match result {
+                Ok(()) => journal.transition(State::CopiedSent, None)?,
+                Err(error) => {
+                    if !error.uncertain && allow_append {
+                        journal.transition(State::Sent, Some(error.message.clone()))?;
+                    }
+                    return Err(format!("Message sent. {}", error.message));
+                }
             }
         }
         self.source.mark_sent(&self.mail)

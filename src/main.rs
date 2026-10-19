@@ -2,10 +2,12 @@ mod config;
 mod delivery;
 mod doctor;
 mod draft;
+mod imap_client;
 mod mail;
 mod mailbox;
 mod message;
 mod outbox;
+mod remote;
 mod sender;
 mod storage;
 mod theme;
@@ -71,6 +73,19 @@ async fn main() -> color_eyre::Result<()> {
         .or_else(|| config.maildir.clone().map(MailboxSource::Maildir))
         .unwrap_or(MailboxSource::Demo);
 
+    if config.remote.is_some()
+        && let Some(root) = &config.maildir
+    {
+        imap_client::initialize(root).map_err(color_eyre::eyre::Error::msg)?;
+    }
+    for account in &config.accounts {
+        if account.remote.is_some()
+            && let Some(root) = &account.maildir
+        {
+            imap_client::initialize(root).map_err(color_eyre::eyre::Error::msg)?;
+        }
+    }
+
     let terminal = ratatui::init();
 
     execute!(stdout(), EnableMouseCapture)?;
@@ -100,6 +115,10 @@ pub struct App {
     delivery_tx: mpsc::UnboundedSender<String>,
     delivery_rx: mpsc::UnboundedReceiver<String>,
     sending: bool,
+    sync_tx: mpsc::UnboundedSender<(String, Result<String, String>)>,
+    sync_rx: mpsc::UnboundedReceiver<(String, Result<String, String>)>,
+    syncing: bool,
+    last_sync: Option<(String, std::time::Instant)>,
     spinner_tick: u64,
     skipped: usize,
     query: String,
@@ -240,6 +259,7 @@ impl App {
     pub fn new(source: MailboxSource, config: Config) -> Self {
         let (load_tx, load_rx) = mpsc::unbounded_channel();
         let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
+        let (sync_tx, sync_rx) = mpsc::unbounded_channel();
         let account_label = config
             .accounts
             .get(config.active_account_index())
@@ -262,6 +282,10 @@ impl App {
             delivery_tx,
             delivery_rx,
             sending: false,
+            sync_tx,
+            sync_rx,
+            syncing: false,
+            last_sync: None,
             spinner_tick: 0,
             skipped: 0,
             query: String::new(),
@@ -294,7 +318,20 @@ impl App {
                         self.spinner_tick = self.spinner_tick.wrapping_add(1);
                     }
                 }
-                _ = mailbox_sync.tick() => self.check_mailbox_changes(),
+                _ = mailbox_sync.tick() => {
+                    self.check_mailbox_changes();
+                    self.sync_if_due();
+                },
+                result = self.sync_rx.recv() => {
+                    if let Some((account, result)) = result {
+                        self.syncing = false;
+                        if self.config.delivery_identity() == account
+                            && matches!(&self.source, MailboxSource::Maildir(root) if self.config.maildir.as_ref() == Some(root)) {
+                            self.notice = Some(result.unwrap_or_else(|error| format!("Sync failed · {error}")));
+                            self.reload();
+                        }
+                    }
+                }
                 result = self.load_rx.recv() => {
                     if let Some(result) = result {
                         self.apply_load(result);
@@ -1350,6 +1387,7 @@ impl App {
             }
         };
         self.start_delivery(delivery::Delivery {
+            remote: None,
             source,
             mail,
             command,
@@ -1371,6 +1409,7 @@ impl App {
             Ok((source, command, account)) => {
                 self.overlay = Some(Overlay::DeliveryReview {
                     delivery: delivery::Delivery {
+                        remote: None,
                         source,
                         mail,
                         command,
@@ -1406,21 +1445,89 @@ impl App {
                     .maildir
                     .clone()
                     .ok_or("Message account has no Maildir.")?;
+                let mut config = self.config.clone();
+                let index = config
+                    .accounts
+                    .iter()
+                    .position(|candidate| candidate.id == account.id)
+                    .unwrap();
+                config.activate(index);
                 Ok((
                     MailboxSource::Maildir(root),
                     account.send_command.clone(),
-                    format!(
-                        "{}:{}",
-                        account.id,
-                        account.email.as_deref().unwrap_or_default()
-                    ),
+                    config.delivery_identity(),
                 ))
             }
             MailboxSource::Demo => Err("Open a Maildir account before sending.".into()),
         }
     }
 
-    fn start_delivery(&mut self, delivery: delivery::Delivery) {
+    fn sync_if_due(&mut self) {
+        let Some(remote) = &self.config.remote else {
+            return;
+        };
+        let identity = self.config.delivery_identity();
+        let due = match &self.last_sync {
+            Some((account, time)) if account == &identity => {
+                remote.sync_interval_secs > 0
+                    && time.elapsed().as_secs() >= remote.sync_interval_secs
+            }
+            _ => true,
+        };
+        if due {
+            self.start_sync();
+        }
+    }
+
+    fn start_sync(&mut self) {
+        if self.syncing {
+            return;
+        }
+        let Some(remote) = self.config.remote.clone() else {
+            self.notice = Some("This account has no IMAP connection.".into());
+            return;
+        };
+        let MailboxSource::Maildir(root) = &self.source else {
+            return;
+        };
+        if self.config.maildir.as_ref() != Some(root) {
+            return;
+        }
+        let root = root.clone();
+        let identity = self.config.delivery_identity();
+        self.last_sync = Some((identity.clone(), std::time::Instant::now()));
+        self.syncing = true;
+        self.notice = Some("Syncing…".into());
+        let sender = self.sync_tx.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || imap_client::sync(&remote, &root))
+                .await
+                .unwrap_or_else(|_| Err("Sync worker stopped.".into()));
+            let _ = sender.send((identity, result));
+        });
+    }
+
+    fn start_delivery(&mut self, mut delivery: delivery::Delivery) {
+        let mut config = self.config.clone();
+        if config.delivery_identity() != delivery.account {
+            for index in 0..config.accounts.len() {
+                config.activate(index);
+                if config.delivery_identity() == delivery.account {
+                    break;
+                }
+            }
+        }
+        if config.delivery_identity() != delivery.account {
+            self.notice = Some("Message account is no longer configured.".into());
+            return;
+        }
+        if config.remote.is_some()
+            && !matches!(&delivery.source, MailboxSource::Maildir(root) if config.maildir.as_ref() == Some(root))
+        {
+            self.notice = Some("Select the configured account before sending through SMTP.".into());
+            return;
+        }
+        delivery.remote = config.remote;
         self.sending = true;
         self.notice = Some("Sending message…".into());
         let sender = self.delivery_tx.clone();
@@ -1436,8 +1543,9 @@ impl App {
     }
 
     fn quit(&mut self) {
-        if self.sending {
-            self.notice = Some("Wait for the current send to finish before quitting.".into());
+        if self.sending || self.syncing {
+            self.notice =
+                Some("Wait for the current send or sync to finish before quitting.".into());
         } else {
             self.running = false;
         }
@@ -1628,6 +1736,7 @@ impl App {
     fn run_command(&mut self, command: &str) {
         match command {
             "reload" => self.reload(),
+            "sync" => self.start_sync(),
             "filter all" => {
                 self.filter = InboxFilter::All;
                 self.refresh_inbox();
@@ -2076,6 +2185,7 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                 "",
                 "commands",
                 "  :reload                 :filter unread",
+                "  :sync                   fetch new IMAP messages",
                 "  :open maildir PATH      :compose  :reply  :quit",
             ]
             .join("\n");
@@ -2475,6 +2585,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_remote_password_keeps_cached_mail_available() {
+        let mailbox = TestMailbox::new();
+        std::fs::write(
+            mailbox.0.join("new/cached"),
+            b"From: reader@example.test\nSubject: cached\n\nbody",
+        )
+        .unwrap();
+        let mut app = mailbox.app();
+        app.config.remote = Some(crate::remote::tests::Server::new().remote());
+        finish_load(&mut app).await;
+        app.start_sync();
+        let (_, result) = app.sync_rx.recv().await.unwrap();
+        assert!(result.unwrap_err().contains("before connecting"));
+        assert_eq!(app.mails.len(), 1);
+        assert!(matches!(app.mailbox_state, MailboxState::Ready));
+    }
+
+    #[tokio::test]
+    async fn demo_and_unrelated_maildirs_never_start_remote_sync() {
+        let mailbox = TestMailbox::new();
+        let mut app = mailbox.app();
+        app.config.remote = Some(crate::remote::tests::Server::new().remote());
+        app.source = MailboxSource::Demo;
+        app.start_sync();
+        assert!(!app.syncing);
+        app.source = MailboxSource::Maildir(mailbox.0.join("unrelated"));
+        app.start_sync();
+        assert!(!app.syncing);
+    }
+
+    #[tokio::test]
     async fn empty_mailbox_detects_new_messages_and_allows_composing() {
         let mailbox = TestMailbox::new();
         let mut app = mailbox.app();
@@ -2652,6 +2793,7 @@ mod tests {
         let mail = source.load().unwrap().mails.remove(0);
         let sink = mailbox.0.join("sent.log");
         let result = crate::delivery::Delivery {
+            remote: None,
             account: "test".into(),
             source,
             mail,
@@ -2705,6 +2847,7 @@ mod tests {
         let mail = source.load().unwrap().mails.remove(0);
         let sink = mailbox.0.join("sent.log");
         let delivery = || crate::delivery::Delivery {
+            remote: None,
             account: "test".into(),
             source: source.clone(),
             mail: mail.clone(),
@@ -2732,6 +2875,7 @@ mod tests {
             .unwrap();
         let mail = source.load().unwrap().mails.remove(0);
         let result = crate::delivery::Delivery {
+            remote: None,
             account: "test".into(),
             source: source.clone(),
             mail: mail.clone(),
@@ -2742,6 +2886,7 @@ mod tests {
         assert!(result.contains("Send failed"));
         assert!(mail.source_path.as_ref().unwrap().exists());
         let result = crate::delivery::Delivery {
+            remote: None,
             account: "test".into(),
             source,
             mail,

@@ -44,6 +44,79 @@ impl SendError {
     }
 }
 
+pub async fn send_smtp(
+    remote: crate::remote::RemoteConfig,
+    message: Vec<u8>,
+) -> Result<(), SendError> {
+    tokio::task::spawn_blocking(move || {
+        remote.validate().map_err(SendError::failed)?;
+        let password = remote.password().map_err(SendError::failed)?;
+        let transport = lettre::SmtpTransport::relay(&remote.smtp_host)
+            .map_err(|_| SendError::failed("Unable to configure SMTP TLS."))?
+            .port(remote.smtp_port)
+            .timeout(Some(remote.timeout()))
+            .credentials(lettre::transport::smtp::authentication::Credentials::new(
+                remote.username.clone(),
+                password,
+            ))
+            .build();
+        smtp_with_transport(&transport, &message)
+    })
+    .await
+    .map_err(|_| SendError::uncertain("SMTP worker stopped. Check delivery before retrying."))?
+}
+
+fn smtp_with_transport(transport: &lettre::SmtpTransport, message: &[u8]) -> Result<(), SendError> {
+    use lettre::Transport;
+    let envelope = crate::message::envelope(message).map_err(SendError::failed)?;
+    let from = envelope
+        .from
+        .parse()
+        .map_err(|_| SendError::failed("Invalid SMTP sender."))?;
+    let recipients = envelope
+        .recipients
+        .iter()
+        .map(|address| address.parse())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SendError::failed("Invalid SMTP recipient."))?;
+    let envelope =
+        lettre::address::Envelope::new(Some(from), recipients).map_err(SendError::failed)?;
+    transport
+        .send_raw(&envelope, &crate::message::wire_message(message))
+        .map(|_| ())
+        .map_err(|error| {
+            let code = error.status().map(|code| code.to_string());
+            let mut cause = std::error::Error::source(&error);
+            let mut tls_error = error.is_tls();
+            while let Some(source) = cause {
+                tls_error |= source.is::<native_tls::Error>()
+                    || source.is::<native_tls::HandshakeError<std::net::TcpStream>>();
+                cause = source.source();
+            }
+            let kind = if tls_error
+                || code
+                    .as_deref()
+                    .is_some_and(|code| code == "535" || code == "534" || code == "530")
+            {
+                FailureKind::Configuration
+            } else if error.is_transient() {
+                FailureKind::Temporary
+            } else if error.is_permanent() {
+                FailureKind::Permanent
+            } else {
+                FailureKind::Uncertain
+            };
+            SendError {
+                kind,
+                message: match code {
+                    Some(code) => format!("SMTP rejected the request ({code})."),
+                    None if tls_error => "SMTP TLS verification failed.".into(),
+                    None => "SMTP connection failed or ended before delivery was confirmed.".into(),
+                },
+            }
+        })
+}
+
 impl fmt::Display for SendError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)
@@ -51,6 +124,130 @@ impl fmt::Display for SendError {
 }
 
 impl std::error::Error for SendError {}
+
+#[cfg(test)]
+mod smtp_tests {
+    use super::*;
+    use crate::remote::tests::Server;
+    use lettre::transport::smtp::{
+        authentication::Credentials,
+        client::{Certificate, Tls, TlsParameters},
+    };
+    use std::io::{BufRead, BufReader};
+
+    const MESSAGE: &[u8] = b"From: test@example.test\r\nTo: visible@example.test\r\nBcc: hidden@example.test\r\nMessage-ID: <test@example.test>\r\n\r\nhello\r\n";
+
+    fn transport(server: &Server, trust: bool) -> lettre::SmtpTransport {
+        let mut tls = TlsParameters::builder("localhost".into());
+        if trust {
+            tls = tls.add_root_certificate(Certificate::from_pem(server.pem.as_bytes()).unwrap());
+        }
+        lettre::SmtpTransport::relay("localhost")
+            .unwrap()
+            .port(server.port)
+            .tls(Tls::Wrapper(tls.build().unwrap()))
+            .credentials(Credentials::new(
+                "test@example.test".into(),
+                "fake-password".into(),
+            ))
+            .timeout(Some(Duration::from_secs(2)))
+            .build()
+    }
+
+    fn exchange(
+        rejection: Option<&'static str>,
+        drop_data: bool,
+    ) -> (Result<(), SendError>, String, String) {
+        let server = Server::new();
+        let transport = transport(&server, true);
+        let worker = server.spawn(move |stream| {
+            let mut stream = BufReader::new(stream.unwrap());
+            stream
+                .get_mut()
+                .write_all(b"220 localhost ESMTP\r\n")
+                .unwrap();
+            let mut recipients = String::new();
+            let mut body = String::new();
+            loop {
+                let mut line = String::new();
+                if stream.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let reply = if line.starts_with("EHLO ") {
+                    "250-localhost\r\n250 AUTH PLAIN\r\n"
+                } else if line.starts_with("AUTH ") {
+                    rejection.unwrap_or("235 authenticated\r\n")
+                } else if line.starts_with("RCPT TO:") {
+                    recipients.push_str(&line);
+                    "250 recipient ok\r\n"
+                } else if line == "DATA\r\n" {
+                    stream.get_mut().write_all(b"354 continue\r\n").unwrap();
+                    loop {
+                        let mut line = String::new();
+                        assert!(stream.read_line(&mut line).unwrap() > 0);
+                        if line == ".\r\n" {
+                            break;
+                        }
+                        body.push_str(&line);
+                    }
+                    if drop_data {
+                        break;
+                    }
+                    "250 queued\r\n"
+                } else if line == "QUIT\r\n" {
+                    stream.get_mut().write_all(b"221 bye\r\n").unwrap();
+                    break;
+                } else {
+                    "250 ok\r\n"
+                };
+                if stream.get_mut().write_all(reply.as_bytes()).is_err() {
+                    break;
+                }
+            }
+            (recipients, body)
+        });
+        let result = smtp_with_transport(&transport, MESSAGE);
+        drop(transport);
+        let (recipients, body) = worker.join().unwrap();
+        (result, recipients, body)
+    }
+
+    #[test]
+    fn sends_over_verified_tls_without_bcc_headers() {
+        let (result, recipients, body) = exchange(None, false);
+        result.unwrap();
+        assert!(recipients.contains("visible@example.test"));
+        assert!(recipients.contains("hidden@example.test"));
+        assert!(!body.contains("Bcc:"));
+        assert!(!body.contains("hidden@example.test"));
+        assert!(body.contains("hello"));
+    }
+
+    #[test]
+    fn classifies_auth_rejection_without_exposing_server_text() {
+        let error = exchange(Some("535 fake-password rejected\r\n"), false)
+            .0
+            .unwrap_err();
+        assert_eq!(error.kind, FailureKind::Configuration);
+        assert!(!error.to_string().contains("fake-password"));
+    }
+
+    #[test]
+    fn dropped_data_confirmation_is_uncertain() {
+        let error = exchange(None, true).0.unwrap_err();
+        assert_eq!(error.kind, FailureKind::Uncertain);
+    }
+
+    #[test]
+    fn rejects_untrusted_tls() {
+        let server = Server::new();
+        let transport = transport(&server, false);
+        let worker = server.spawn(|stream| assert!(stream.is_none()));
+        let error = smtp_with_transport(&transport, MESSAGE).unwrap_err();
+        assert_eq!(error.kind, FailureKind::Configuration);
+        worker.join().unwrap();
+    }
+}
 
 pub async fn send(command: &[String], message: &[u8]) -> Result<(), SendError> {
     send_with_timeout(command, message, Duration::from_secs(60)).await

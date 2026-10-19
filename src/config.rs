@@ -16,6 +16,7 @@ pub struct Config {
     pub download_dir: Option<PathBuf>,
     pub editor: Vec<String>,
     pub send_command: Vec<String>,
+    pub remote: Option<crate::remote::RemoteConfig>,
     pub default_account: Option<String>,
     pub accounts: Vec<Account>,
     #[serde(skip)]
@@ -33,6 +34,7 @@ pub struct Account {
     pub download_dir: Option<PathBuf>,
     pub editor: Vec<String>,
     pub send_command: Vec<String>,
+    pub remote: Option<crate::remote::RemoteConfig>,
 }
 
 impl Config {
@@ -52,6 +54,14 @@ impl Config {
         let base = path.parent().unwrap_or(Path::new("."));
         resolve_path(&mut config.maildir, base);
         resolve_path(&mut config.download_dir, base);
+        if let Some(remote) = &config.remote {
+            remote.validate().map_err(color_eyre::eyre::Error::msg)?;
+            if config.maildir.is_none() || !config.send_command.is_empty() {
+                return Err(color_eyre::eyre::eyre!(
+                    "Remote accounts require maildir and must not set send_command."
+                ));
+            }
+        }
         for account in &mut config.accounts {
             resolve_path(&mut account.maildir, base);
             resolve_path(&mut account.download_dir, base);
@@ -59,6 +69,14 @@ impl Config {
         let mut ids = std::collections::HashSet::new();
         let mut roots = std::collections::HashSet::new();
         for account in &config.accounts {
+            if let Some(remote) = &account.remote {
+                remote.validate().map_err(color_eyre::eyre::Error::msg)?;
+                if account.maildir.is_none() || !account.send_command.is_empty() {
+                    return Err(color_eyre::eyre::eyre!(
+                        "Remote accounts require maildir and must not set send_command."
+                    ));
+                }
+            }
             if account.id.trim().is_empty() || !ids.insert(&account.id) {
                 return Err(color_eyre::eyre::eyre!(
                     "Every account must have a unique, nonempty id."
@@ -137,6 +155,7 @@ impl Config {
         self.download_dir = account.download_dir;
         self.editor = account.editor;
         self.send_command = account.send_command;
+        self.remote = account.remote;
         true
     }
 
@@ -148,11 +167,22 @@ impl Config {
     }
 
     pub fn delivery_identity(&self) -> String {
-        format!(
+        let identity = format!(
             "{}:{}",
             self.active_account.as_deref().unwrap_or("local"),
             self.email.as_deref().unwrap_or_default()
-        )
+        );
+        match &self.remote {
+            Some(remote) => format!(
+                "{identity}:{}:{}:{}:{}:{}",
+                remote.imap_host,
+                remote.imap_port,
+                remote.smtp_host,
+                remote.smtp_port,
+                remote.username
+            ),
+            None => identity,
+        }
     }
 }
 
@@ -230,6 +260,24 @@ mod tests {
         assert_eq!(config.maildir, Some(root.join("mail")));
         assert_eq!(config.download_dir, Some(root.join("downloads")));
         assert_eq!(config.identity().as_deref(), Some("tuna@example.com"));
+    }
+
+    #[test]
+    fn loads_remote_account_and_rejects_plaintext_password_fields() {
+        let root = std::env::temp_dir().join(crate::storage::unique_name("remote-config"));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("config.toml");
+        let contents = "[[accounts]]\nid = 'personal'\nemail = 'me@example.test'\nmaildir = 'mail'\n[accounts.remote]\nimap_host = 'localhost'\nsmtp_host = 'localhost'\nusername = 'me@example.test'\npassword_env = 'TERMAIL_PASSWORD'\n";
+        fs::write(&path, contents).unwrap();
+        let mut config = Config::load(Some(&path)).unwrap();
+        assert_eq!(config.maildir, Some(root.join("mail")));
+        assert_eq!(config.remote.as_ref().unwrap().sent, "INBOX.Sent");
+        let identity = config.delivery_identity();
+        config.remote.as_mut().unwrap().smtp_host = "other.example.test".into();
+        assert_ne!(config.delivery_identity(), identity);
+        fs::write(&path, format!("{contents}password = 'fake-password'\n")).unwrap();
+        assert!(Config::load(Some(&path)).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

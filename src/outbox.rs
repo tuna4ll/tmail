@@ -16,6 +16,8 @@ pub enum State {
     Ready,
     Sending,
     Sent,
+    CopyingSent,
+    CopiedSent,
     Failed(FailureKind),
 }
 
@@ -190,6 +192,8 @@ pub fn describe(root: &Path, message: &Path) -> String {
                         "Delivery unconfirmed · check delivery before retrying"
                     }
                     State::Sent => "Sent · retry to save the Sent copy",
+                    State::CopyingSent => "Sent · remote copy unconfirmed · retry to check",
+                    State::CopiedSent => "Sent · remote copy saved · retry to finish locally",
                     State::Failed(FailureKind::Temporary) => "Temporary failure · press x to retry",
                     State::Failed(FailureKind::Configuration) => {
                         "Setup error · fix sender settings before retrying"
@@ -308,6 +312,7 @@ mod tests {
         assert!(mail.delivery_status.as_deref().unwrap().contains("Queued"));
         assert_eq!(
             Delivery {
+                remote: None,
                 source: source.clone(),
                 mail,
                 command,
@@ -470,6 +475,7 @@ mod tests {
         let fixture = Fixture::new();
         let delivery = fixture.queue();
         let failed = Delivery {
+            remote: None,
             source: delivery.source.clone(),
             mail: delivery.mail.clone(),
             account: delivery.account.clone(),
@@ -492,5 +498,34 @@ mod tests {
         assert_eq!(record.attempts, 2);
         assert_eq!(record.state, State::Sent);
         assert_eq!(value.lines().count(), 5);
+    }
+
+    #[tokio::test]
+    async fn remote_copy_failure_never_repeats_smtp_delivery() {
+        let fixture = Fixture::new();
+        let mut delivery = fixture.queue();
+        fixture
+            .journal(&delivery)
+            .transition(State::Sent, None)
+            .unwrap();
+        delivery.remote = Some(crate::remote::tests::Server::new().remote());
+        assert!(delivery.run().await.contains("Message sent."));
+        assert!(!fixture.0.join("sent.log").exists());
+        let source = MailboxSource::Maildir(fixture.0.clone());
+        let mail = source.load().unwrap().mails.remove(0);
+        let delivery = Delivery {
+            source,
+            mail,
+            account: "personal:me@example.com".into(),
+            command: Vec::new(),
+            remote: Some(crate::remote::tests::Server::new().remote()),
+        };
+        assert_eq!(fixture.journal(&delivery).record.state, State::Sent);
+        fixture
+            .journal(&delivery)
+            .transition(State::CopiedSent, None)
+            .unwrap();
+        assert_eq!(delivery.run().await, "Message sent");
+        assert!(!fixture.0.join("sent.log").exists());
     }
 }

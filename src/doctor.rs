@@ -18,7 +18,7 @@ pub fn run(config: &Config) -> bool {
     let healthy = checks.iter().all(|check| check.ok);
     println!();
     if healthy {
-        println!("Ready to read and send mail.");
+        println!("Local setup checked. No server connection was made.");
     } else {
         println!("Fix the failed checks, then run termail doctor again.");
     }
@@ -49,6 +49,11 @@ pub fn checks(config: &Config) -> Vec<Check> {
                 format!("{} needs cur, new, and tmp directories.", path.display())
             },
         },
+        Some(path) if config.remote.is_some() && !path.exists() => Check {
+            ok: true,
+            label: "maildir",
+            detail: format!("{} will be created on startup.", path.display()),
+        },
         Some(path) => Check {
             ok: false,
             label: "maildir",
@@ -61,25 +66,35 @@ pub fn checks(config: &Config) -> Vec<Check> {
         },
     });
     checks.push(command_check("editor", &config.editor_command()));
-    checks.push(
-        if config
-            .send_command
-            .first()
-            .is_some_and(|value| value == "termail-test-sink")
-        {
-            Check {
-                ok: config.send_command.len() > 1,
-                label: "sender",
-                detail: if config.send_command.len() > 1 {
-                    "local test sink".into()
-                } else {
-                    "termail-test-sink needs an output path.".into()
-                },
-            }
-        } else {
-            command_check("sender", &config.send_command)
-        },
-    );
+    checks.push(if let Some(remote) = &config.remote {
+        Check {
+            ok: remote.validate().is_ok() && remote.password().is_ok(),
+            label: "sender",
+            detail: match remote.validate().and_then(|_| remote.password()) {
+                Ok(_) => format!(
+                    "IMAPS {}:{} · SMTPS {}:{}",
+                    remote.imap_host, remote.imap_port, remote.smtp_host, remote.smtp_port
+                ),
+                Err(error) => error,
+            },
+        }
+    } else if config
+        .send_command
+        .first()
+        .is_some_and(|value| value == "termail-test-sink")
+    {
+        Check {
+            ok: config.send_command.len() > 1,
+            label: "sender",
+            detail: if config.send_command.len() > 1 {
+                "local test sink".into()
+            } else {
+                "termail-test-sink needs an output path.".into()
+            },
+        }
+    } else {
+        command_check("sender", &config.send_command)
+    });
     let downloads = config.download_dir();
     checks.push(Check {
         ok: downloads.is_dir(),
