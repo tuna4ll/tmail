@@ -34,6 +34,8 @@ pub struct Mail {
     pub account: Option<String>,
     pub source_path: Option<PathBuf>,
     pub mailbox: Option<String>,
+    #[serde(skip)]
+    pub delivery_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -170,6 +172,7 @@ impl Mail {
             account: None,
             source_path: None,
             mailbox: None,
+            delivery_status: None,
         }
     }
 

@@ -117,22 +117,45 @@ impl MailboxSource {
         save_message(root, ".Drafts", "new", contents, "").map_err(Into::into)
     }
 
-    pub fn save_outbox(&self, contents: &[u8]) -> Result<PathBuf, LoadError> {
+    pub fn stage_outbox(&self, contents: &[u8]) -> Result<PathBuf, LoadError> {
         let Self::Maildir(root) = self else {
             return Err(LoadError {
                 message: "Choose one account before queueing messages.".into(),
             });
         };
-        save_message(root, ".Outbox", "new", contents, "").map_err(Into::into)
+        save_message(root, ".Outbox", "tmp", contents, "").map_err(Into::into)
     }
 
-    pub fn save_sent(&self, contents: &[u8]) -> Result<PathBuf, LoadError> {
+    #[cfg(test)]
+    pub fn save_outbox(&self, contents: &[u8]) -> Result<PathBuf, LoadError> {
+        let temporary = self.stage_outbox(contents)?;
+        let folder = temporary.parent().unwrap().parent().unwrap();
+        let destination = folder.join("new").join(temporary.file_name().unwrap());
+        crate::storage::rename(&temporary, &destination)?;
+        Ok(destination)
+    }
+
+    pub fn update_draft(&self, path: &Path, contents: &[u8]) -> Result<PathBuf, LoadError> {
         let Self::Maildir(root) = self else {
             return Err(LoadError {
-                message: "Choose one account before saving sent messages.".into(),
+                message: "Choose one account before saving drafts.".into(),
             });
         };
-        save_message(root, ".Sent", "cur", contents, "!2,S").map_err(Into::into)
+        let folder = root.join(".Drafts");
+        if ![folder.join("new"), folder.join("cur")]
+            .iter()
+            .any(|parent| path.parent() == Some(parent.as_path()))
+        {
+            return Err(LoadError {
+                message: "Draft is outside the active Drafts folder.".into(),
+            });
+        }
+        let temporary = save_message(root, ".Drafts", "tmp", contents, "")?;
+        if let Err(error) = crate::storage::rename(&temporary, path) {
+            let _ = fs::remove_file(temporary);
+            return Err(error.into());
+        }
+        Ok(path.to_path_buf())
     }
 
     pub fn save_attachment(
@@ -258,7 +281,7 @@ impl From<io::Error> for LoadError {
 
 fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
     let mut mails = Vec::new();
-    let mut skipped = Vec::new();
+    let mut skipped = crate::outbox::recover(path);
     let mut attempted = 0;
     let cache = load_cache(path).unwrap_or_default();
     let mut next_cache = BTreeMap::new();
@@ -357,6 +380,7 @@ fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
                 account: None,
                 source_path: Some(message.path().to_path_buf()),
                 mailbox: Some(mailbox.clone()),
+                delivery_status: None,
             };
             next_cache.insert(
                 cache_key,
@@ -372,6 +396,13 @@ fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
     }
 
     mails.sort_by_key(|mail| mail.timestamp.unwrap_or_default());
+    for mail in &mut mails {
+        if mail.mailbox.as_deref() == Some("Outbox")
+            && let Some(source) = &mail.source_path
+        {
+            mail.delivery_status = Some(crate::outbox::describe(path, source));
+        }
+    }
     let _ = save_cache(path, &next_cache);
     Ok(LoadReport {
         mails,
@@ -499,19 +530,35 @@ fn move_to_folder(path: &Path, folder: &Path) -> io::Result<MaildirChange> {
     for child in ["cur", "new", "tmp"] {
         fs::create_dir_all(folder.join(child))?;
     }
+    crate::storage::sync_parent(folder)?;
     let file_name = path
         .file_name()
+        .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid Maildir filename."))?;
-    let mut after = folder.join("cur").join(file_name);
+    let (base, flags, separator) = if let Some((base, flags)) = file_name.rsplit_once(":2,") {
+        (base, flags, ":2,")
+    } else if let Some((base, flags)) = file_name.rsplit_once("!2,") {
+        (base, flags, "!2,")
+    } else {
+        (file_name, "", if cfg!(windows) { "!2," } else { ":2," })
+    };
+    let mut flags: Vec<char> = flags.chars().collect();
+    if folder.file_name().is_some_and(|name| name == ".Sent") {
+        flags.push('S');
+    }
+    flags.sort_unstable();
+    flags.dedup();
+    let flags: String = flags.into_iter().collect();
+    let mut after = folder.join("cur").join(format!("{base}{separator}{flags}"));
     if after.exists() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let unique = format!("{}.termail-{nonce}", file_name.to_string_lossy());
+        let unique = format!("{base}.termail-{nonce}{separator}{flags}");
         after = folder.join("cur").join(unique);
     }
-    fs::rename(path, &after)?;
+    crate::storage::rename(path, &after)?;
     Ok(MaildirChange {
         before: path.to_path_buf(),
         after,
@@ -535,19 +582,23 @@ fn save_message(
     for child in ["cur", "new", "tmp"] {
         fs::create_dir_all(folder.join(child))?;
     }
+    crate::storage::sync_parent(&folder)?;
+    crate::storage::sync_parent(&folder.join("tmp"))?;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos();
-    let name = format!("{nonce}.{}.termail{suffix}", std::process::id());
+        .as_secs();
+    let name = format!("{nonce}.{}{suffix}", crate::storage::unique_name("termail"));
     let temporary = folder.join("tmp").join(&name);
     let destination = folder.join(location).join(name);
-    fs::write(&temporary, contents)?;
-    fs::rename(temporary, &destination)?;
+    crate::storage::write_new(&temporary, contents)?;
+    if temporary != destination {
+        crate::storage::rename(&temporary, &destination)?;
+    }
     Ok(destination)
 }
 
-fn safe_file_name(value: &str) -> String {
+pub(crate) fn safe_file_name(value: &str) -> String {
     let mut name: String = value
         .chars()
         .map(|character| {
@@ -653,13 +704,13 @@ fn clean_id(value: &str) -> String {
         .into()
 }
 
-fn format_addresses(addresses: &Address<'_>) -> Vec<String> {
+pub(crate) fn format_addresses(addresses: &Address<'_>) -> Vec<String> {
     addresses.iter().map(format_address).collect()
 }
 
 fn format_address(address: &mail_parser::Addr<'_>) -> String {
     match (address.name.as_deref(), address.address.as_deref()) {
-        (Some(name), Some(email)) => format!("{name} <{email}>"),
+        (Some(name), Some(email)) => crate::message::display_address(name, email),
         (None, Some(email)) => email.into(),
         (Some(name), None) => name.into(),
         (None, None) => "unknown".into(),

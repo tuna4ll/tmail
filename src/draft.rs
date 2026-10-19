@@ -1,10 +1,10 @@
 use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
-use base64::{Engine, engine::general_purpose::STANDARD};
+use mail_builder::{MessageBuilder, headers::text::Text};
+use mail_parser::{MessageParser, MimeHeaders};
 
 use crate::mail::Mail;
 
@@ -57,6 +57,8 @@ pub struct Composer {
     pub attachments: String,
     pub format: MessageFormat,
     pub body_path: PathBuf,
+    pub original_draft: Option<PathBuf>,
+    attachment_dir: Option<PathBuf>,
     reply_to: Option<String>,
     references: Vec<String>,
     message_id: String,
@@ -79,17 +81,13 @@ impl Composer {
         identity: Option<&str>,
         signature: Option<&str>,
     ) -> io::Result<Self> {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let body_path =
-            std::env::temp_dir().join(format!("termail-body-{}-{nonce}.txt", std::process::id()));
+        let name = crate::storage::unique_name("termail");
+        let body_path = std::env::temp_dir().join(format!("{name}.txt"));
         let body = signature
             .filter(|value| !value.trim().is_empty())
             .map(|value| format!("\n\n-- \n{}", value.trim()))
             .unwrap_or_default();
-        fs::write(&body_path, body)?;
+        crate::storage::write_new(&body_path, body.as_bytes())?;
         let subject = reply_to
             .map(|mail| {
                 if mail.subject.to_lowercase().starts_with("re:") {
@@ -115,10 +113,82 @@ impl Composer {
             attachments: String::new(),
             format: MessageFormat::Plain,
             body_path,
+            original_draft: None,
+            attachment_dir: None,
             reply_to: reply_to.map(|mail| mail.id.clone()),
             references,
-            message_id: format!("termail-{}-{nonce}@localhost", std::process::id()),
+            message_id: format!("{name}@localhost"),
         })
+    }
+
+    pub fn resume(path: &Path) -> io::Result<Self> {
+        let contents = fs::read(path)?;
+        let parsed = MessageParser::default()
+            .parse(&contents)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Unable to read draft."))?;
+        let mut composer = Self::new(None, None, None)?;
+        composer.from = parsed
+            .from()
+            .map(crate::mailbox::format_addresses)
+            .unwrap_or_default()
+            .join(", ");
+        composer.to = parsed
+            .to()
+            .map(crate::mailbox::format_addresses)
+            .unwrap_or_default()
+            .join(", ");
+        composer.cc = parsed
+            .cc()
+            .map(crate::mailbox::format_addresses)
+            .unwrap_or_default()
+            .join(", ");
+        composer.bcc = parsed
+            .bcc()
+            .map(crate::mailbox::format_addresses)
+            .unwrap_or_default()
+            .join(", ");
+        composer.subject = parsed.subject().unwrap_or_default().into();
+        composer.reply_to = parsed.in_reply_to().as_text().map(str::to_owned);
+        composer.references = parsed
+            .references()
+            .as_text_list()
+            .unwrap_or_default()
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        if let Some(id) = parsed.message_id() {
+            composer.message_id = id.into();
+        }
+        let body = if parsed
+            .html_part(0)
+            .is_some_and(|part| matches!(part.body, mail_parser::PartType::Html(_)))
+        {
+            composer.format = MessageFormat::Html;
+            parsed.body_html(0)
+        } else {
+            parsed.body_text(0)
+        }
+        .unwrap_or_default();
+        fs::write(&composer.body_path, body.as_bytes())?;
+        let mut attachments = Vec::new();
+        for (index, part) in parsed.attachments().enumerate() {
+            let directory = composer.body_path.with_extension("attachments");
+            if composer.attachment_dir.is_none() {
+                fs::create_dir(&directory)?;
+                composer.attachment_dir = Some(directory.clone());
+            }
+            let directory = directory.join(index.to_string());
+            fs::create_dir(&directory)?;
+            let name =
+                crate::mailbox::safe_file_name(part.attachment_name().unwrap_or("attachment"))
+                    .replace(';', "_");
+            let attachment = directory.join(name);
+            crate::storage::write_new(&attachment, part.contents())?;
+            attachments.push(attachment.to_string_lossy().into_owned());
+        }
+        composer.attachments = attachments.join("; ");
+        composer.original_draft = Some(path.to_path_buf());
+        Ok(composer)
     }
 
     pub fn summary(&self, base: &Path) -> Result<Summary, DraftError> {
@@ -153,6 +223,16 @@ impl Composer {
                 "Set email in config.toml before sending.".into(),
             ))
         } else {
+            let from = crate::message::addresses(&self.from, "From").map_err(DraftError)?;
+            if from.len() != 1 {
+                return Err(DraftError("From must contain exactly one address.".into()));
+            }
+            for (field, value) in [("To", &self.to), ("Cc", &self.cc), ("Bcc", &self.bcc)] {
+                crate::message::addresses(value, field).map_err(DraftError)?;
+            }
+            if self.subject.chars().any(char::is_control) {
+                return Err(DraftError("Subject contains a control character.".into()));
+            }
             Ok(())
         }
     }
@@ -204,6 +284,9 @@ impl Composer {
 impl Drop for Composer {
     fn drop(&mut self) {
         let _ = self.remove_body();
+        if let Some(directory) = &self.attachment_dir {
+            let _ = fs::remove_dir_all(directory);
+        }
     }
 }
 
@@ -229,6 +312,11 @@ fn inspect_message(
         return Err(DraftError(
             "Add at least one recipient to To, Cc, or Bcc.".into(),
         ));
+    }
+    if require_recipient {
+        for (field, value) in [("To", &to), ("Cc", &cc), ("Bcc", &bcc)] {
+            crate::message::addresses(value, field).map_err(DraftError)?;
+        }
     }
     let attachments: Vec<PathBuf> = header_values(headers, "attach")
         .into_iter()
@@ -270,48 +358,50 @@ fn prepare_message(
     require_recipient: bool,
 ) -> Result<Vec<u8>, DraftError> {
     let summary = inspect_message(contents, base, require_recipient)?;
-    if summary.attachments.is_empty() {
-        let text = String::from_utf8_lossy(contents);
-        let (headers, body) = split_message(&text);
-        let headers = headers
-            .lines()
-            .filter(|line| !line.to_ascii_lowercase().starts_with("attach:"))
-            .collect::<Vec<_>>()
-            .join("\r\n");
-        return Ok(format!("{headers}\r\n\r\n{body}").into_bytes());
-    }
     let text = String::from_utf8_lossy(contents);
     let (headers, body) = split_message(&text);
-    let body_type = header_values(headers, "content-type")
-        .into_iter()
-        .next()
-        .filter(|value| value.to_ascii_lowercase().starts_with("text/html"))
-        .map(|_| "text/html")
-        .unwrap_or("text/plain");
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let boundary = format!("termail-{nonce}");
-    let mut message = String::new();
-    for line in headers.lines() {
-        let lower = line.to_ascii_lowercase();
-        if !lower.starts_with("attach:")
-            && !lower.starts_with("mime-version:")
-            && !lower.starts_with("content-type:")
-        {
-            message.push_str(line.trim_end_matches('\r'));
-            message.push_str("\r\n");
+    let mut builder = MessageBuilder::new();
+    for name in ["From", "To", "Cc", "Bcc"] {
+        let value = header_values(headers, name).join(", ");
+        match crate::message::addresses(&value, name) {
+            Ok(addresses) if !addresses.is_empty() => {
+                builder = builder.header(
+                    name,
+                    mail_builder::headers::address::Address::new_list(addresses),
+                )
+            }
+            Ok(_) => {}
+            Err(error) if require_recipient => return Err(DraftError(error)),
+            Err(_) => builder = builder.header(name, Text::new(value)),
         }
     }
-    message.push_str("MIME-Version: 1.0\r\n");
-    message.push_str(&format!(
-        "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n"
-    ));
-    message.push_str(&format!(
-        "--{boundary}\r\nContent-Type: {body_type}; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{}\r\n",
-        body.trim_start_matches(['\r', '\n'])
-    ));
+    builder = builder.subject(header_values(headers, "subject").join(" "));
+    let parsed = MessageParser::default().parse(contents);
+    if let Some(parsed) = &parsed {
+        if let Some(id) = parsed.message_id() {
+            builder = builder.message_id(id.to_owned());
+        }
+        if let Some(id) = parsed.in_reply_to().as_text() {
+            builder = builder.in_reply_to(id.to_owned());
+        }
+        let references = parsed.references().as_text_list().unwrap_or_default();
+        if !references.is_empty() {
+            builder = builder.references(
+                references
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    let body = body
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "\r\n");
+    builder = match summary.format {
+        MessageFormat::Plain => builder.text_body(body),
+        MessageFormat::Html => builder.html_body(body),
+    };
     for path in summary.attachments {
         let bytes = fs::read(&path).map_err(|error| {
             DraftError(format!(
@@ -321,21 +411,20 @@ fn prepare_message(
         })?;
         let name = path
             .file_name()
-            .and_then(|value| value.to_str())
-            .map(one_line)
-            .unwrap_or_else(|| "attachment".into());
-        let media_type = mime_guess::from_path(&path).first_or_octet_stream();
-        message.push_str(&format!(
-            "--{boundary}\r\nContent-Type: {media_type}; name=\"{name}\"\r\nContent-Disposition: attachment; filename=\"{name}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n"
-        ));
-        let encoded = STANDARD.encode(bytes);
-        for chunk in encoded.as_bytes().chunks(76) {
-            message.push_str(&String::from_utf8_lossy(chunk));
-            message.push_str("\r\n");
-        }
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment")
+            .to_owned();
+        let guessed = mime_guess::from_path(&path).first_or_octet_stream();
+        let media_type = if guessed.type_() == "text" && std::str::from_utf8(&bytes).is_err() {
+            "application/octet-stream".to_owned()
+        } else {
+            guessed.to_string()
+        };
+        builder = builder.attachment(media_type, name, bytes);
     }
-    message.push_str(&format!("--{boundary}--\r\n"));
-    Ok(message.into_bytes())
+    builder
+        .write_to_vec()
+        .map_err(|error| DraftError(error.to_string()))
 }
 
 fn split_message(message: &str) -> (&str, &str) {
@@ -393,8 +482,17 @@ mod tests {
 
         assert!(!body.contains("Subject:"));
         assert!(body.contains("-- \nTuna"));
-        assert!(message.contains("To: Ada <ada@example.com>"));
-        assert!(message.contains("Cc: mert@example.com"));
+        let parsed = mail_parser::MessageParser::default()
+            .parse(message.as_bytes())
+            .unwrap();
+        assert_eq!(
+            parsed.to().unwrap().first().unwrap().name.as_deref(),
+            Some("Ada")
+        );
+        assert_eq!(
+            parsed.cc().unwrap().first().unwrap().address.as_deref(),
+            Some("mert@example.com")
+        );
         assert!(message.contains("Subject: Re: Update"));
         assert!(message.contains("In-Reply-To: <first@example.com>"));
         assert!(message.contains("<root@example.com> <first@example.com>"));
@@ -412,8 +510,11 @@ mod tests {
         let message = String::from_utf8(composer.message(Path::new(".")).unwrap()).unwrap();
 
         assert_eq!(summary.format, MessageFormat::Html);
-        assert!(message.contains("Content-Type: text/html; charset=utf-8"));
-        assert!(message.ends_with("<p>hello</p>"));
+        let parsed = mail_parser::MessageParser::default()
+            .parse(message.as_bytes())
+            .unwrap();
+        assert_eq!(parsed.body_html(0).unwrap(), "<p>hello</p>");
+        assert!(parsed.date().is_some());
         composer.remove_body().unwrap();
     }
 
@@ -435,7 +536,10 @@ mod tests {
         let message = String::from_utf8(prepare(contents, &root).unwrap()).unwrap();
         assert!(message.contains("Content-Type: multipart/mixed"));
         assert!(message.contains("filename=\"notes.txt\""));
-        assert!(message.contains("aGVsbG8="));
+        let parsed = mail_parser::MessageParser::default()
+            .parse(message.as_bytes())
+            .unwrap();
+        assert_eq!(parsed.attachments().next().unwrap().contents(), b"hello");
         assert!(!message.contains("Attach: notes.txt"));
 
         let html = prepare(
@@ -444,7 +548,10 @@ mod tests {
         )
         .unwrap();
         let html = String::from_utf8(html).unwrap();
-        assert!(html.contains("Content-Type: text/html; charset=utf-8"));
+        let parsed = mail_parser::MessageParser::default()
+            .parse(html.as_bytes())
+            .unwrap();
+        assert_eq!(parsed.body_html(0).unwrap().trim(), "<p>hello</p>");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -472,8 +579,11 @@ mod tests {
         let composer = Composer::new(None, Some("tuna@example.com"), None).unwrap();
         let message = String::from_utf8(composer.draft_message(Path::new(".")).unwrap()).unwrap();
 
-        assert!(message.contains("To: \r\n"));
-        assert!(message.contains("Subject: \r\n"));
+        let parsed = mail_parser::MessageParser::default()
+            .parse(message.as_bytes())
+            .unwrap();
+        assert!(parsed.to().is_none());
+        assert_eq!(parsed.subject().unwrap_or_default(), "");
         composer.remove_body().unwrap();
     }
 
@@ -486,5 +596,72 @@ mod tests {
 
         assert!(error.to_string().contains("Set email"));
         composer.remove_body().unwrap();
+    }
+
+    #[test]
+    fn encodes_unicode_headers_and_preserves_body_whitespace() {
+        let mut composer =
+            Composer::new(None, Some("Tuna Kılıç <tuna@example.com>"), None).unwrap();
+        composer.to = "\"Doe, Ada\" <ada@example.com>".into();
+        composer.subject = "Türkçe başlık: ğüşiöç ".repeat(12);
+        let body = "\n\nMerhaba dünya!\nİkinci satır.\n";
+        fs::write(&composer.body_path, body).unwrap();
+        let bytes = composer.message(Path::new(".")).unwrap();
+        let parsed = mail_parser::MessageParser::default().parse(&bytes).unwrap();
+        assert_eq!(parsed.subject(), Some(composer.subject.trim()));
+        assert_eq!(
+            parsed.from().unwrap().first().unwrap().name.as_deref(),
+            Some("Tuna Kılıç")
+        );
+        assert_eq!(parsed.body_text(0).unwrap().replace("\r\n", "\n"), body);
+        assert!(parsed.date().is_some());
+        assert!(parsed.message_id().is_some());
+        assert!(
+            !bytes
+                .windows(2)
+                .any(|pair| pair[1] == b'\n' && pair[0] != b'\r')
+        );
+        assert!(
+            bytes
+                .split(|byte| *byte == b'\n')
+                .all(|line| line.len() <= 998)
+        );
+    }
+
+    #[test]
+    fn invalid_recipients_can_be_saved_but_not_sent() {
+        let mut composer = Composer::new(None, Some("tuna@example.com"), None).unwrap();
+        composer.to = "unfinished-address".into();
+        assert!(composer.message(Path::new(".")).is_err());
+        assert!(composer.draft_message(Path::new(".")).is_ok());
+        composer.to = "ada@example.com\r\nBcc: hidden@example.com".into();
+        assert!(composer.summary(Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn resumes_quoted_names_and_unicode_attachments() {
+        let directory = std::env::temp_dir().join(crate::storage::unique_name("termail-mime"));
+        fs::create_dir(&directory).unwrap();
+        let attachment = directory.join("Türkçe rapor.txt");
+        fs::write(&attachment, [0, 1, 127, 128, 255]).unwrap();
+        let draft = directory.join("draft.eml");
+        let mut composer = Composer::new(None, Some("tuna@example.com"), None).unwrap();
+        composer.to = "\"Doe, Ada\" <ada@example.com>".into();
+        composer.attachments = attachment.display().to_string();
+        fs::write(&draft, composer.draft_message(&directory).unwrap()).unwrap();
+        let resumed = Composer::resume(&draft).unwrap();
+        let bytes = resumed.message(&directory).unwrap();
+        let parsed = mail_parser::MessageParser::default().parse(&bytes).unwrap();
+        assert_eq!(
+            parsed.to().unwrap().first().unwrap().name.as_deref(),
+            Some("Doe, Ada")
+        );
+        let part = parsed.attachments().next().unwrap();
+        assert_eq!(
+            mail_parser::MimeHeaders::attachment_name(part),
+            Some("Türkçe rapor.txt")
+        );
+        assert_eq!(part.contents(), [0, 1, 127, 128, 255]);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

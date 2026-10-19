@@ -18,6 +18,8 @@ pub struct Config {
     pub send_command: Vec<String>,
     pub default_account: Option<String>,
     pub accounts: Vec<Account>,
+    #[serde(skip)]
+    pub(crate) active_account: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -54,6 +56,30 @@ impl Config {
             resolve_path(&mut account.maildir, base);
             resolve_path(&mut account.download_dir, base);
         }
+        let mut ids = std::collections::HashSet::new();
+        let mut roots = std::collections::HashSet::new();
+        for account in &config.accounts {
+            if account.id.trim().is_empty() || !ids.insert(&account.id) {
+                return Err(color_eyre::eyre::eyre!(
+                    "Every account must have a unique, nonempty id."
+                ));
+            }
+            if let Some(root) = &account.maildir {
+                let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                if !roots.insert(root) {
+                    return Err(color_eyre::eyre::eyre!(
+                        "Accounts must use separate Maildir directories."
+                    ));
+                }
+            }
+        }
+        if let Some(default) = &config.default_account
+            && !config.accounts.iter().any(|account| &account.id == default)
+        {
+            return Err(color_eyre::eyre::eyre!(
+                "default_account does not match a configured account."
+            ));
+        }
         if !config.accounts.is_empty() {
             let selected = config
                 .default_account
@@ -67,7 +93,7 @@ impl Config {
 
     pub fn identity(&self) -> Option<String> {
         match (&self.name, &self.email) {
-            (Some(name), Some(email)) => Some(format!("{name} <{email}>")),
+            (Some(name), Some(email)) => Some(crate::message::display_address(name, email)),
             (None, Some(email)) => Some(email.clone()),
             _ => None,
         }
@@ -103,6 +129,7 @@ impl Config {
         let Some(account) = self.accounts.get(index).cloned() else {
             return false;
         };
+        self.active_account = Some(account.id.clone());
         self.name = account.name;
         self.email = account.email;
         self.signature = account.signature;
@@ -114,14 +141,18 @@ impl Config {
     }
 
     pub fn active_account_index(&self) -> usize {
-        self.email
+        self.active_account
             .as_deref()
-            .and_then(|email| {
-                self.accounts
-                    .iter()
-                    .position(|account| account.email.as_deref() == Some(email))
-            })
+            .and_then(|id| self.accounts.iter().position(|account| account.id == id))
             .unwrap_or_default()
+    }
+
+    pub fn delivery_identity(&self) -> String {
+        format!(
+            "{}:{}",
+            self.active_account.as_deref().unwrap_or("local"),
+            self.email.as_deref().unwrap_or_default()
+        )
     }
 }
 
@@ -153,6 +184,30 @@ mod tests {
     };
 
     use super::Config;
+
+    #[test]
+    fn distinguishes_accounts_with_the_same_email() {
+        let mut config = Config {
+            accounts: vec![
+                super::Account {
+                    id: "personal".into(),
+                    email: Some("me@example.com".into()),
+                    ..Default::default()
+                },
+                super::Account {
+                    id: "work".into(),
+                    email: Some("me@example.com".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        config.activate(1);
+        assert_eq!(config.active_account_index(), 1);
+        assert_eq!(config.delivery_identity(), "work:me@example.com");
+        config.activate(0);
+        assert_eq!(config.delivery_identity(), "personal:me@example.com");
+    }
 
     #[test]
     fn resolves_relative_maildir_from_config() {

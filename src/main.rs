@@ -1,9 +1,13 @@
 mod config;
+mod delivery;
 mod doctor;
 mod draft;
 mod mail;
 mod mailbox;
+mod message;
+mod outbox;
 mod sender;
+mod storage;
 mod theme;
 mod widgets;
 
@@ -82,7 +86,6 @@ async fn main() -> color_eyre::Result<()> {
 
 pub struct App {
     running: bool,
-    event_stream: EventStream,
     selected: usize,
     mails: Vec<Mail>,
     conversations: Vec<Conversation>,
@@ -91,8 +94,12 @@ pub struct App {
     focus: Pane,
     source: MailboxSource,
     mailbox_state: MailboxState,
-    load_tx: mpsc::UnboundedSender<Result<LoadReport, LoadError>>,
-    load_rx: mpsc::UnboundedReceiver<Result<LoadReport, LoadError>>,
+    load_tx: mpsc::UnboundedSender<MailboxLoad>,
+    load_rx: mpsc::UnboundedReceiver<MailboxLoad>,
+    load_generation: u64,
+    delivery_tx: mpsc::UnboundedSender<String>,
+    delivery_rx: mpsc::UnboundedReceiver<String>,
+    sending: bool,
     spinner_tick: u64,
     skipped: usize,
     query: String,
@@ -106,6 +113,12 @@ pub struct App {
     config: Config,
     active_folder: String,
     account_label: String,
+}
+
+struct MailboxLoad {
+    generation: u64,
+    fingerprint: Option<u64>,
+    result: Result<LoadReport, LoadError>,
 }
 
 struct UndoAction {
@@ -130,6 +143,9 @@ enum InboxFilter {
 }
 
 enum Overlay {
+    DeliveryReview {
+        delivery: delivery::Delivery,
+    },
     Help {
         scroll: u16,
     },
@@ -223,6 +239,7 @@ enum Pane {
 impl App {
     pub fn new(source: MailboxSource, config: Config) -> Self {
         let (load_tx, load_rx) = mpsc::unbounded_channel();
+        let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
         let account_label = config
             .accounts
             .get(config.active_account_index())
@@ -231,7 +248,6 @@ impl App {
             .unwrap_or_else(|| "local".into());
         let mut app = Self {
             running: false,
-            event_stream: EventStream::new(),
             selected: 0,
             mails: Vec::new(),
             conversations: Vec::new(),
@@ -242,6 +258,10 @@ impl App {
             mailbox_state: MailboxState::Loading,
             load_tx,
             load_rx,
+            load_generation: 0,
+            delivery_tx,
+            delivery_rx,
+            sending: false,
             spinner_tick: 0,
             skipped: 0,
             query: String::new(),
@@ -264,6 +284,7 @@ impl App {
         self.running = true;
         let mut animation = interval(Duration::from_millis(80));
         let mut mailbox_sync = interval(Duration::from_secs(2));
+        let mut event_stream = EventStream::new();
 
         while self.running {
             terminal.draw(|frame| self.draw(frame))?;
@@ -279,7 +300,12 @@ impl App {
                         self.apply_load(result);
                     }
                 }
-                event = self.event_stream.next() => {
+                result = self.delivery_rx.recv() => {
+                    if let Some(notice) = result {
+                        self.finish_delivery(notice);
+                    }
+                }
+                event = event_stream.next() => {
                     if let Some(Ok(event)) = event {
                         self.handle_event(event);
                     }
@@ -328,10 +354,13 @@ impl App {
                     ("ctrl+s", "review"),
                     ("esc", "close"),
                 ])
+            } else if let Some(notice) = &self.notice {
+                action_line(notice, false)
             } else {
                 status_line(&[
-                    ("r", "retry"),
-                    (":", "command"),
+                    ("c", "compose"),
+                    ("p", "accounts"),
+                    ("r", "reload"),
                     ("?", "help"),
                     ("q", "quit"),
                 ])
@@ -581,7 +610,15 @@ impl App {
         if key.modifiers == KeyModifiers::CONTROL
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         {
-            self.running = false;
+            match self.overlay.take() {
+                Some(Overlay::Compose(state) | Overlay::ComposeClose(state))
+                | Some(Overlay::DraftReady { state, .. }) => {
+                    self.overlay = Some(Overlay::ComposeClose(state));
+                    return;
+                }
+                overlay => self.overlay = overlay,
+            }
+            self.quit();
             return;
         }
         if self.handle_overlay_key(key) {
@@ -590,13 +627,15 @@ impl App {
         if !matches!(self.mailbox_state, MailboxState::Ready) {
             match (key.modifiers, key.code) {
                 (_, KeyCode::Char('r')) => self.reload(),
+                (_, KeyCode::Char('c')) => self.start_draft(false),
+                (_, KeyCode::Char('p')) => self.open_accounts(),
+                (_, KeyCode::Char('g')) => self.open_folders(),
                 (_, KeyCode::Char('?')) => self.overlay = Some(Overlay::Help { scroll: 0 }),
                 (_, KeyCode::Char(':')) => {
                     self.overlay = Some(Overlay::Command(String::new()));
                 }
-                (_, KeyCode::Char('q'))
-                | (KeyModifiers::CONTROL, KeyCode::Char('c') | KeyCode::Char('C')) => {
-                    self.running = false;
+                (_, KeyCode::Char('q')) => {
+                    self.quit();
                 }
                 _ => {}
             }
@@ -650,6 +689,10 @@ impl App {
             }
             KeyCode::Char('x') if self.active_folder == "Outbox" => {
                 self.retry_outbox();
+                return;
+            }
+            KeyCode::Char('z') if self.active_folder == "Outbox" => {
+                self.review_delivery();
                 return;
             }
             KeyCode::Char('m') => {
@@ -715,7 +758,7 @@ impl App {
 
             (_, KeyCode::Esc | KeyCode::Char('q'))
             | (KeyModifiers::CONTROL, KeyCode::Char('c') | KeyCode::Char('C')) => {
-                self.running = false;
+                self.quit();
             }
 
             (_, KeyCode::Tab) => {
@@ -831,6 +874,26 @@ impl App {
     }
 
     fn open_mail(&mut self, mail_id: &str) {
+        if self.active_folder == "Drafts" && matches!(self.source, MailboxSource::Maildir(_)) {
+            let path = self
+                .mails
+                .iter()
+                .find(|mail| mail.id == mail_id)
+                .and_then(|mail| mail.source_path.clone());
+            if let Some(path) = path {
+                match draft::Composer::resume(&path) {
+                    Ok(composer) => {
+                        self.overlay = Some(Overlay::Compose(ComposeState {
+                            composer,
+                            field: 0,
+                            error: None,
+                        }))
+                    }
+                    Err(error) => self.notice = Some(format!("Unable to open draft: {error}")),
+                }
+                return;
+            }
+        }
         if let Some(index) = self.visible_conversations().iter().position(|index| {
             self.conversations[*index]
                 .mail_ids
@@ -847,13 +910,27 @@ impl App {
         self.spinner_tick = 0;
         let source = self.source.clone();
         let sender = self.load_tx.clone();
+        self.load_generation += 1;
+        let generation = self.load_generation;
         tokio::task::spawn_blocking(move || {
-            let _ = sender.send(source.load());
+            let fingerprint = source.fingerprint().ok();
+            let result = source.load();
+            let _ = sender.send(MailboxLoad {
+                generation,
+                fingerprint,
+                result,
+            });
         });
     }
 
-    fn apply_load(&mut self, result: Result<LoadReport, LoadError>) {
-        match result {
+    fn apply_load(&mut self, load: MailboxLoad) {
+        if load.generation != self.load_generation {
+            return;
+        }
+        if let Some(fingerprint) = load.fingerprint {
+            self.mailbox_fingerprint = fingerprint;
+        }
+        match load.result {
             Ok(report) if report.mails.is_empty() && report.attempted > 0 => {
                 self.clear_mailbox();
                 self.skipped = report.skipped.len();
@@ -885,7 +962,6 @@ impl App {
                 }) {
                     self.reader = None;
                 }
-                self.refresh_fingerprint();
                 self.mailbox_state = MailboxState::Ready;
             }
             Err(error) => {
@@ -921,6 +997,10 @@ impl App {
     }
 
     fn toggle_read(&mut self) {
+        if self.sending {
+            self.notice = Some("Wait for the current send before changing messages.".into());
+            return;
+        }
         let Some(mail_id) = self.active_mail_id() else {
             return;
         };
@@ -954,6 +1034,10 @@ impl App {
     }
 
     fn toggle_starred(&mut self) {
+        if self.sending {
+            self.notice = Some("Wait for the current send before changing messages.".into());
+            return;
+        }
         let Some(mail_id) = self.active_mail_id() else {
             return;
         };
@@ -983,6 +1067,10 @@ impl App {
     }
 
     fn undo_last(&mut self) {
+        if self.sending {
+            self.notice = Some("Wait for the current send before changing messages.".into());
+            return;
+        }
         let Some(undo) = self.undo.take() else {
             return;
         };
@@ -1002,6 +1090,10 @@ impl App {
     }
 
     fn move_active_message(&mut self, archive: bool) {
+        if self.sending {
+            self.notice = Some("Wait for the current send before changing messages.".into());
+            return;
+        }
         let Some(mail_id) = self.active_mail_id() else {
             return;
         };
@@ -1188,13 +1280,14 @@ impl App {
                 MailboxSource::Unified(maildirs)
             }
             Some(index) => {
-                if !self.config.activate(index) {
+                let Some(account) = self.config.accounts.get(index) else {
                     return;
-                }
-                let Some(path) = self.config.maildir.clone() else {
+                };
+                let Some(path) = account.maildir.clone() else {
                     self.notice = Some("Set maildir for this account in config.toml.".into());
                     return;
                 };
+                self.config.activate(index);
                 self.account_label = self.config.accounts[index].label();
                 MailboxSource::Maildir(path)
             }
@@ -1238,43 +1331,115 @@ impl App {
     }
 
     fn retry_outbox(&mut self) {
+        if self.sending {
+            self.notice = Some("A message is still being sent.".into());
+            return;
+        }
         let Some(mail_id) = self.active_mail_id() else {
             return;
         };
         let Some(index) = self.mails.iter().position(|mail| mail.id == mail_id) else {
             return;
         };
-        let Some(path) = self.mails[index].source_path.as_ref() else {
-            self.notice = Some("Queued message has no Maildir path.".into());
-            return;
-        };
-        let contents = match fs::read(path) {
-            Ok(contents) => contents,
+        let mail = self.mails[index].clone();
+        let (source, command, account) = match self.delivery_account(&mail) {
+            Ok(account) => account,
             Err(error) => {
-                self.notice = Some(format!("Unable to read queued message: {error}"));
+                self.notice = Some(error);
                 return;
             }
         };
-        if let Err(error) = sender::send(&self.config.send_command, &contents) {
-            self.notice = Some(format!("Send failed: {error}. Message remains in Outbox."));
+        self.start_delivery(delivery::Delivery {
+            source,
+            mail,
+            command,
+            account,
+        });
+    }
+
+    fn review_delivery(&mut self) {
+        if self.sending {
             return;
         }
-        match self.source.mark_sent(&self.mails[index]) {
-            Ok(change) => {
-                if let Some(change) = change {
-                    self.mails[index].source_path = Some(change.after_path().to_path_buf());
-                }
-                self.mails[index].mailbox = Some("Sent".into());
-                self.reader = None;
-                self.notice = Some("Queued message sent".into());
-                self.refresh_fingerprint();
-                self.rebuild_mailbox(None);
+        let Some(id) = self.active_mail_id() else {
+            return;
+        };
+        let Some(mail) = self.mails.iter().find(|mail| mail.id == id).cloned() else {
+            return;
+        };
+        match self.delivery_account(&mail) {
+            Ok((source, command, account)) => {
+                self.overlay = Some(Overlay::DeliveryReview {
+                    delivery: delivery::Delivery {
+                        source,
+                        mail,
+                        command,
+                        account,
+                    },
+                })
             }
-            Err(error) => {
-                self.notice = Some(format!(
-                    "Message sent, but unable to move it to Sent: {error}"
-                ));
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
+    fn delivery_account(
+        &self,
+        mail: &Mail,
+    ) -> Result<(MailboxSource, Vec<String>, String), String> {
+        if mail_folder(mail) != "Outbox" {
+            return Err("Select an Outbox message to retry.".into());
+        }
+        match &self.source {
+            MailboxSource::Maildir(_) => Ok((
+                self.source.clone(),
+                self.config.send_command.clone(),
+                self.config.delivery_identity(),
+            )),
+            MailboxSource::Unified(_) => {
+                let account = self
+                    .config
+                    .accounts
+                    .iter()
+                    .find(|account| Some(account.id.as_str()) == mail.account.as_deref())
+                    .ok_or("Message account is no longer configured.")?;
+                let root = account
+                    .maildir
+                    .clone()
+                    .ok_or("Message account has no Maildir.")?;
+                Ok((
+                    MailboxSource::Maildir(root),
+                    account.send_command.clone(),
+                    format!(
+                        "{}:{}",
+                        account.id,
+                        account.email.as_deref().unwrap_or_default()
+                    ),
+                ))
             }
+            MailboxSource::Demo => Err("Open a Maildir account before sending.".into()),
+        }
+    }
+
+    fn start_delivery(&mut self, delivery: delivery::Delivery) {
+        self.sending = true;
+        self.notice = Some("Sending message…".into());
+        let sender = self.delivery_tx.clone();
+        tokio::spawn(async move {
+            let _ = sender.send(delivery.run().await);
+        });
+    }
+
+    fn finish_delivery(&mut self, notice: String) {
+        self.sending = false;
+        self.notice = Some(notice);
+        self.reload();
+    }
+
+    fn quit(&mut self) {
+        if self.sending {
+            self.notice = Some("Wait for the current send to finish before quitting.".into());
+        } else {
+            self.running = false;
         }
     }
 
@@ -1285,7 +1450,10 @@ impl App {
     }
 
     fn check_mailbox_changes(&mut self) {
-        if !matches!(self.mailbox_state, MailboxState::Ready) {
+        if !matches!(
+            self.mailbox_state,
+            MailboxState::Ready | MailboxState::Empty
+        ) {
             return;
         }
         if let Ok(fingerprint) = self.source.fingerprint()
@@ -1301,6 +1469,17 @@ impl App {
             return false;
         };
         let mut overlay = match overlay {
+            Overlay::DeliveryReview { delivery } => {
+                if action_key(key, 's') || action_key(key, 'r') {
+                    match delivery.resolve(action_key(key, 's')) {
+                        Ok(()) => self.start_delivery(delivery),
+                        Err(error) => self.notice = Some(error),
+                    }
+                } else if key.code != KeyCode::Esc {
+                    self.overlay = Some(Overlay::DeliveryReview { delivery });
+                }
+                return true;
+            }
             Overlay::Compose(state) => {
                 self.handle_compose_key(state, key);
                 return true;
@@ -1436,7 +1615,10 @@ impl App {
                 }
                 _ => self.overlay = Some(overlay),
             },
-            Overlay::DraftReady { .. } | Overlay::ComposeClose(_) | Overlay::Compose(_) => {
+            Overlay::DraftReady { .. }
+            | Overlay::ComposeClose(_)
+            | Overlay::Compose(_)
+            | Overlay::DeliveryReview { .. } => {
                 unreachable!()
             }
         }
@@ -1461,7 +1643,7 @@ impl App {
             "compose" => self.start_draft(false),
             "reply" => self.start_draft(true),
             "help" => self.overlay = Some(Overlay::Help { scroll: 0 }),
-            "quit" => self.running = false,
+            "quit" => self.quit(),
             _ if command.starts_with("open maildir ") => {
                 let path = command.trim_start_matches("open maildir ").trim();
                 if path.is_empty() {
@@ -1621,6 +1803,11 @@ impl App {
     }
 
     fn finish_composer(&mut self, mut state: ComposeState, send: bool) {
+        if send && self.sending {
+            state.error = Some("Wait for the current send to finish.".into());
+            self.overlay = Some(Overlay::Compose(state));
+            return;
+        }
         let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let contents = if send {
             state.composer.message(&base)
@@ -1636,35 +1823,37 @@ impl App {
             }
         };
         if send {
-            match sender::send(&self.config.send_command, &contents) {
-                Ok(()) => match self.source.save_sent(&contents) {
-                    Ok(_) => {
-                        let _ = state.composer.remove_body();
-                        self.notice = Some("Message sent".into());
-                    }
-                    Err(error) => {
-                        let _ = state.composer.remove_body();
-                        self.notice = Some(format!(
-                            "Message sent, but no Sent copy was saved: {error}. Check the Sent folder."
-                        ));
-                    }
-                },
-                Err(error) => match self.source.save_outbox(&contents) {
-                    Ok(_) => {
-                        let _ = state.composer.remove_body();
-                        self.notice = Some(format!("Send failed: {error}. Queued in Outbox."));
-                    }
-                    Err(queue_error) => {
-                        state.error = Some(format!(
-                            "Send failed: {error}. Unable to queue: {queue_error}. Save the draft and retry."
-                        ));
-                        self.overlay = Some(Overlay::Compose(state));
-                        return;
-                    }
-                },
+            let delivery = match delivery::Delivery::queue(
+                self.source.clone(),
+                self.config.delivery_identity(),
+                self.config.send_command.clone(),
+                &contents,
+            ) {
+                Ok(delivery) => delivery,
+                Err(error) => {
+                    state.error = Some(format!(
+                        "Unable to queue message: {error}. Nothing was sent."
+                    ));
+                    self.overlay = Some(Overlay::Compose(state));
+                    return;
+                }
+            };
+            if let Some(original) = &state.composer.original_draft
+                && let Err(error) = fs::remove_file(original)
+            {
+                self.notice = Some(format!(
+                    "Message queued but not sent: unable to remove the original draft: {error}. Retry from Outbox."
+                ));
+                self.reload();
+                return;
             }
+            self.start_delivery(delivery);
         } else {
-            match self.source.save_draft(&contents) {
+            let saved = match &state.composer.original_draft {
+                Some(path) => self.source.update_draft(path, &contents),
+                None => self.source.save_draft(&contents),
+            };
+            match saved {
                 Ok(_) => {
                     let _ = state.composer.remove_body();
                     self.notice = Some("Draft saved".into());
@@ -1678,7 +1867,7 @@ impl App {
                 }
             }
         }
-        self.refresh_fingerprint();
+        self.reload();
     }
 
     fn visible_conversations(&self) -> Vec<usize> {
@@ -1752,7 +1941,7 @@ fn draw_mailbox_state(
         MailboxState::Empty => {
             frame.render_widget(
                 Paragraph::new(
-                    "No messages found\n\nAdd mail to cur/ or new/, then press r to retry.",
+                    "No messages found\n\nPress c to compose or p to switch accounts. New mail appears automatically.",
                 )
                 .style(theme::text())
                 .alignment(Alignment::Center)
@@ -1830,6 +2019,7 @@ fn draw_no_matches(frame: &mut Frame, area: Rect, folder: &str, folder_empty: bo
 
 fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
     let (width, height) = match overlay {
+        Overlay::DeliveryReview { .. } => (72, 12),
         Overlay::Help { .. } => (66, 23),
         Overlay::Command(_) => (64, 3),
         Overlay::DraftReady { .. } => (68, 11),
@@ -1849,11 +2039,23 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
     );
     frame.render_widget(Clear, area);
     match overlay {
+        Overlay::DeliveryReview { delivery } => {
+            let text = format!(
+                "{}\n\nCheck the receiving mailbox or sender logs first.\nRetrying without checking may send a duplicate.\n\ns  I confirmed delivery · save to Sent only\nr  I confirmed no delivery · retry sending\nesc  leave unchanged",
+                delivery.mail.subject
+            );
+            frame.render_widget(
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: true })
+                    .block(Block::bordered().title(" resolve unconfirmed delivery ")),
+                area,
+            );
+        }
         Overlay::Help { scroll } => {
             let text = [
                 "navigation",
                 "  j/k or arrows  select     tab  switch pane",
-                "  enter          open       esc  close",
+                "  enter          open / resume draft     esc  close",
                 "",
                 "message actions",
                 "  m  read/unread     s  star/unstar",
@@ -1861,6 +2063,7 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                 "  u  undo            r  reply       c  compose",
                 "  l  open links       v  attachments",
                 "  x  retry selected Outbox message",
+                "  z  resolve unconfirmed Outbox delivery",
                 "",
                 "inbox",
                 "  /  search      g  folders      1/2/3  filters",
@@ -2230,6 +2433,350 @@ mod tests {
         ComposeState, MailboxState, Overlay, action_key, draw_mailbox_state, draw_overlay,
         parse_options, reader_is_docked,
     };
+
+    struct TestMailbox(std::path::PathBuf);
+
+    impl TestMailbox {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(crate::storage::unique_name("termail-app"));
+            for folder in ["cur", "new", "tmp"] {
+                std::fs::create_dir_all(root.join(folder)).unwrap();
+            }
+            Self(root)
+        }
+
+        fn app(&self) -> super::App {
+            super::App::new(
+                MailboxSource::Maildir(self.0.clone()),
+                crate::config::Config {
+                    email: Some("me@example.test".into()),
+                    maildir: Some(self.0.clone()),
+                    ..Default::default()
+                },
+            )
+        }
+    }
+
+    impl Drop for TestMailbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn finish_load(app: &mut super::App) {
+        loop {
+            let load = app.load_rx.recv().await.unwrap();
+            let current = load.generation == app.load_generation;
+            app.apply_load(load);
+            if current {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_mailbox_detects_new_messages_and_allows_composing() {
+        let mailbox = TestMailbox::new();
+        let mut app = mailbox.app();
+        finish_load(&mut app).await;
+        assert!(matches!(app.mailbox_state, MailboxState::Empty));
+        app.on_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(matches!(app.overlay, Some(Overlay::Compose(_))));
+        app.overlay = None;
+        std::fs::write(
+            mailbox.0.join("new/incoming"),
+            b"From: ada@example.test\nSubject: hello\n\nhello",
+        )
+        .unwrap();
+        app.check_mailbox_changes();
+        finish_load(&mut app).await;
+        assert_eq!(app.mails.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ignores_stale_mailbox_loads() {
+        let mailbox = TestMailbox::new();
+        let mut app = mailbox.app();
+        finish_load(&mut app).await;
+        app.apply_load(super::MailboxLoad {
+            generation: app.load_generation - 1,
+            fingerprint: Some(999),
+            result: MailboxSource::Demo.load(),
+        });
+        assert!(app.mails.is_empty());
+        assert!(matches!(app.mailbox_state, MailboxState::Empty));
+        assert_ne!(app.mailbox_fingerprint, 999);
+    }
+
+    #[tokio::test]
+    async fn saving_a_draft_refreshes_the_mailbox() {
+        let mailbox = TestMailbox::new();
+        let mut app = mailbox.app();
+        finish_load(&mut app).await;
+        app.start_draft(false);
+        let Some(Overlay::Compose(state)) = app.overlay.take() else {
+            panic!()
+        };
+        app.finish_composer(state, false);
+        finish_load(&mut app).await;
+        assert_eq!(app.mails.len(), 1);
+        assert_eq!(app.mails[0].mailbox.as_deref(), Some("Drafts"));
+    }
+
+    #[tokio::test]
+    async fn resumes_drafts_without_losing_headers_body_or_attachments() {
+        let mailbox = TestMailbox::new();
+        let mut app = mailbox.app();
+        finish_load(&mut app).await;
+        let attachment = mailbox.0.join("notes.txt");
+        std::fs::write(&attachment, b"attached notes").unwrap();
+        let mut composer = Composer::new(
+            Some(&crate::mail::Mail::new(
+                "parent@example.test",
+                "ada@example.test",
+                "Hello",
+                "",
+                None,
+            )),
+            Some("me@example.test"),
+            None,
+        )
+        .unwrap();
+        composer.cc = "cc@example.test".into();
+        composer.bcc = "bcc@example.test".into();
+        composer.format = crate::draft::MessageFormat::Html;
+        composer.attachments = attachment.display().to_string();
+        std::fs::write(&composer.body_path, "<p>Draft body</p>").unwrap();
+        app.finish_composer(
+            ComposeState {
+                composer,
+                field: 0,
+                error: None,
+            },
+            false,
+        );
+        finish_load(&mut app).await;
+        let original = app.mails[0].source_path.clone().unwrap();
+        std::fs::remove_file(attachment).unwrap();
+        app.active_folder = "Drafts".into();
+        app.open_mail(&app.mails[0].id.clone());
+        let Some(Overlay::Compose(mut state)) = app.overlay.take() else {
+            panic!()
+        };
+        assert_eq!(state.composer.format, crate::draft::MessageFormat::Html);
+        assert_eq!(state.composer.cc, "cc@example.test");
+        assert_eq!(state.composer.bcc, "bcc@example.test");
+        let message = state.composer.message(&mailbox.0).unwrap();
+        let parsed = mail_parser::MessageParser::default()
+            .parse(&message)
+            .unwrap();
+        assert_eq!(parsed.in_reply_to().as_text(), Some("parent@example.test"));
+        assert_eq!(parsed.body_html(0).unwrap().trim(), "<p>Draft body</p>");
+        assert_eq!(
+            parsed.attachments().next().unwrap().contents(),
+            b"attached notes"
+        );
+        let extracted = std::path::PathBuf::from(&state.composer.attachments);
+        state.composer.subject = "Updated".into();
+        app.finish_composer(state, false);
+        finish_load(&mut app).await;
+        assert_eq!(app.mails.len(), 1);
+        assert_eq!(app.mails[0].subject, "Updated");
+        assert_eq!(app.mails[0].source_path.as_ref(), Some(&original));
+        assert!(!extracted.exists());
+    }
+
+    #[tokio::test]
+    async fn interrupt_preserves_the_composer() {
+        let mailbox = TestMailbox::new();
+        let mut app = mailbox.app();
+        finish_load(&mut app).await;
+        app.running = true;
+        app.start_draft(false);
+        app.on_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.running);
+        assert!(matches!(app.overlay, Some(Overlay::ComposeClose(_))));
+    }
+
+    #[tokio::test]
+    async fn sending_a_resumed_draft_moves_it_to_sent() {
+        let mailbox = TestMailbox::new();
+        let mut app = mailbox.app();
+        let sink = mailbox.0.join("sent.log");
+        app.config.send_command = vec!["termail-test-sink".into(), sink.display().to_string()];
+        finish_load(&mut app).await;
+        app.start_draft(false);
+        let Some(Overlay::Compose(mut state)) = app.overlay.take() else {
+            panic!()
+        };
+        state.composer.to = "ada@example.test".into();
+        app.finish_composer(state, false);
+        finish_load(&mut app).await;
+        app.active_folder = "Drafts".into();
+        app.open_mail(&app.mails[0].id.clone());
+        let Some(Overlay::Compose(state)) = app.overlay.take() else {
+            panic!()
+        };
+        app.finish_composer(state, true);
+        assert!(app.sending);
+        app.running = true;
+        app.quit();
+        assert!(app.running);
+        let notice = app.delivery_rx.recv().await.unwrap();
+        app.finish_delivery(notice);
+        finish_load(&mut app).await;
+        assert!(!app.sending);
+        assert_eq!(app.mails.len(), 1);
+        assert_eq!(app.mails[0].mailbox.as_deref(), Some("Sent"));
+        assert!(!app.mails[0].unread);
+        assert!(sink.exists());
+    }
+
+    #[tokio::test]
+    async fn uncertain_delivery_is_not_retried_after_reopening() {
+        let mailbox = TestMailbox::new();
+        let source = MailboxSource::Maildir(mailbox.0.clone());
+        let path = source
+            .save_outbox(b"From: me@example.test\nTo: ada@example.test\n\nbody")
+            .unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        std::fs::create_dir_all(mailbox.0.join(".Outbox/termail-state")).unwrap();
+        std::fs::write(
+            mailbox
+                .0
+                .join(".Outbox/termail-state")
+                .join(format!("{name}.delivery")),
+            "sending",
+        )
+        .unwrap();
+        let mail = source.load().unwrap().mails.remove(0);
+        let sink = mailbox.0.join("sent.log");
+        let result = crate::delivery::Delivery {
+            account: "test".into(),
+            source,
+            mail,
+            command: vec!["termail-test-sink".into(), sink.display().to_string()],
+        }
+        .run()
+        .await;
+        assert!(result.contains("unconfirmed"));
+        assert!(path.exists());
+        assert!(!sink.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slow_delivery_keeps_navigation_responsive_and_preserves_its_account() {
+        let personal = TestMailbox::new();
+        let work = TestMailbox::new();
+        let mut app = personal.app();
+        finish_load(&mut app).await;
+        app.config.send_command =
+            vec!["sh".into(), "-c".into(), "cat >/dev/null; sleep 0.1".into()];
+        app.start_draft(false);
+        let Some(Overlay::Compose(mut state)) = app.overlay.take() else {
+            panic!()
+        };
+        state.composer.to = "ada@example.test".into();
+        app.finish_composer(state, true);
+        app.on_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(matches!(app.overlay, Some(Overlay::Help { .. })));
+        app.source = MailboxSource::Maildir(work.0.clone());
+        app.reload();
+        let notice =
+            tokio::time::timeout(std::time::Duration::from_secs(5), app.delivery_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        app.finish_delivery(notice);
+        finish_load(&mut app).await;
+        assert!(app.mails.is_empty());
+        let personal_mail = MailboxSource::Maildir(personal.0.clone()).load().unwrap();
+        assert_eq!(personal_mail.mails[0].mailbox.as_deref(), Some("Sent"));
+    }
+
+    #[tokio::test]
+    async fn sent_copy_failure_does_not_resend_the_message() {
+        let mailbox = TestMailbox::new();
+        let source = MailboxSource::Maildir(mailbox.0.clone());
+        source
+            .save_outbox(b"From: me@example.test\nTo: ada@example.test\nSubject: hello\n\nbody")
+            .unwrap();
+        let mail = source.load().unwrap().mails.remove(0);
+        let sink = mailbox.0.join("sent.log");
+        let delivery = || crate::delivery::Delivery {
+            account: "test".into(),
+            source: source.clone(),
+            mail: mail.clone(),
+            command: vec!["termail-test-sink".into(), sink.display().to_string()],
+        };
+        std::fs::write(mailbox.0.join(".Sent"), "blocked").unwrap();
+        let result = delivery().run().await;
+        assert!(result.contains("unable to move"), "{result}");
+        let sent = std::fs::read(&sink).unwrap();
+        std::fs::remove_file(mailbox.0.join(".Sent")).unwrap();
+        assert_eq!(delivery().run().await, "Message sent");
+        assert_eq!(std::fs::read(sink).unwrap(), sent);
+        assert_eq!(
+            source.load().unwrap().mails[0].mailbox.as_deref(),
+            Some("Sent")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_sender_leaves_a_retryable_outbox_message() {
+        let mailbox = TestMailbox::new();
+        let source = MailboxSource::Maildir(mailbox.0.clone());
+        source
+            .save_outbox(b"From: me@example.test\nTo: ada@example.test\n\nbody")
+            .unwrap();
+        let mail = source.load().unwrap().mails.remove(0);
+        let result = crate::delivery::Delivery {
+            account: "test".into(),
+            source: source.clone(),
+            mail: mail.clone(),
+            command: Vec::new(),
+        }
+        .run()
+        .await;
+        assert!(result.contains("Send failed"));
+        assert!(mail.source_path.as_ref().unwrap().exists());
+        let result = crate::delivery::Delivery {
+            account: "test".into(),
+            source,
+            mail,
+            command: vec![
+                "termail-test-sink".into(),
+                mailbox.0.join("sent.log").display().to_string(),
+            ],
+        }
+        .run()
+        .await;
+        assert_eq!(result, "Message sent");
+    }
+
+    #[tokio::test]
+    async fn unified_outbox_uses_the_message_account() {
+        let personal = TestMailbox::new();
+        let work = TestMailbox::new();
+        let mut app = personal.app();
+        finish_load(&mut app).await;
+        app.config.send_command = vec!["wrong-account".into()];
+        app.config.accounts = vec![crate::config::Account {
+            id: "work".into(),
+            maildir: Some(work.0.clone()),
+            send_command: vec!["work-sender".into()],
+            ..Default::default()
+        }];
+        app.source = MailboxSource::Unified(vec![("work".into(), work.0.clone())]);
+        let mut mail = crate::mail::Mail::new("work:queued", "", "", "", None);
+        mail.account = Some("work".into());
+        mail.mailbox = Some("Outbox".into());
+        let (source, command, account) = app.delivery_account(&mail).unwrap();
+        assert_eq!(account, "work:");
+        assert_eq!(source, MailboxSource::Maildir(work.0.clone()));
+        assert_eq!(command, vec!["work-sender"]);
+    }
 
     #[test]
     fn docks_readers_only_when_they_fit() {

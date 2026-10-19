@@ -99,6 +99,9 @@ fn message_text(mail: &Mail) -> Text<'static> {
         lines.push(header_line("date", date, false));
     }
     lines.push(header_line("subject", &mail.subject, true));
+    if let Some(status) = &mail.delivery_status {
+        lines.push(header_line("delivery", status, true));
+    }
     if mail.html {
         lines.push(header_line("format", "html · remote images blocked", false));
     }
