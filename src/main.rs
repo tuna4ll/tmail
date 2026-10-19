@@ -1,3 +1,4 @@
+mod account_setup;
 mod config;
 mod delivery;
 mod doctor;
@@ -30,8 +31,8 @@ use std::{
 
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent,
-        KeyEventKind, KeyModifiers,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     },
     execute,
 };
@@ -68,6 +69,8 @@ async fn main() -> color_eyre::Result<()> {
         }
         return Ok(());
     }
+    let needs_setup = options.source.is_none() && config.maildir.is_none();
+    let explicit_source = options.source.is_some();
     let source = options
         .source
         .or_else(|| config.maildir.clone().map(MailboxSource::Maildir))
@@ -88,11 +91,13 @@ async fn main() -> color_eyre::Result<()> {
 
     let terminal = ratatui::init();
 
-    execute!(stdout(), EnableMouseCapture)?;
+    execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
 
-    let result = App::new(source, config).run(terminal).await;
+    let mut app = App::new(source, config);
+    app.prepare_accounts(needs_setup, explicit_source);
+    let result = app.run(terminal).await;
 
-    execute!(stdout(), DisableMouseCapture)?;
+    execute!(stdout(), DisableMouseCapture, DisableBracketedPaste)?;
 
     ratatui::restore();
 
@@ -119,6 +124,12 @@ pub struct App {
     sync_rx: mpsc::UnboundedReceiver<(String, Result<String, String>)>,
     syncing: bool,
     last_sync: Option<(String, std::time::Instant)>,
+    setup_tx: mpsc::UnboundedSender<SetupResult>,
+    setup_rx: mpsc::UnboundedReceiver<SetupResult>,
+    setup_generation: u64,
+    checking_account: bool,
+    setup_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    onboarding: bool,
     spinner_tick: u64,
     skipped: usize,
     query: String,
@@ -138,6 +149,12 @@ struct MailboxLoad {
     generation: u64,
     fingerprint: Option<u64>,
     result: Result<LoadReport, LoadError>,
+}
+
+struct SetupResult {
+    request: u64,
+    account: config::Account,
+    result: Result<(), String>,
 }
 
 struct UndoAction {
@@ -162,6 +179,7 @@ enum InboxFilter {
 }
 
 enum Overlay {
+    AccountSetup(Box<account_setup::Form>),
     DeliveryReview {
         delivery: delivery::Delivery,
     },
@@ -260,6 +278,7 @@ impl App {
         let (load_tx, load_rx) = mpsc::unbounded_channel();
         let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
         let (sync_tx, sync_rx) = mpsc::unbounded_channel();
+        let (setup_tx, setup_rx) = mpsc::unbounded_channel();
         let account_label = config
             .accounts
             .get(config.active_account_index())
@@ -286,6 +305,12 @@ impl App {
             sync_rx,
             syncing: false,
             last_sync: None,
+            setup_tx,
+            setup_rx,
+            setup_generation: 0,
+            checking_account: false,
+            setup_cancel: None,
+            onboarding: false,
             spinner_tick: 0,
             skipped: 0,
             query: String::new(),
@@ -337,6 +362,9 @@ impl App {
                         self.apply_load(result);
                     }
                 }
+                result = self.setup_rx.recv() => {
+                    if let Some(result) = result { self.finish_account_setup(result); }
+                }
                 result = self.delivery_rx.recv() => {
                     if let Some(notice) = result {
                         self.finish_delivery(notice);
@@ -357,6 +385,15 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
+        if self.onboarding {
+            frame.render_widget(Paragraph::new("Connect an account\n\nAdd an email account to read and send mail.\n\nenter  Add account    q  Quit")
+                .style(theme::text()).alignment(Alignment::Center)
+                .block(Block::bordered().title(" termail ").border_style(theme::border(true))), frame.area());
+            if let Some(overlay) = &self.overlay {
+                draw_overlay(frame, overlay);
+            }
+            return;
+        }
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -630,8 +667,17 @@ impl App {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key_event(key),
+            Event::Paste(text) => {
+                if let Some(Overlay::AccountSetup(form)) = &mut self.overlay
+                    && !form.busy
+                {
+                    form.input(&text);
+                }
+            }
             Event::Mouse(mouse) => {
-                if self.reader.is_none()
+                if self.overlay.is_none()
+                    && !self.onboarding
+                    && self.reader.is_none()
                     && !self.visible_conversations().is_empty()
                     && let Some(workspace) = &mut self.workspace
                     && let Some(mail_id) = workspace.handle_mouse(mouse)
@@ -659,6 +705,14 @@ impl App {
             return;
         }
         if self.handle_overlay_key(key) {
+            return;
+        }
+        if self.onboarding {
+            match key.code {
+                KeyCode::Enter => self.open_account_setup(account_setup::Mode::Add),
+                KeyCode::Char('q') => self.quit(),
+                _ => {}
+            }
             return;
         }
         if !matches!(self.mailbox_state, MailboxState::Ready) {
@@ -1268,15 +1322,205 @@ impl App {
         }
     }
 
-    fn open_accounts(&mut self) {
-        if self.config.accounts.len() < 2 {
-            self.notice = Some("Add another [[accounts]] entry to switch accounts.".into());
+    fn prepare_accounts(&mut self, needs_setup: bool, explicit_source: bool) {
+        if needs_setup {
+            self.onboarding = true;
+            self.load_generation += 1;
+            self.clear_mailbox();
+            self.open_account_setup(account_setup::Mode::Add);
+        } else if !explicit_source {
+            self.prompt_login();
+        }
+    }
+
+    fn prompt_login(&mut self) {
+        if self.overlay.is_none()
+            && matches!(&self.source, MailboxSource::Maildir(root) if self.config.maildir.as_ref() == Some(root))
+            && self
+                .config
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.password().is_err())
+        {
+            self.open_account_setup(account_setup::Mode::Login);
+        }
+    }
+
+    fn open_account_setup(&mut self, mode: account_setup::Mode) {
+        if self.sending || self.syncing {
+            self.notice = Some(
+                "Wait for sending or syncing to finish before changing account settings.".into(),
+            );
             return;
         }
-        let mut items = vec![AccountItem {
-            label: "All accounts".into(),
-            index: None,
-        }];
+        if mode != account_setup::Mode::Add && self.config.remote.is_none() {
+            self.notice = Some(
+                "This is a local account. Use :account add to connect an IMAP account.".into(),
+            );
+            return;
+        }
+        self.overlay = Some(Overlay::AccountSetup(Box::new(account_setup::Form::new(
+            &self.config,
+            mode,
+        ))));
+    }
+
+    fn handle_account_key(&mut self, mut form: Box<account_setup::Form>, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            self.setup_generation += 1;
+            if let Some(cancel) = &self.setup_cancel {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return;
+        }
+        if form.busy {
+            self.overlay = Some(Overlay::AccountSetup(form));
+            return;
+        }
+        let submit = key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('s')
+            || key.code == KeyCode::Enter
+                && (form.mode == account_setup::Mode::Login || form.field == 10);
+        if submit {
+            if self.checking_account {
+                form.error =
+                    Some("The previous connection check is finishing. Try again shortly.".into());
+            } else {
+                match form.build() {
+                    Ok(account) => {
+                        self.setup_generation += 1;
+                        form.request = self.setup_generation;
+                        form.busy = true;
+                        form.error = None;
+                        self.checking_account = true;
+                        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        self.setup_cancel = Some(cancel.clone());
+                        let request = form.request;
+                        let sender = self.setup_tx.clone();
+                        tokio::spawn(async move {
+                            let checked = account.clone();
+                            let result = tokio::task::spawn_blocking(move || {
+                                account_setup::verify(&checked, &cancel)
+                            })
+                            .await
+                            .unwrap_or_else(|_| Err("Connection check stopped. Try again.".into()));
+                            let _ = sender.send(SetupResult {
+                                request,
+                                account,
+                                result,
+                            });
+                        });
+                    }
+                    Err((field, error)) => {
+                        form.field = field;
+                        form.error = Some(error);
+                    }
+                }
+            }
+        } else {
+            match key.code {
+                KeyCode::Tab | KeyCode::Down | KeyCode::Enter => form.move_field(false),
+                KeyCode::BackTab | KeyCode::Up => form.move_field(true),
+                KeyCode::Backspace => {
+                    if let Some(value) = form.values.get_mut(form.field) {
+                        value.pop();
+                    }
+                }
+                KeyCode::Char(' ') if form.field == 10 => form.make_default = !form.make_default,
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(value) = form.values.get_mut(form.field) {
+                        use zeroize::Zeroize;
+                        value.zeroize();
+                    }
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    form.input(&character.to_string())
+                }
+                _ => {}
+            }
+        }
+        self.overlay = Some(Overlay::AccountSetup(form));
+    }
+
+    fn finish_account_setup(&mut self, result: SetupResult) {
+        self.checking_account = false;
+        self.setup_cancel = None;
+        if result.request != self.setup_generation {
+            return;
+        }
+        let Some(Overlay::AccountSetup(mut form)) = self.overlay.take() else {
+            return;
+        };
+        if form.request != result.request {
+            self.overlay = Some(Overlay::AccountSetup(form));
+            return;
+        }
+        form.busy = false;
+        let saved = result.result.and_then(|_| {
+            let root = result
+                .account
+                .maildir
+                .as_ref()
+                .ok_or("Set a local cache directory before connecting.")?;
+            imap_client::initialize(root)?;
+            if form.mode == account_setup::Mode::Login {
+                self.config.remote = result.account.remote.clone();
+                if let Some(account) = self
+                    .config
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == result.account.id)
+                {
+                    account.remote = result.account.remote;
+                }
+                Ok(())
+            } else {
+                self.config.save_account(
+                    result.account,
+                    form.mode == account_setup::Mode::Edit,
+                    form.make_default,
+                )
+            }
+        });
+        if let Err(error) = saved {
+            form.error = Some(error);
+            self.overlay = Some(Overlay::AccountSetup(form));
+            return;
+        }
+        self.onboarding = false;
+        self.last_sync = None;
+        self.active_folder = "INBOX".into();
+        self.query.clear();
+        self.filter = InboxFilter::All;
+        self.undo = None;
+        self.reader = None;
+        self.source = MailboxSource::Maildir(self.config.maildir.clone().unwrap());
+        self.account_label = self.config.current_account().label();
+        self.notice = Some("Account connected".into());
+        self.reload();
+    }
+
+    fn open_accounts(&mut self) {
+        if self.config.accounts.is_empty() {
+            self.open_account_setup(if self.config.remote.is_some() {
+                account_setup::Mode::Edit
+            } else {
+                account_setup::Mode::Add
+            });
+            return;
+        }
+        let mut items = if self.config.accounts.len() > 1 {
+            vec![AccountItem {
+                label: "All accounts".into(),
+                index: None,
+            }]
+        } else {
+            Vec::new()
+        };
         items.extend(
             self.config
                 .accounts
@@ -1290,7 +1534,7 @@ impl App {
         let selected = if matches!(self.source, MailboxSource::Unified(_)) {
             0
         } else {
-            self.config.active_account_index() + 1
+            self.config.active_account_index() + usize::from(self.config.accounts.len() > 1)
         };
         self.overlay = Some(Overlay::Accounts { selected, items });
     }
@@ -1336,6 +1580,7 @@ impl App {
         self.undo = None;
         self.reader = None;
         self.reload();
+        self.prompt_login();
     }
 
     fn save_active_attachment(&mut self, index: usize, open: bool) {
@@ -1463,9 +1708,15 @@ impl App {
     }
 
     fn sync_if_due(&mut self) {
+        if self.onboarding || matches!(self.overlay, Some(Overlay::AccountSetup(_))) {
+            return;
+        }
         let Some(remote) = &self.config.remote else {
             return;
         };
+        if remote.password().is_err() {
+            return;
+        }
         let identity = self.config.delivery_identity();
         let due = match &self.last_sync {
             Some((account, time)) if account == &identity => {
@@ -1491,6 +1742,10 @@ impl App {
             return;
         };
         if self.config.maildir.as_ref() != Some(root) {
+            return;
+        }
+        if remote.password().is_err() {
+            self.prompt_login();
             return;
         }
         let root = root.clone();
@@ -1543,9 +1798,10 @@ impl App {
     }
 
     fn quit(&mut self) {
-        if self.sending || self.syncing {
-            self.notice =
-                Some("Wait for the current send or sync to finish before quitting.".into());
+        if self.sending || self.syncing || self.checking_account {
+            self.notice = Some(
+                "Wait for the current connection, send or sync to finish before quitting.".into(),
+            );
         } else {
             self.running = false;
         }
@@ -1577,6 +1833,10 @@ impl App {
             return false;
         };
         let mut overlay = match overlay {
+            Overlay::AccountSetup(form) => {
+                self.handle_account_key(form, key);
+                return true;
+            }
             Overlay::DeliveryReview { delivery } => {
                 if action_key(key, 's') || action_key(key, 'r') {
                     match delivery.resolve(action_key(key, 's')) {
@@ -1708,6 +1968,19 @@ impl App {
             },
             Overlay::Accounts { selected, items } => match key.code {
                 KeyCode::Esc => {}
+                KeyCode::Char('a') => self.open_account_setup(account_setup::Mode::Add),
+                KeyCode::Char('e') => {
+                    if let Some(index) = items.get(*selected).and_then(|item| item.index) {
+                        self.select_account(Some(index));
+                        self.open_account_setup(account_setup::Mode::Edit);
+                    }
+                }
+                KeyCode::Char('l') => {
+                    if let Some(index) = items.get(*selected).and_then(|item| item.index) {
+                        self.select_account(Some(index));
+                        self.open_account_setup(account_setup::Mode::Login);
+                    }
+                }
                 KeyCode::Down | KeyCode::Char('j') if *selected + 1 < items.len() => {
                     *selected += 1;
                     self.overlay = Some(overlay);
@@ -1729,12 +2002,17 @@ impl App {
             | Overlay::DeliveryReview { .. } => {
                 unreachable!()
             }
+            Overlay::AccountSetup(_) => unreachable!(),
         }
         true
     }
 
     fn run_command(&mut self, command: &str) {
         match command {
+            "accounts" => self.open_accounts(),
+            "account add" => self.open_account_setup(account_setup::Mode::Add),
+            "account edit" => self.open_account_setup(account_setup::Mode::Edit),
+            "login" => self.open_account_setup(account_setup::Mode::Login),
             "reload" => self.reload(),
             "sync" => self.start_sync(),
             "filter all" => {
@@ -1884,11 +2162,11 @@ impl App {
         &mut self,
         mut state: ComposeState,
     ) -> color_eyre::Result<DefaultTerminal> {
-        execute!(stdout(), DisableMouseCapture)?;
+        execute!(stdout(), DisableMouseCapture, DisableBracketedPaste)?;
         ratatui::restore();
         let result = self.run_editor(&state.composer.body_path);
         let terminal = ratatui::init();
-        execute!(stdout(), EnableMouseCapture)?;
+        execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
 
         if let Err(error) = result {
             state.error = Some(format!(
@@ -2128,6 +2406,14 @@ fn draw_no_matches(frame: &mut Frame, area: Rect, folder: &str, folder_empty: bo
 
 fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
     let (width, height) = match overlay {
+        Overlay::AccountSetup(form) => (
+            76,
+            if form.mode == account_setup::Mode::Login {
+                12
+            } else {
+                22
+            },
+        ),
         Overlay::DeliveryReview { .. } => (72, 12),
         Overlay::Help { .. } => (66, 23),
         Overlay::Command(_) => (64, 3),
@@ -2148,6 +2434,7 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
     );
     frame.render_widget(Clear, area);
     match overlay {
+        Overlay::AccountSetup(form) => form.draw(frame, area),
         Overlay::DeliveryReview { delivery } => {
             let text = format!(
                 "{}\n\nCheck the receiving mailbox or sender logs first.\nRetrying without checking may send a duplicate.\n\ns  I confirmed delivery · save to Sent only\nr  I confirmed no delivery · retry sending\nesc  leave unchanged",
@@ -2186,6 +2473,8 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                 "commands",
                 "  :reload                 :filter unread",
                 "  :sync                   fetch new IMAP messages",
+                "  :accounts               :account add / :account edit",
+                "  :login                  enter an account password",
                 "  :open maildir PATH      :compose  :reply  :quit",
             ]
             .join("\n");
@@ -2352,7 +2641,7 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                     Block::bordered()
                         .border_style(theme::border(true))
                         .title_style(theme::title(true))
-                        .title(" accounts ")
+                        .title(" accounts · a add · e edit · l sign in ")
                         .bg(theme::SURFACE),
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
@@ -2596,10 +2885,183 @@ mod tests {
         app.config.remote = Some(crate::remote::tests::Server::new().remote());
         finish_load(&mut app).await;
         app.start_sync();
-        let (_, result) = app.sync_rx.recv().await.unwrap();
-        assert!(result.unwrap_err().contains("before connecting"));
+        assert!(
+            matches!(app.overlay, Some(Overlay::AccountSetup(ref form)) if form.mode == crate::account_setup::Mode::Login)
+        );
+        assert!(!app.syncing);
         assert_eq!(app.mails.len(), 1);
         assert!(matches!(app.mailbox_state, MailboxState::Ready));
+    }
+
+    #[tokio::test]
+    async fn first_run_opens_setup_without_loading_demo_mail() {
+        let mailbox = TestMailbox::new();
+        let config = crate::config::Config::load(Some(&mailbox.0.join("config.toml"))).unwrap();
+        let mut app = super::App::new(MailboxSource::Demo, config);
+        app.prepare_accounts(true, false);
+        assert!(app.onboarding);
+        let load = app.load_rx.recv().await.unwrap();
+        app.apply_load(load);
+        assert!(app.mails.is_empty());
+        assert!(
+            matches!(app.overlay, Some(Overlay::AccountSetup(ref form)) if form.mode == crate::account_setup::Mode::Add)
+        );
+        app.on_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.overlay.is_none());
+        assert!(app.onboarding);
+        assert!(!mailbox.0.join("config.toml").exists());
+        app.on_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.overlay, Some(Overlay::AccountSetup(_))));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("add account"));
+    }
+
+    fn pending_setup(app: &mut super::App, request: u64) -> crate::config::Account {
+        let mut form = crate::account_setup::tests::filled_form(&app.config);
+        let account = form.build().unwrap();
+        form.busy = true;
+        form.request = request;
+        app.setup_generation = request;
+        app.checking_account = true;
+        app.overlay = Some(Overlay::AccountSetup(Box::new(form)));
+        account
+    }
+
+    #[tokio::test]
+    async fn failed_and_cancelled_logins_never_save_account_settings() {
+        let mailbox = TestMailbox::new();
+        let config = crate::config::Config::load(Some(&mailbox.0.join("config.toml"))).unwrap();
+        let mut app = super::App::new(MailboxSource::Demo, config);
+        app.prepare_accounts(true, false);
+        let account = pending_setup(&mut app, 1);
+        app.finish_account_setup(super::SetupResult {
+            request: 1,
+            account,
+            result: Err("Sign-in failed".into()),
+        });
+        assert!(
+            matches!(app.overlay, Some(Overlay::AccountSetup(ref form)) if !form.busy && form.error.as_deref() == Some("Sign-in failed"))
+        );
+        assert!(!mailbox.0.join("config.toml").exists());
+        assert!(app.config.accounts.is_empty());
+        let account = pending_setup(&mut app, 2);
+        app.on_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.finish_account_setup(super::SetupResult {
+            request: 2,
+            account,
+            result: Ok(()),
+        });
+        assert!(app.overlay.is_none());
+        assert!(app.onboarding);
+        assert!(!app.checking_account);
+        assert!(!mailbox.0.join("config.toml").exists());
+        assert!(app.config.accounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn verified_setup_persists_settings_and_restart_requests_password() {
+        let mailbox = TestMailbox::new();
+        let path = mailbox.0.join("config.toml");
+        let config = crate::config::Config::load(Some(&path)).unwrap();
+        let mut app = super::App::new(MailboxSource::Demo, config);
+        app.prepare_accounts(true, false);
+        let account = pending_setup(&mut app, 1);
+        app.finish_account_setup(super::SetupResult {
+            request: 1,
+            account,
+            result: Ok(()),
+        });
+        assert!(!app.onboarding);
+        assert!(app.overlay.is_none());
+        assert!(
+            app.config
+                .remote
+                .as_ref()
+                .unwrap()
+                .session_password
+                .is_some()
+        );
+        finish_load(&mut app).await;
+        assert!(matches!(app.mailbox_state, MailboxState::Empty));
+        let config = crate::config::Config::load(Some(&path)).unwrap();
+        let source = MailboxSource::Maildir(config.maildir.clone().unwrap());
+        let mut restarted = super::App::new(source, config);
+        restarted.prepare_accounts(false, false);
+        assert!(
+            matches!(restarted.overlay, Some(Overlay::AccountSetup(ref form)) if form.mode == crate::account_setup::Mode::Login)
+        );
+        let before = std::fs::read(&path).unwrap();
+        let Some(Overlay::AccountSetup(mut form)) = restarted.overlay.take() else {
+            panic!()
+        };
+        form.values[3] = "another-fake-password".into();
+        form.request = 2;
+        let account = form.build().unwrap();
+        restarted.setup_generation = 2;
+        restarted.overlay = Some(Overlay::AccountSetup(form));
+        restarted.finish_account_setup(super::SetupResult {
+            request: 2,
+            account,
+            result: Ok(()),
+        });
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(
+            restarted
+                .config
+                .remote
+                .as_ref()
+                .unwrap()
+                .password()
+                .unwrap(),
+            "another-fake-password"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_form_accepts_paste_without_executing_newlines() {
+        let mailbox = TestMailbox::new();
+        let mut app = mailbox.app();
+        app.open_account_setup(crate::account_setup::Mode::Add);
+        app.handle_event(crossterm::event::Event::Paste("Tuna\r\nKılıç\u{1b}".into()));
+        let Some(Overlay::AccountSetup(form)) = &app.overlay else {
+            panic!()
+        };
+        assert_eq!(form.values[0], "TunaKılıç");
+        assert!(!form.busy);
+    }
+
+    #[tokio::test]
+    async fn single_account_menu_allows_adding_and_editing() {
+        let mailbox = TestMailbox::new();
+        let mut app = mailbox.app();
+        app.config.path = Some(mailbox.0.join("config.toml"));
+        let account = crate::account_setup::tests::filled_form(&app.config)
+            .build()
+            .unwrap();
+        app.config.accounts.push(account);
+        app.config.activate(0);
+        app.open_accounts();
+        assert!(
+            matches!(app.overlay, Some(Overlay::Accounts { ref items, .. }) if items.len() == 1)
+        );
+        app.on_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(
+            matches!(app.overlay, Some(Overlay::AccountSetup(ref form)) if form.mode == crate::account_setup::Mode::Add)
+        );
+        app.overlay = None;
+        app.open_accounts();
+        app.on_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(
+            matches!(app.overlay, Some(Overlay::AccountSetup(ref form)) if form.mode == crate::account_setup::Mode::Edit)
+        );
     }
 
     #[tokio::test]

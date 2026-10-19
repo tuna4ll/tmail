@@ -66,6 +66,28 @@ pub async fn send_smtp(
     .map_err(|_| SendError::uncertain("SMTP worker stopped. Check delivery before retrying."))?
 }
 
+pub fn check_connection(remote: &crate::remote::RemoteConfig) -> Result<(), String> {
+    remote.validate()?;
+    let password = remote.password()?;
+    let transport = lettre::SmtpTransport::relay(&remote.smtp_host)
+        .map_err(|_| "Unable to configure SMTP TLS.")?
+        .port(remote.smtp_port)
+        .timeout(Some(remote.timeout()))
+        .credentials(lettre::transport::smtp::authentication::Credentials::new(
+            remote.username.clone(),
+            password,
+        ))
+        .build();
+    check_transport(&transport)
+}
+
+fn check_transport(transport: &lettre::SmtpTransport) -> Result<(), String> {
+    match transport.test_connection() {
+        Ok(true) => Ok(()),
+        _ => Err("SMTP sign-in failed. Check the server, port and password.".into()),
+    }
+}
+
 fn smtp_with_transport(transport: &lettre::SmtpTransport, message: &[u8]) -> Result<(), SendError> {
     use lettre::Transport;
     let envelope = crate::message::envelope(message).map_err(SendError::failed)?;
@@ -245,6 +267,47 @@ mod smtp_tests {
         let worker = server.spawn(|stream| assert!(stream.is_none()));
         let error = smtp_with_transport(&transport, MESSAGE).unwrap_err();
         assert_eq!(error.kind, FailureKind::Configuration);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn connection_check_authenticates_without_sending_mail() {
+        let server = Server::new();
+        let transport = transport(&server, true);
+        let worker = server.spawn(|stream| {
+            let mut stream = BufReader::new(stream.unwrap());
+            stream
+                .get_mut()
+                .write_all(b"220 localhost ESMTP\r\n")
+                .unwrap();
+            let mut authenticated = false;
+            let mut checked = false;
+            loop {
+                let mut line = String::new();
+                if stream.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let response = if line.starts_with("EHLO ") {
+                    "250-localhost\r\n250 AUTH PLAIN\r\n"
+                } else if line.starts_with("AUTH ") {
+                    authenticated = true;
+                    "235 authenticated\r\n"
+                } else if line == "NOOP\r\n" {
+                    checked = true;
+                    "250 ok\r\n"
+                } else if line == "QUIT\r\n" {
+                    stream.get_mut().write_all(b"221 bye\r\n").unwrap();
+                    break;
+                } else {
+                    panic!("Connection check must not send mail");
+                };
+                stream.get_mut().write_all(response.as_bytes()).unwrap();
+            }
+            assert!(authenticated);
+            assert!(checked);
+        });
+        check_transport(&transport).unwrap();
+        drop(transport);
         worker.join().unwrap();
     }
 }

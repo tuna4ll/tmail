@@ -1,8 +1,17 @@
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone)]
+pub struct SessionPassword(pub zeroize::Zeroizing<String>);
+
+impl std::fmt::Debug for SessionPassword {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[redacted]")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RemoteConfig {
     pub imap_host: String,
@@ -16,6 +25,8 @@ pub struct RemoteConfig {
     pub sync_interval_secs: u64,
     pub batch_size: usize,
     pub timeout_secs: u64,
+    #[serde(skip)]
+    pub session_password: Option<std::sync::Arc<SessionPassword>>,
 }
 
 impl Default for RemoteConfig {
@@ -32,6 +43,7 @@ impl Default for RemoteConfig {
             sync_interval_secs: 60,
             batch_size: 200,
             timeout_secs: 30,
+            session_password: None,
         }
     }
 }
@@ -81,6 +93,11 @@ impl RemoteConfig {
     }
 
     pub fn password(&self) -> Result<String, String> {
+        if let Some(password) = &self.session_password
+            && !password.0.is_empty()
+        {
+            return Ok(password.0.to_string());
+        }
         std::env::var(&self.password_env)
             .ok()
             .filter(|value| !value.is_empty())
