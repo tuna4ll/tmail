@@ -96,6 +96,10 @@ impl MailboxSource {
         self.set_flag(mail, 'F', starred)
     }
 
+    pub fn set_answered(&self, mail: &Mail) -> Result<Option<MaildirChange>, LoadError> {
+        self.set_flag(mail, 'R', true)
+    }
+
     pub fn archive(&self, mail: &Mail) -> Result<Option<MaildirChange>, LoadError> {
         self.move_to(mail, ".Archive")
     }
@@ -328,6 +332,7 @@ fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
                 .iter()
                 .map(|value| clean_id(value))
                 .collect();
+            let reply_address = parsed.reply_to().map(format_addresses).unwrap_or_default();
             let unread = !message.flags().contains(&Flag::Seen);
             let starred = message.flags().contains(&Flag::Flagged);
             let html = parsed.html_body_count() > 0;
@@ -371,6 +376,7 @@ fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
                 timestamp,
                 reply_to,
                 references,
+                reply_address,
                 unread,
                 starred,
                 attachment_count: attachments.len(),
@@ -446,7 +452,7 @@ fn cache_path(maildir: &Path) -> Option<PathBuf> {
     maildir.hash(&mut hasher);
     ProjectDirs::from("com", "tunakilic", "termail").map(|dirs| {
         dirs.cache_dir()
-            .join(format!("maildir-v3-{:016x}.json", hasher.finish()))
+            .join(format!("maildir-v4-{:016x}.json", hasher.finish()))
     })
 }
 

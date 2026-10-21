@@ -1,4 +1,8 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    borrow::Borrow,
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +25,8 @@ pub struct Mail {
     pub timestamp: Option<i64>,
     pub reply_to: Option<String>,
     pub references: Vec<String>,
+    #[serde(default)]
+    pub reply_address: Vec<String>,
     pub unread: bool,
     pub starred: bool,
     pub attachment_count: usize,
@@ -43,6 +49,8 @@ pub struct Conversation {
     pub root_id: String,
     pub subject: String,
     pub mail_ids: Vec<String>,
+    /// Positions of the messages in the slice the conversation was grouped from.
+    pub positions: Vec<usize>,
 }
 
 impl Conversation {
@@ -51,103 +59,162 @@ impl Conversation {
             root_id: root_id.into(),
             subject: subject.into(),
             mail_ids: Vec::new(),
+            positions: Vec::new(),
         }
     }
 
     pub fn last_sender<'a>(&self, mails: &'a [Mail]) -> Option<&'a str> {
-        let mail_id = self.latest_mail_id()?;
-        mails
-            .iter()
-            .find(|mail| mail.id == mail_id)
-            .map(|mail| mail.from.as_str())
+        self.mails(mails).last().map(|mail| mail.from.as_str())
     }
 
     pub fn latest_mail_id(&self) -> Option<&str> {
         self.mail_ids.last().map(String::as_str)
     }
 
+    pub fn mails<'a>(&self, mails: &'a [Mail]) -> Vec<&'a Mail> {
+        self.positions
+            .iter()
+            .filter_map(|position| mails.get(*position))
+            .collect()
+    }
+
     pub fn is_unread(&self, mails: &[Mail]) -> bool {
-        self.mail_ids.iter().any(|id| {
-            mails
-                .iter()
-                .find(|mail| &mail.id == id)
-                .is_some_and(|mail| mail.unread)
-        })
+        self.mails(mails).iter().any(|mail| mail.unread)
     }
 
     pub fn is_starred(&self, mails: &[Mail]) -> bool {
-        self.mail_ids.iter().any(|id| {
-            mails
-                .iter()
-                .find(|mail| &mail.id == id)
-                .is_some_and(|mail| mail.starred)
-        })
+        self.mails(mails).iter().any(|mail| mail.starred)
     }
 
     pub fn matches(&self, mails: &[Mail], query: &str) -> bool {
         let query = query.to_lowercase();
-        self.mail_ids.iter().any(|id| {
-            mails
-                .iter()
-                .find(|mail| &mail.id == id)
-                .is_some_and(|mail| mail.matches(&query))
-        })
+        self.mails(mails).iter().any(|mail| mail.matches(&query))
     }
 }
 
+#[cfg(test)]
 pub fn group_conversations(mails: &[Mail]) -> Vec<Conversation> {
-    let mut conversations = Vec::new();
+    group_conversations_where(mails, |_| Some(0))
+}
 
-    for mail in mails {
-        let root = root_mail(mail, mails);
-        let index = conversations
-            .iter()
-            .position(|conversation: &Conversation| conversation.root_id == root.id);
-        let conversation = match index {
-            Some(index) => &mut conversations[index],
-            None => {
-                conversations.push(Conversation::new(&root.id, &root.subject));
-                conversations.last_mut().unwrap()
-            }
+/// Groups the messages `rank` accepts. When several copies share a Message-ID, the
+/// one with the lowest rank stands for all of them.
+pub fn group_conversations_where(
+    mails: &[Mail],
+    rank: impl Fn(&Mail) -> Option<u8>,
+) -> Vec<Conversation> {
+    let mut chosen: HashMap<&str, (u8, usize)> = HashMap::new();
+    for (position, mail) in mails.iter().enumerate() {
+        let Some(value) = rank(mail) else {
+            continue;
         };
-        conversation.mail_ids.push(mail.id.clone());
+        let entry = chosen.entry(mail.id.as_str()).or_insert((value, position));
+        if value < entry.0 {
+            *entry = (value, position);
+        }
     }
-
+    let mut pool: Vec<usize> = chosen.into_values().map(|(_, position)| position).collect();
+    pool.sort_unstable();
+    let subset: Vec<&Mail> = pool.iter().map(|position| &mails[*position]).collect();
+    let roots = roots(&parents(&subset));
+    let mut conversations: Vec<Conversation> = Vec::new();
+    let mut by_root = HashMap::new();
+    for (index, root) in roots.into_iter().enumerate() {
+        let conversation = *by_root.entry(root).or_insert_with(|| {
+            conversations.push(Conversation::new(&subset[root].id, &subset[root].subject));
+            conversations.len() - 1
+        });
+        conversations[conversation]
+            .mail_ids
+            .push(subset[index].id.clone());
+        conversations[conversation].positions.push(pool[index]);
+    }
     conversations
 }
 
-fn root_mail<'a>(mail: &'a Mail, mails: &'a [Mail]) -> &'a Mail {
-    let mut current = mail;
-    let mut visited = HashSet::new();
-
-    while visited.insert(current.id.as_str()) {
-        let Some(parent_id) = parent_id(current, mails) else {
-            return current;
-        };
-        let Some(parent) = mails.iter().find(|mail| mail.id == parent_id) else {
-            return current;
-        };
-        current = parent;
-    }
-
-    mail
-}
-
-pub fn parent_id<'a>(mail: &'a Mail, mails: &'a [Mail]) -> Option<&'a str> {
-    mail.reply_to
-        .as_deref()
-        .filter(|id| mails.iter().any(|candidate| candidate.id == *id))
-        .or_else(|| {
-            mail.references
-                .iter()
-                .rev()
-                .find(|id| mails.iter().any(|candidate| candidate.id == id.as_str()))
-                .map(String::as_str)
+/// Strips reply and forward prefixes, reporting whether there were any.
+fn base_subject(subject: &str) -> (String, bool) {
+    let mut rest = subject.trim();
+    let mut reply = false;
+    while let Some(prefix) = ["re:", "fwd:", "fw:", "aw:", "sv:", "ynt:", "ilt:"]
+        .iter()
+        .find(|prefix| {
+            rest.get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
         })
+    {
+        rest = rest[prefix.len()..].trim_start();
+        reply = true;
+    }
+    (rest.to_lowercase(), reply)
 }
 
-pub fn root_id<'a>(mail: &'a Mail, mails: &'a [Mail]) -> &'a str {
-    root_mail(mail, mails).id.as_str()
+/// The index of each message's parent. Replies are linked by In-Reply-To and
+/// References; replies from clients that drop those headers fall back to the most
+/// recent earlier message with the same subject.
+pub fn parents<M: std::borrow::Borrow<Mail>>(mails: &[M]) -> Vec<Option<usize>> {
+    let mut index = HashMap::new();
+    for (position, mail) in mails.iter().map(Borrow::borrow).enumerate() {
+        index.entry(mail.id.as_str()).or_insert(position);
+    }
+    let mut latest_by_subject: HashMap<String, usize> = HashMap::new();
+    mails
+        .iter()
+        .map(Borrow::borrow)
+        .enumerate()
+        .map(|(position, mail): (usize, &Mail)| {
+            let explicit = mail
+                .reply_to
+                .as_deref()
+                .and_then(|id| index.get(id))
+                .or_else(|| {
+                    mail.references
+                        .iter()
+                        .rev()
+                        .find_map(|id| index.get(id.as_str()))
+                })
+                .copied()
+                .filter(|parent| *parent != position);
+            let (subject, reply) = base_subject(&mail.subject);
+            let parent = explicit.or_else(|| {
+                (reply && mail.reply_to.is_none() && mail.references.is_empty())
+                    .then(|| latest_by_subject.get(&subject).copied())
+                    .flatten()
+            });
+            if !subject.is_empty() {
+                latest_by_subject.insert(subject, position);
+            }
+            parent
+        })
+        .collect()
+}
+
+/// The thread root of each message, given `parents`. Cycles stop at the first
+/// message seen twice.
+pub fn roots(parents: &[Option<usize>]) -> Vec<usize> {
+    let mut roots: Vec<Option<usize>> = vec![None; parents.len()];
+    for start in 0..parents.len() {
+        let mut path = Vec::new();
+        let mut seen = HashSet::new();
+        let mut current = start;
+        let root = loop {
+            if let Some(root) = roots[current] {
+                break root;
+            }
+            if !seen.insert(current) {
+                break current;
+            }
+            path.push(current);
+            match parents[current] {
+                Some(parent) => current = parent,
+                None => break current,
+            }
+        };
+        for position in path {
+            roots[position] = Some(root);
+        }
+    }
+    roots.into_iter().map(Option::unwrap_or_default).collect()
 }
 
 impl Mail {
@@ -163,6 +230,7 @@ impl Mail {
             timestamp: None,
             reply_to: reply_to.map(Into::into),
             references: Vec::new(),
+            reply_address: Vec::new(),
             unread: false,
             starred: false,
             attachment_count: 0,
@@ -221,6 +289,16 @@ impl Mail {
                 .iter()
                 .any(|value| value.to_lowercase().contains(&query))
     }
+}
+
+/// The bare, lowercased address from a display form such as `Name <a@b.test>`.
+pub fn email_of(value: &str) -> String {
+    value
+        .rsplit_once('<')
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .map_or(value, |(address, _)| address)
+        .trim()
+        .to_lowercase()
 }
 
 pub fn demo_mails() -> Vec<Mail> {

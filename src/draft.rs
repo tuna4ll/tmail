@@ -6,7 +6,7 @@ use std::{
 use mail_builder::{MessageBuilder, headers::text::Text};
 use mail_parser::{MessageParser, MimeHeaders};
 
-use crate::mail::Mail;
+use crate::mail::{Mail, email_of};
 
 #[derive(Clone, Debug)]
 pub struct Summary {
@@ -47,6 +47,14 @@ impl MessageFormat {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Start {
+    New,
+    Reply,
+    ReplyAll,
+    Forward,
+}
+
 #[derive(Debug)]
 pub struct Composer {
     pub from: String,
@@ -81,33 +89,73 @@ impl Composer {
         identity: Option<&str>,
         signature: Option<&str>,
     ) -> io::Result<Self> {
+        let start = if reply_to.is_some() {
+            Start::Reply
+        } else {
+            Start::New
+        };
+        Self::start(start, reply_to, identity, signature)
+    }
+
+    pub fn start(
+        start: Start,
+        original: Option<&Mail>,
+        identity: Option<&str>,
+        signature: Option<&str>,
+    ) -> io::Result<Self> {
         let name = crate::storage::unique_name("termail");
         let body_path = std::env::temp_dir().join(format!("{name}.txt"));
-        let body = signature
+        let own = identity.map(email_of).filter(|value| value.contains('@'));
+        let mut body = signature
             .filter(|value| !value.trim().is_empty())
             .map(|value| format!("\n\n-- \n{}", value.trim()))
             .unwrap_or_default();
+        let original = original.filter(|_| start != Start::New);
+        if let Some(mail) = original {
+            if body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str("\n\n");
+            body.push_str(&match start {
+                Start::Forward => forwarded(mail),
+                _ => quoted(mail),
+            });
+        }
         crate::storage::write_new(&body_path, body.as_bytes())?;
-        let subject = reply_to
+        let subject = original
             .map(|mail| {
-                if mail.subject.to_lowercase().starts_with("re:") {
-                    mail.subject.clone()
-                } else {
-                    format!("Re: {}", mail.subject)
+                let lowered = mail.subject.to_lowercase();
+                match start {
+                    Start::Forward if lowered.starts_with("fwd:") || lowered.starts_with("fw:") => {
+                        mail.subject.clone()
+                    }
+                    Start::Forward => format!("Fwd: {}", mail.subject),
+                    _ if lowered.starts_with("re:") => mail.subject.clone(),
+                    _ => format!("Re: {}", mail.subject),
                 }
             })
             .unwrap_or_default();
-        let mut references = reply_to
+        let replying = original.filter(|_| start != Start::Forward);
+        let mut references = replying
             .map(|mail| mail.references.clone())
             .unwrap_or_default();
-        if let Some(mail) = reply_to {
+        if let Some(mail) = replying {
             references.push(mail.id.clone());
             references.dedup();
         }
-        Ok(Self {
+        let (to, cc) = replying
+            .map(|mail| recipients(mail, own.as_deref(), start == Start::ReplyAll))
+            .unwrap_or_default();
+        let domain = own
+            .as_deref()
+            .and_then(|address| address.rsplit_once('@'))
+            .map(|(_, domain)| domain.to_owned())
+            .filter(|domain| !domain.is_empty())
+            .unwrap_or_else(|| "localhost".into());
+        let mut composer = Self {
             from: identity.unwrap_or_default().into(),
-            to: reply_to.map(|mail| mail.from.clone()).unwrap_or_default(),
-            cc: String::new(),
+            to,
+            cc,
             bcc: String::new(),
             subject,
             attachments: String::new(),
@@ -115,10 +163,45 @@ impl Composer {
             body_path,
             original_draft: None,
             attachment_dir: None,
-            reply_to: reply_to.map(|mail| mail.id.clone()),
+            reply_to: replying.map(|mail| mail.id.clone()),
             references,
-            message_id: format!("{name}@localhost"),
-        })
+            message_id: format!("{name}@{domain}"),
+        };
+        if start == Start::Forward
+            && let Some(path) = original.and_then(|mail| mail.source_path.as_ref())
+        {
+            let contents = fs::read(path)?;
+            if let Some(parsed) = MessageParser::default().parse(&contents) {
+                composer.extract_attachments(&parsed)?;
+            }
+        }
+        Ok(composer)
+    }
+
+    /// The message this composer replies to.
+    pub fn replying_to(&self) -> Option<&str> {
+        self.reply_to.as_deref()
+    }
+
+    fn extract_attachments(&mut self, parsed: &mail_parser::Message<'_>) -> io::Result<()> {
+        let mut attachments = Vec::new();
+        for (index, part) in parsed.attachments().enumerate() {
+            let directory = self.body_path.with_extension("attachments");
+            if self.attachment_dir.is_none() {
+                fs::create_dir(&directory)?;
+                self.attachment_dir = Some(directory.clone());
+            }
+            let directory = directory.join(index.to_string());
+            fs::create_dir(&directory)?;
+            let name =
+                crate::mailbox::safe_file_name(part.attachment_name().unwrap_or("attachment"))
+                    .replace(';', "_");
+            let attachment = directory.join(name);
+            crate::storage::write_new(&attachment, part.contents())?;
+            attachments.push(attachment.to_string_lossy().into_owned());
+        }
+        self.attachments = attachments.join("; ");
+        Ok(())
     }
 
     pub fn resume(path: &Path) -> io::Result<Self> {
@@ -170,23 +253,7 @@ impl Composer {
         }
         .unwrap_or_default();
         fs::write(&composer.body_path, body.as_bytes())?;
-        let mut attachments = Vec::new();
-        for (index, part) in parsed.attachments().enumerate() {
-            let directory = composer.body_path.with_extension("attachments");
-            if composer.attachment_dir.is_none() {
-                fs::create_dir(&directory)?;
-                composer.attachment_dir = Some(directory.clone());
-            }
-            let directory = directory.join(index.to_string());
-            fs::create_dir(&directory)?;
-            let name =
-                crate::mailbox::safe_file_name(part.attachment_name().unwrap_or("attachment"))
-                    .replace(';', "_");
-            let attachment = directory.join(name);
-            crate::storage::write_new(&attachment, part.contents())?;
-            attachments.push(attachment.to_string_lossy().into_owned());
-        }
-        composer.attachments = attachments.join("; ");
+        composer.extract_attachments(&parsed)?;
         composer.original_draft = Some(path.to_path_buf());
         Ok(composer)
     }
@@ -288,6 +355,76 @@ impl Drop for Composer {
             let _ = fs::remove_dir_all(directory);
         }
     }
+}
+
+/// Recipients for a reply: the Reply-To or sender, or the original recipients when
+/// replying to one's own message; replying to all adds everyone else as Cc.
+fn recipients(mail: &Mail, own: Option<&str>, all: bool) -> (String, String) {
+    let mine = |value: &String| own.is_some_and(|own| email_of(value) == own);
+    let to: Vec<String> = if mine(&mail.from) {
+        mail.to.clone()
+    } else if !mail.reply_address.is_empty() {
+        mail.reply_address.clone()
+    } else {
+        vec![mail.from.clone()]
+    };
+    let mut seen: Vec<String> = to.iter().map(|value| email_of(value)).collect();
+    let mut cc = Vec::new();
+    if all {
+        for value in mail.to.iter().chain(&mail.cc) {
+            let address = email_of(value);
+            if !mine(value) && !seen.contains(&address) {
+                seen.push(address);
+                cc.push(value.clone());
+            }
+        }
+    }
+    (to.join(", "), cc.join(", "))
+}
+
+fn short_date(mail: &Mail) -> Option<String> {
+    mail.date
+        .as_deref()
+        .map(|date| date.get(..16).unwrap_or(date).replace('T', " "))
+}
+
+fn quoted(mail: &Mail) -> String {
+    let attribution = match short_date(mail) {
+        Some(date) => format!("On {date}, {} wrote:", mail.from),
+        None => format!("{} wrote:", mail.from),
+    };
+    let lines: Vec<String> = mail
+        .body
+        .trim_end()
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                ">".into()
+            } else {
+                format!("> {line}")
+            }
+        })
+        .collect();
+    format!("{attribution}\n{}\n", lines.join("\n"))
+}
+
+fn forwarded(mail: &Mail) -> String {
+    let mut headers = vec![format!("From: {}", mail.from)];
+    if let Some(date) = short_date(mail) {
+        headers.push(format!("Date: {date}"));
+    }
+    headers.push(format!("Subject: {}", mail.subject));
+    if !mail.to.is_empty() {
+        headers.push(format!("To: {}", mail.to.join(", ")));
+    }
+    if !mail.cc.is_empty() {
+        headers.push(format!("Cc: {}", mail.cc.join(", ")));
+    }
+    format!(
+        "---------- Forwarded message ----------\n{}\n\n{}\n",
+        headers.join("\n"),
+        mail.body.trim_end()
+    )
 }
 
 fn one_line(value: &str) -> String {

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::{
-    mail::{Mail, parent_id, root_id},
+    mail::{Mail, parents, roots},
     theme,
     widgets::mail_card::MailCard,
 };
@@ -170,19 +170,28 @@ fn conversation_flow(
     selected_mail_id: &str,
     layout: FlowLayout,
 ) -> Flow<MailCard, StepEdge> {
-    let Some(selected) = mails.iter().find(|mail| mail.id == selected_mail_id) else {
+    let Some(selected) = mails.iter().position(|mail| mail.id == selected_mail_id) else {
         return Flow::new();
     };
-    let selected_root_id = root_id(selected, mails);
-    let conversation: Vec<&Mail> = mails
-        .iter()
-        .filter(|mail| root_id(mail, mails) == selected_root_id)
+    let parents = parents(mails);
+    let roots = roots(&parents);
+    let conversation: Vec<usize> = (0..mails.len())
+        .filter(|index| roots[*index] == roots[selected])
         .collect();
     let selected_path = selected_path_ids(mails, selected_mail_id);
+    let conversation: Vec<(&Mail, Option<&str>)> = conversation
+        .into_iter()
+        .map(|index| {
+            (
+                &mails[index],
+                parents[index].map(|parent| mails[parent].id.as_str()),
+            )
+        })
+        .collect();
     let nodes = conversation
         .iter()
         .enumerate()
-        .map(|(index, mail)| {
+        .map(|(index, (mail, _))| {
             Node::new(
                 &mail.id,
                 (0.0, 0.0),
@@ -202,11 +211,11 @@ fn conversation_flow(
         .collect();
     let edges: Vec<Edge<StepEdge>> = conversation
         .iter()
-        .filter_map(|mail| {
-            let parent_id = parent_id(mail, mails)?;
+        .filter_map(|(mail, parent_id)| {
+            let parent_id = (*parent_id)?;
             conversation
                 .iter()
-                .any(|parent| parent.id == parent_id)
+                .any(|(parent, _)| parent.id == parent_id)
                 .then(|| {
                     let edge = Edge::new(format!("reply-{}", mail.id), parent_id, &mail.id);
                     let edge = match layout {
@@ -259,15 +268,15 @@ fn reply_style(active: bool) -> EdgeStyle {
 }
 
 fn selected_path_ids<'a>(mails: &'a [Mail], selected_mail_id: &str) -> HashSet<&'a str> {
+    let parents = parents(mails);
     let mut ids = HashSet::new();
-    let mut current = mails.iter().find(|mail| mail.id == selected_mail_id);
+    let mut current = mails.iter().position(|mail| mail.id == selected_mail_id);
 
-    while let Some(mail) = current {
-        if !ids.insert(mail.id.as_str()) {
+    while let Some(index) = current {
+        if !ids.insert(mails[index].id.as_str()) {
             break;
         }
-        current = parent_id(mail, mails)
-            .and_then(|parent_id| mails.iter().find(|candidate| candidate.id == parent_id));
+        current = parents[index];
     }
 
     ids

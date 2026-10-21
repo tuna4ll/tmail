@@ -17,7 +17,7 @@ mod theme;
 mod widgets;
 
 use config::Config;
-use mail::{Attachment, Conversation, Mail, group_conversations};
+use mail::{Attachment, Conversation, Mail, group_conversations_where};
 use mailbox::{LoadError, LoadReport, MailboxSource, MaildirChange};
 use widgets::reader::Reader;
 use widgets::workspace::Workspace;
@@ -224,6 +224,8 @@ struct ComposeState {
     composer: draft::Composer,
     field: usize,
     error: Option<String>,
+    /// The account to send from when composing in the all-accounts view.
+    account: Option<usize>,
 }
 
 impl ComposeState {
@@ -629,7 +631,7 @@ impl App {
         } else if self.reader.is_some() {
             status_line(&[
                 ("j/k", "scroll"),
-                ("r", "reply"),
+                ("r/A/F", "reply/all/forward"),
                 ("l", "links"),
                 ("v", "files"),
                 ("m/s", "read/star"),
@@ -732,7 +734,7 @@ impl App {
         if !matches!(self.mailbox_state, MailboxState::Ready) {
             match (key.modifiers, key.code) {
                 (_, KeyCode::Char('r')) => self.reload(),
-                (_, KeyCode::Char('c')) => self.start_draft(false),
+                (_, KeyCode::Char('c')) => self.start_draft(draft::Start::New),
                 (_, KeyCode::Char('p')) => self.open_accounts(),
                 (_, KeyCode::Char('g')) => self.open_folders(),
                 (_, KeyCode::Char('?')) => self.overlay = Some(Overlay::Help { scroll: 0 }),
@@ -821,11 +823,19 @@ impl App {
                 return;
             }
             KeyCode::Char('r') => {
-                self.start_draft(true);
+                self.start_draft(draft::Start::Reply);
+                return;
+            }
+            KeyCode::Char('A') => {
+                self.start_draft(draft::Start::ReplyAll);
+                return;
+            }
+            KeyCode::Char('F') => {
+                self.start_draft(draft::Start::Forward);
                 return;
             }
             KeyCode::Char('c') if self.reader.is_some() || self.focus == Pane::Inbox => {
-                self.start_draft(false);
+                self.start_draft(draft::Start::New);
                 return;
             }
             KeyCode::Char('l') if self.reader.is_some() => {
@@ -949,14 +959,9 @@ impl App {
         else {
             return;
         };
+        let thread = self.selected_thread();
         if let Some(workspace) = &mut self.workspace {
-            let active_mails: Vec<Mail> = self
-                .mails
-                .iter()
-                .filter(|mail| mail_folder(mail) == self.active_folder)
-                .cloned()
-                .collect();
-            workspace.show_conversation(&active_mails, &mail_id);
+            workspace.show_conversation(&thread, &mail_id);
         }
     }
 
@@ -979,12 +984,13 @@ impl App {
     }
 
     fn open_mail(&mut self, mail_id: &str) {
-        if self.active_folder == "Drafts" && matches!(self.source, MailboxSource::Maildir(_)) {
-            let path = self
-                .mails
-                .iter()
-                .find(|mail| mail.id == mail_id)
-                .and_then(|mail| mail.source_path.clone());
+        let mail = self
+            .mails
+            .iter()
+            .find(|mail| mail.id == mail_id && mail_folder(mail) == "Drafts");
+        if mail.is_some() && !matches!(self.source, MailboxSource::Demo) {
+            let path = mail.and_then(|mail| mail.source_path.clone());
+            let account = mail.and_then(|mail| self.account_index(mail));
             if let Some(path) = path {
                 match draft::Composer::resume(&path) {
                     Ok(composer) => {
@@ -992,6 +998,7 @@ impl App {
                             composer,
                             field: 0,
                             error: None,
+                            account,
                         }))
                     }
                     Err(error) => self.notice = Some(format!("Unable to open draft: {error}")),
@@ -1007,6 +1014,25 @@ impl App {
         }) {
             self.selected = index;
             self.reader = Some(Reader::new(mail_id.into()));
+            self.mark_seen(mail_id);
+        }
+    }
+
+    /// Opening a message marks it read, like other mail clients do.
+    fn mark_seen(&mut self, mail_id: &str) {
+        let Some(index) = self
+            .mails
+            .iter()
+            .position(|mail| mail.id == mail_id && mail.unread)
+        else {
+            return;
+        };
+        if let Ok(change) = self.source.set_seen(&self.mails[index], true) {
+            if let Some(change) = &change {
+                self.mails[index].source_path = Some(change.after_path().to_path_buf());
+            }
+            self.mails[index].unread = false;
+            self.refresh_fingerprint();
         }
     }
 
@@ -1236,14 +1262,40 @@ impl App {
         }
     }
 
+    /// The messages of the selected conversation, from every folder it spans.
+    fn selected_thread(&self) -> Vec<Mail> {
+        self.selected_conversation()
+            .map(|conversation| {
+                conversation
+                    .mails(&self.mails)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn rebuild_mailbox(&mut self, mail_id: Option<&str>) {
-        let active_mails: Vec<Mail> = self
-            .mails
-            .iter()
-            .filter(|mail| mail_folder(mail) == self.active_folder)
-            .cloned()
-            .collect();
-        self.conversations = group_conversations(&active_mails);
+        // Threads draw on every folder except the bins and queues, so the map shows
+        // replies from Sent next to the Inbox messages they answer.
+        let active = self.active_folder.clone();
+        let mut conversations = group_conversations_where(&self.mails, |mail| {
+            let folder = mail_folder(mail);
+            if folder == active {
+                Some(0)
+            } else if ["Trash", "Junk", "Outbox", "Drafts"].contains(&folder) {
+                None
+            } else {
+                Some(1)
+            }
+        });
+        conversations.retain(|conversation| {
+            conversation
+                .mails(&self.mails)
+                .iter()
+                .any(|mail| mail_folder(mail) == active)
+        });
+        self.conversations = conversations;
         let visible = self.visible_conversations();
         self.selected = mail_id
             .and_then(|mail_id| {
@@ -1256,10 +1308,11 @@ impl App {
             })
             .unwrap_or_default()
             .min(visible.len().saturating_sub(1));
+        let thread = self.selected_thread();
         self.workspace = self
             .selected_conversation()
             .and_then(Conversation::latest_mail_id)
-            .map(|mail_id| Workspace::new(&active_mails, mail_id));
+            .map(|mail_id| Workspace::new(&thread, mail_id));
     }
 
     fn folder_items(&self) -> Vec<FolderItem> {
@@ -2059,7 +2112,7 @@ impl App {
             Overlay::Help { scroll } => match key.code {
                 KeyCode::Esc | KeyCode::Char('?') => {}
                 KeyCode::Down | KeyCode::Char('j') => {
-                    *scroll = scroll.saturating_add(1).min(14);
+                    *scroll = scroll.saturating_add(1).min(HELP.len() as u16 - 1);
                     self.overlay = Some(overlay);
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -2203,8 +2256,10 @@ impl App {
                 self.filter = InboxFilter::Starred;
                 self.refresh_inbox();
             }
-            "compose" => self.start_draft(false),
-            "reply" => self.start_draft(true),
+            "compose" => self.start_draft(draft::Start::New),
+            "reply" => self.start_draft(draft::Start::Reply),
+            "reply all" => self.start_draft(draft::Start::ReplyAll),
+            "forward" => self.start_draft(draft::Start::Forward),
             "help" => self.overlay = Some(Overlay::Help { scroll: 0 }),
             "quit" => self.quit(),
             _ if command.starts_with("open maildir ") => {
@@ -2229,13 +2284,10 @@ impl App {
         }
     }
 
-    fn start_draft(&mut self, reply: bool) {
-        if !matches!(self.source, MailboxSource::Maildir(_)) {
-            self.notice = Some(if matches!(self.source, MailboxSource::Unified(_)) {
-                "Choose one account with p before composing.".into()
-            } else {
-                "Open a Maildir mailbox to save drafts.".into()
-            });
+    fn start_draft(&mut self, start: draft::Start) {
+        let reply = start != draft::Start::New;
+        if matches!(self.source, MailboxSource::Demo) {
+            self.notice = Some("Open a Maildir mailbox to save drafts.".into());
             return;
         }
         let mail = reply
@@ -2243,27 +2295,76 @@ impl App {
             .flatten()
             .and_then(|id| self.mails.iter().find(|mail| mail.id == id));
         if reply && mail.is_none() {
-            self.notice = Some("Select a message to reply.".into());
+            self.notice = Some("Select a message first.".into());
             return;
         }
-        match draft::Composer::new(
-            mail,
-            self.config.identity().as_deref(),
-            self.config.signature.as_deref(),
+        let account = match &self.source {
+            MailboxSource::Unified(_) => Some(
+                mail.and_then(|mail| self.account_index(mail))
+                    .unwrap_or_else(|| self.config.active_account_index()),
+            ),
+            _ => None,
+        };
+        let (_, config) = self.compose_context(account);
+        // Unified views prefix message IDs with the account; replies need the real ones.
+        let original = mail.map(|mail| {
+            let mut mail = mail.clone();
+            if let Some(prefix) = mail.account.as_ref().map(|account| format!("{account}:")) {
+                let strip = |value: &str| value.strip_prefix(&prefix).unwrap_or(value).to_owned();
+                mail.id = strip(&mail.id);
+                mail.reply_to = mail.reply_to.as_deref().map(strip);
+                mail.references = mail.references.iter().map(|id| strip(id)).collect();
+            }
+            mail
+        });
+        match draft::Composer::start(
+            start,
+            original.as_ref(),
+            config.identity().as_deref(),
+            config.signature.as_deref(),
         ) {
             Ok(composer) => {
+                let forward = start == draft::Start::Forward;
                 let state = ComposeState {
-                    field: if reply { ComposeState::BODY_FIELD } else { 0 },
+                    field: if reply && !forward {
+                        ComposeState::BODY_FIELD
+                    } else {
+                        0
+                    },
                     composer,
                     error: None,
+                    account,
                 };
-                if reply {
+                if reply && !forward {
                     self.pending_editor = Some(state);
                 } else {
                     self.overlay = Some(Overlay::Compose(state));
                 }
             }
             Err(error) => self.notice = Some(format!("Unable to create draft: {error}")),
+        }
+    }
+
+    fn account_index(&self, mail: &Mail) -> Option<usize> {
+        let account = mail.account.as_deref()?;
+        self.config
+            .accounts
+            .iter()
+            .position(|candidate| candidate.id == account)
+    }
+
+    /// The mailbox and settings a draft is saved and sent with.
+    fn compose_context(&self, account: Option<usize>) -> (MailboxSource, Config) {
+        let mut config = self.config.clone();
+        match account {
+            Some(index) if config.activate(index) => (
+                config
+                    .maildir
+                    .clone()
+                    .map_or(MailboxSource::Demo, MailboxSource::Maildir),
+                config,
+            ),
+            _ => (self.source.clone(), config),
         }
     }
 
@@ -2385,11 +2486,12 @@ impl App {
                 return;
             }
         };
+        let (source, config) = self.compose_context(state.account);
         if send {
             let delivery = match delivery::Delivery::queue(
-                self.source.clone(),
-                self.config.delivery_identity(),
-                self.config.send_command.clone(),
+                source.clone(),
+                config.delivery_identity(),
+                config.send_command.clone(),
                 &contents,
             ) {
                 Ok(delivery) => delivery,
@@ -2403,6 +2505,7 @@ impl App {
             };
             if let Some(original) = &state.composer.original_draft
                 && let Err(error) = fs::remove_file(original)
+                && error.kind() != std::io::ErrorKind::NotFound
             {
                 self.notice = Some(format!(
                     "Message queued but not sent: unable to remove the original draft: {error}. Retry from Outbox."
@@ -2410,11 +2513,12 @@ impl App {
                 self.reload();
                 return;
             }
+            self.mark_answered(state.composer.replying_to(), state.account);
             self.start_delivery(delivery);
         } else {
             let saved = match &state.composer.original_draft {
-                Some(path) => self.source.update_draft(path, &contents),
-                None => self.source.save_draft(&contents),
+                Some(path) if path.exists() => source.update_draft(path, &contents),
+                _ => source.save_draft(&contents),
             };
             match saved {
                 Ok(_) => {
@@ -2431,6 +2535,23 @@ impl App {
             }
         }
         self.reload();
+    }
+
+    fn mark_answered(&mut self, id: Option<&str>, account: Option<usize>) {
+        let Some(id) = id else {
+            return;
+        };
+        let account = account.and_then(|index| self.config.accounts.get(index));
+        let id = match account {
+            Some(account) => format!("{}:{id}", account.id),
+            None => id.to_owned(),
+        };
+        if let Some(index) = self.mails.iter().position(|mail| mail.id == id)
+            && let Ok(Some(change)) = self.source.set_answered(&self.mails[index])
+        {
+            self.mails[index].source_path = Some(change.after_path().to_path_buf());
+            self.refresh_fingerprint();
+        }
     }
 
     fn visible_conversations(&self) -> Vec<usize> {
@@ -2580,6 +2701,38 @@ fn draw_no_matches(frame: &mut Frame, area: Rect, folder: &str, folder_empty: bo
     );
 }
 
+const HELP: &[&str] = &[
+    "navigation",
+    "  j/k or arrows  select     tab  switch pane",
+    "  enter          open / resume draft     esc  close",
+    "",
+    "message actions",
+    "  m  read/unread     s  star/unstar",
+    "  a  archive         d  move to Trash",
+    "  u  undo            c  compose",
+    "  r  reply           A  reply all   F  forward",
+    "  l  open links       v  attachments",
+    "  x  retry selected Outbox message",
+    "  z  resolve unconfirmed Outbox delivery",
+    "",
+    "inbox",
+    "  /  search      g  folders      1/2/3  filters",
+    "  p  accounts",
+    "",
+    "compose",
+    "  tab  next field      shift+tab  previous field",
+    "  arrows/space  format      enter on Body  $EDITOR",
+    "  ctrl+s  review             ctrl+d  save draft",
+    "",
+    "commands",
+    "  :reload                 :filter unread",
+    "  :sync                   fetch new IMAP messages",
+    "  :accounts               :account add / :account edit",
+    "  :login                  enter an account password",
+    "  :open maildir PATH      :compose  :reply  :quit",
+    "  :reply all              :forward",
+];
+
 fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
     let (width, height) = match overlay {
         Overlay::AccountSetup(form) => (
@@ -2624,36 +2777,7 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
             );
         }
         Overlay::Help { scroll } => {
-            let text = [
-                "navigation",
-                "  j/k or arrows  select     tab  switch pane",
-                "  enter          open / resume draft     esc  close",
-                "",
-                "message actions",
-                "  m  read/unread     s  star/unstar",
-                "  a  archive         d  move to Trash",
-                "  u  undo            r  reply       c  compose",
-                "  l  open links       v  attachments",
-                "  x  retry selected Outbox message",
-                "  z  resolve unconfirmed Outbox delivery",
-                "",
-                "inbox",
-                "  /  search      g  folders      1/2/3  filters",
-                "  p  accounts",
-                "",
-                "compose",
-                "  tab  next field      shift+tab  previous field",
-                "  arrows/space  format      enter on Body  $EDITOR",
-                "  ctrl+s  review             ctrl+d  save draft",
-                "",
-                "commands",
-                "  :reload                 :filter unread",
-                "  :sync                   fetch new IMAP messages",
-                "  :accounts               :account add / :account edit",
-                "  :login                  enter an account password",
-                "  :open maildir PATH      :compose  :reply  :quit",
-            ]
-            .join("\n");
+            let text = HELP.join("\n");
             frame.render_widget(
                 Paragraph::new(text)
                     .style(theme::text())
@@ -3292,7 +3416,7 @@ mod tests {
         let mailbox = TestMailbox::new();
         let mut app = mailbox.app();
         finish_load(&mut app).await;
-        app.start_draft(false);
+        app.start_draft(crate::draft::Start::New);
         let Some(Overlay::Compose(state)) = app.overlay.take() else {
             panic!()
         };
@@ -3331,6 +3455,7 @@ mod tests {
                 composer,
                 field: 0,
                 error: None,
+                account: None,
             },
             false,
         );
@@ -3371,7 +3496,7 @@ mod tests {
         let mut app = mailbox.app();
         finish_load(&mut app).await;
         app.running = true;
-        app.start_draft(false);
+        app.start_draft(crate::draft::Start::New);
         app.on_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.running);
         assert!(matches!(app.overlay, Some(Overlay::ComposeClose(_))));
@@ -3384,7 +3509,7 @@ mod tests {
         let sink = mailbox.0.join("sent.log");
         app.config.send_command = vec!["termail-test-sink".into(), sink.display().to_string()];
         finish_load(&mut app).await;
-        app.start_draft(false);
+        app.start_draft(crate::draft::Start::New);
         let Some(Overlay::Compose(mut state)) = app.overlay.take() else {
             panic!()
         };
@@ -3453,7 +3578,7 @@ mod tests {
         finish_load(&mut app).await;
         app.config.send_command =
             vec!["sh".into(), "-c".into(), "cat >/dev/null; sleep 0.1".into()];
-        app.start_draft(false);
+        app.start_draft(crate::draft::Start::New);
         let Some(Overlay::Compose(mut state)) = app.overlay.take() else {
             panic!()
         };
@@ -3633,6 +3758,7 @@ mod tests {
             composer,
             field: 0,
             error: None,
+            account: None,
         }));
 
         assert!(screen.contains("From"));
