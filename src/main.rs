@@ -3,6 +3,8 @@ mod config;
 mod delivery;
 mod doctor;
 mod draft;
+#[cfg(test)]
+mod fake_imap;
 mod imap_client;
 mod mail;
 mod mailbox;
@@ -101,7 +103,10 @@ async fn main() -> color_eyre::Result<()> {
 
     ratatui::restore();
 
-    result
+    result?;
+    // Sync and IDLE workers hold blocking sockets; their state is saved atomically, so
+    // there is nothing to wait for.
+    std::process::exit(0)
 }
 
 pub struct App {
@@ -120,10 +125,14 @@ pub struct App {
     delivery_tx: mpsc::UnboundedSender<String>,
     delivery_rx: mpsc::UnboundedReceiver<String>,
     sending: bool,
-    sync_tx: mpsc::UnboundedSender<(String, Result<String, String>)>,
-    sync_rx: mpsc::UnboundedReceiver<(String, Result<String, String>)>,
-    syncing: bool,
-    last_sync: Option<(String, std::time::Instant)>,
+    sync_tx: mpsc::UnboundedSender<(String, Result<imap_client::Synced, String>)>,
+    sync_rx: mpsc::UnboundedReceiver<(String, Result<imap_client::Synced, String>)>,
+    syncing: std::collections::HashSet<String>,
+    manual_sync: bool,
+    last_sync: std::collections::HashMap<String, std::time::Instant>,
+    watch_tx: mpsc::UnboundedSender<String>,
+    watch_rx: mpsc::UnboundedReceiver<String>,
+    watchers: std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     setup_tx: mpsc::UnboundedSender<SetupResult>,
     setup_rx: mpsc::UnboundedReceiver<SetupResult>,
     setup_generation: u64,
@@ -181,7 +190,7 @@ enum InboxFilter {
 enum Overlay {
     AccountSetup(Box<account_setup::Form>),
     DeliveryReview {
-        delivery: delivery::Delivery,
+        delivery: Box<delivery::Delivery>,
     },
     Help {
         scroll: u16,
@@ -278,6 +287,7 @@ impl App {
         let (load_tx, load_rx) = mpsc::unbounded_channel();
         let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
         let (sync_tx, sync_rx) = mpsc::unbounded_channel();
+        let (watch_tx, watch_rx) = mpsc::unbounded_channel();
         let (setup_tx, setup_rx) = mpsc::unbounded_channel();
         let account_label = config
             .accounts
@@ -303,8 +313,12 @@ impl App {
             sending: false,
             sync_tx,
             sync_rx,
-            syncing: false,
-            last_sync: None,
+            syncing: Default::default(),
+            manual_sync: false,
+            last_sync: Default::default(),
+            watch_tx,
+            watch_rx,
+            watchers: Default::default(),
             setup_tx,
             setup_rx,
             setup_generation: 0,
@@ -349,12 +363,12 @@ impl App {
                 },
                 result = self.sync_rx.recv() => {
                     if let Some((account, result)) = result {
-                        self.syncing = false;
-                        if self.config.delivery_identity() == account
-                            && matches!(&self.source, MailboxSource::Maildir(root) if self.config.maildir.as_ref() == Some(root)) {
-                            self.notice = Some(result.unwrap_or_else(|error| format!("Sync failed · {error}")));
-                            self.reload();
-                        }
+                        self.finish_sync(account, result);
+                    }
+                }
+                account = self.watch_rx.recv() => {
+                    if let Some(account) = account {
+                        self.start_account_sync(&account);
                     }
                 }
                 result = self.load_rx.recv() => {
@@ -1340,17 +1354,16 @@ impl App {
                 .config
                 .remote
                 .as_ref()
-                .is_some_and(|remote| remote.password().is_err())
+                .is_some_and(|remote| !remote.has_credentials())
         {
             self.open_account_setup(account_setup::Mode::Login);
         }
     }
 
     fn open_account_setup(&mut self, mode: account_setup::Mode) {
-        if self.sending || self.syncing {
-            self.notice = Some(
-                "Wait for sending or syncing to finish before changing account settings.".into(),
-            );
+        if self.sending {
+            self.notice =
+                Some("Wait for sending to finish before changing account settings.".into());
             return;
         }
         if mode != account_setup::Mode::Add && self.config.remote.is_none() {
@@ -1380,7 +1393,7 @@ impl App {
         let submit = key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('s')
             || key.code == KeyCode::Enter
-                && (form.mode == account_setup::Mode::Login || form.field == 10);
+                && (form.mode == account_setup::Mode::Login || form.field >= 10);
         if submit {
             if self.checking_account {
                 form.error =
@@ -1427,6 +1440,7 @@ impl App {
                     }
                 }
                 KeyCode::Char(' ') if form.field == 10 => form.make_default = !form.make_default,
+                KeyCode::Char(' ') if form.field == 11 => form.remember = !form.remember,
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if let Some(value) = form.values.get_mut(form.field) {
                         use zeroize::Zeroize;
@@ -1467,7 +1481,32 @@ impl App {
                 .as_ref()
                 .ok_or("Set a local cache directory before connecting.")?;
             imap_client::initialize(root)?;
-            if form.mode == account_setup::Mode::Login {
+            if let Some(remote) = &result.account.remote {
+                match &remote.session_password {
+                    Some(password) if remote.keyring => {
+                        remote.store_keyring_password(&password.0)?
+                    }
+                    _ if !remote.keyring => remote.forget_keyring_password(),
+                    _ => {}
+                }
+            }
+            let remembered = self
+                .config
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.keyring);
+            if form.mode == account_setup::Mode::Login
+                && result
+                    .account
+                    .remote
+                    .as_ref()
+                    .is_some_and(|remote| remote.keyring != remembered)
+                && !self.config.accounts.is_empty()
+            {
+                let make_default =
+                    self.config.default_account.as_deref() == Some(result.account.id.as_str());
+                self.config.save_account(result.account, true, make_default)
+            } else if form.mode == account_setup::Mode::Login {
                 self.config.remote = result.account.remote.clone();
                 if let Some(account) = self
                     .config
@@ -1492,7 +1531,8 @@ impl App {
             return;
         }
         self.onboarding = false;
-        self.last_sync = None;
+        self.last_sync.clear();
+        self.stop_watchers();
         self.active_folder = "INBOX".into();
         self.query.clear();
         self.filter = InboxFilter::All;
@@ -1653,13 +1693,13 @@ impl App {
         match self.delivery_account(&mail) {
             Ok((source, command, account)) => {
                 self.overlay = Some(Overlay::DeliveryReview {
-                    delivery: delivery::Delivery {
+                    delivery: Box::new(delivery::Delivery {
                         remote: None,
                         source,
                         mail,
                         command,
                         account,
-                    },
+                    }),
                 })
             }
             Err(error) => self.notice = Some(error),
@@ -1707,59 +1747,196 @@ impl App {
         }
     }
 
+    /// Accounts that mirror a server, as (id, remote settings, Maildir).
+    fn remote_accounts(&self) -> Vec<(String, remote::RemoteConfig, PathBuf)> {
+        if self.config.accounts.is_empty() {
+            return self
+                .config
+                .remote
+                .clone()
+                .zip(self.config.maildir.clone())
+                .map(|(remote, root)| vec![(self.config.current_account().id, remote, root)])
+                .unwrap_or_default();
+        }
+        self.config
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                Some((
+                    account.id.clone(),
+                    account.remote.clone()?,
+                    account.maildir.clone()?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Whether the open mailbox is one of the configured accounts rather than a demo or
+    /// a Maildir opened by path.
+    fn uses_accounts(&self) -> bool {
+        match &self.source {
+            MailboxSource::Demo => false,
+            MailboxSource::Unified(_) => true,
+            MailboxSource::Maildir(root) => {
+                self.config.maildir.as_ref() == Some(root)
+                    || self
+                        .config
+                        .accounts
+                        .iter()
+                        .any(|account| account.maildir.as_ref() == Some(root))
+            }
+        }
+    }
+
+    fn shows_maildir(&self, root: &Path) -> bool {
+        match &self.source {
+            MailboxSource::Demo => false,
+            MailboxSource::Maildir(path) => path == root,
+            MailboxSource::Unified(accounts) => accounts.iter().any(|(_, path)| path == root),
+        }
+    }
+
     fn sync_if_due(&mut self) {
-        if self.onboarding || matches!(self.overlay, Some(Overlay::AccountSetup(_))) {
+        if self.onboarding
+            || matches!(self.overlay, Some(Overlay::AccountSetup(_)))
+            || !self.uses_accounts()
+        {
             return;
         }
-        let Some(remote) = &self.config.remote else {
-            return;
-        };
-        if remote.password().is_err() {
-            return;
-        }
-        let identity = self.config.delivery_identity();
-        let due = match &self.last_sync {
-            Some((account, time)) if account == &identity => {
+        for (id, remote, _) in self.remote_accounts() {
+            let due = self.last_sync.get(&id).is_none_or(|time| {
                 remote.sync_interval_secs > 0
                     && time.elapsed().as_secs() >= remote.sync_interval_secs
+            });
+            if due && remote.has_credentials() {
+                self.start_account_sync(&id);
             }
-            _ => true,
-        };
-        if due {
-            self.start_sync();
         }
     }
 
     fn start_sync(&mut self) {
-        if self.syncing {
+        if !self.uses_accounts() {
             return;
         }
-        let Some(remote) = self.config.remote.clone() else {
+        let accounts = self.remote_accounts();
+        if accounts.is_empty() {
             self.notice = Some("This account has no IMAP connection.".into());
             return;
-        };
-        let MailboxSource::Maildir(root) = &self.source else {
-            return;
-        };
-        if self.config.maildir.as_ref() != Some(root) {
-            return;
         }
-        if remote.password().is_err() {
+        if self
+            .config
+            .remote
+            .as_ref()
+            .is_some_and(|remote| !remote.has_credentials())
+            && matches!(&self.source, MailboxSource::Maildir(root) if self.config.maildir.as_ref() == Some(root))
+        {
             self.prompt_login();
             return;
         }
-        let root = root.clone();
-        let identity = self.config.delivery_identity();
-        self.last_sync = Some((identity.clone(), std::time::Instant::now()));
-        self.syncing = true;
+        self.manual_sync = true;
         self.notice = Some("Syncing…".into());
+        for (id, remote, _) in accounts {
+            if remote.has_credentials() {
+                self.start_account_sync(&id);
+            }
+        }
+    }
+
+    fn start_account_sync(&mut self, id: &str) {
+        let Some((_, remote, root)) = self
+            .remote_accounts()
+            .into_iter()
+            .find(|(candidate, ..)| candidate == id)
+        else {
+            return;
+        };
+        if !self.syncing.insert(id.to_owned()) {
+            return;
+        }
+        self.last_sync
+            .insert(id.to_owned(), std::time::Instant::now());
         let sender = self.sync_tx.clone();
+        let id = id.to_owned();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || imap_client::sync(&remote, &root))
                 .await
                 .unwrap_or_else(|_| Err("Sync worker stopped.".into()));
-            let _ = sender.send((identity, result));
+            let _ = sender.send((id, result));
         });
+    }
+
+    fn finish_sync(&mut self, id: String, result: Result<imap_client::Synced, String>) {
+        self.syncing.remove(&id);
+        let manual = self.manual_sync && self.syncing.is_empty();
+        if self.syncing.is_empty() {
+            self.manual_sync = false;
+        }
+        let Some((_, remote, root)) = self
+            .remote_accounts()
+            .into_iter()
+            .find(|(candidate, ..)| *candidate == id)
+        else {
+            return;
+        };
+        let visible = self.shows_maildir(&root);
+        match result {
+            Ok(synced) => {
+                if !self.watchers.contains_key(&id) && remote.sync_interval_secs > 0 {
+                    self.watch_account(id, remote);
+                }
+                if visible && (synced.changed || manual) {
+                    self.notice = Some(synced.summary);
+                    self.reload();
+                }
+            }
+            Err(error) => {
+                if visible {
+                    self.notice = Some(format!("Sync failed · {error}"));
+                }
+                if self.config.remote.as_ref().is_some_and(|active| {
+                    active.username == remote.username && active.imap_host == remote.imap_host
+                }) && (error.contains("Sign in") || error.contains("login failed"))
+                {
+                    self.prompt_login();
+                }
+            }
+        }
+    }
+
+    /// Keeps an IDLE connection open so new mail starts a sync right away.
+    fn watch_account(&mut self, id: String, remote: remote::RemoteConfig) {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.watchers.insert(id.clone(), stop.clone());
+        let sender = self.watch_tx.clone();
+        std::thread::spawn(move || {
+            let mut backoff = 30;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match imap_client::wait_for_change(&remote, Duration::from_secs(25 * 60), &stop) {
+                    Ok(changed) => {
+                        backoff = 30;
+                        if changed && sender.send(id.clone()).is_err() {
+                            return;
+                        }
+                    }
+                    Err(error) if error.contains("not supported") => return,
+                    Err(_) => {
+                        for _ in 0..backoff {
+                            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_secs(1));
+                        }
+                        backoff = (backoff * 2).min(15 * 60);
+                    }
+                }
+            }
+        });
+    }
+
+    fn stop_watchers(&mut self) {
+        for (_, stop) in self.watchers.drain() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     fn start_delivery(&mut self, mut delivery: delivery::Delivery) {
@@ -1798,10 +1975,9 @@ impl App {
     }
 
     fn quit(&mut self) {
-        if self.sending || self.syncing || self.checking_account {
-            self.notice = Some(
-                "Wait for the current connection, send or sync to finish before quitting.".into(),
-            );
+        if self.sending || self.checking_account {
+            self.notice =
+                Some("Wait for the current connection or send to finish before quitting.".into());
         } else {
             self.running = false;
         }
@@ -1840,7 +2016,7 @@ impl App {
             Overlay::DeliveryReview { delivery } => {
                 if action_key(key, 's') || action_key(key, 'r') {
                     match delivery.resolve(action_key(key, 's')) {
-                        Ok(()) => self.start_delivery(delivery),
+                        Ok(()) => self.start_delivery(*delivery),
                         Err(error) => self.notice = Some(error),
                     }
                 } else if key.code != KeyCode::Esc {
@@ -2888,7 +3064,7 @@ mod tests {
         assert!(
             matches!(app.overlay, Some(Overlay::AccountSetup(ref form)) if form.mode == crate::account_setup::Mode::Login)
         );
-        assert!(!app.syncing);
+        assert!(app.syncing.is_empty());
         assert_eq!(app.mails.len(), 1);
         assert!(matches!(app.mailbox_state, MailboxState::Ready));
     }
@@ -3071,10 +3247,10 @@ mod tests {
         app.config.remote = Some(crate::remote::tests::Server::new().remote());
         app.source = MailboxSource::Demo;
         app.start_sync();
-        assert!(!app.syncing);
+        assert!(app.syncing.is_empty());
         app.source = MailboxSource::Maildir(mailbox.0.join("unrelated"));
         app.start_sync();
-        assert!(!app.syncing);
+        assert!(app.syncing.is_empty());
     }
 
     #[tokio::test]

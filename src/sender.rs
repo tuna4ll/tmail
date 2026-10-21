@@ -50,16 +50,7 @@ pub async fn send_smtp(
 ) -> Result<(), SendError> {
     tokio::task::spawn_blocking(move || {
         remote.validate().map_err(SendError::failed)?;
-        let password = remote.password().map_err(SendError::failed)?;
-        let transport = lettre::SmtpTransport::relay(&remote.smtp_host)
-            .map_err(|_| SendError::failed("Unable to configure SMTP TLS."))?
-            .port(remote.smtp_port)
-            .timeout(Some(remote.timeout()))
-            .credentials(lettre::transport::smtp::authentication::Credentials::new(
-                remote.username.clone(),
-                password,
-            ))
-            .build();
+        let transport = smtp_transport(&remote).map_err(SendError::failed)?;
         smtp_with_transport(&transport, &message)
     })
     .await
@@ -68,17 +59,28 @@ pub async fn send_smtp(
 
 pub fn check_connection(remote: &crate::remote::RemoteConfig) -> Result<(), String> {
     remote.validate()?;
-    let password = remote.password()?;
-    let transport = lettre::SmtpTransport::relay(&remote.smtp_host)
-        .map_err(|_| "Unable to configure SMTP TLS.")?
+    check_transport(&smtp_transport(remote)?)
+}
+
+fn smtp_transport(remote: &crate::remote::RemoteConfig) -> Result<lettre::SmtpTransport, String> {
+    use lettre::transport::smtp::authentication::{Credentials, Mechanism};
+    let secret = remote.password()?;
+    let builder = if remote.smtp_security.starttls(remote.smtp_port) {
+        lettre::SmtpTransport::starttls_relay(&remote.smtp_host)
+    } else {
+        lettre::SmtpTransport::relay(&remote.smtp_host)
+    }
+    .map_err(|_| "Unable to configure SMTP TLS.")?;
+    let mechanisms = match remote.auth {
+        crate::remote::Auth::Password => vec![Mechanism::Plain, Mechanism::Login],
+        crate::remote::Auth::Xoauth2 => vec![Mechanism::Xoauth2],
+    };
+    Ok(builder
         .port(remote.smtp_port)
         .timeout(Some(remote.timeout()))
-        .credentials(lettre::transport::smtp::authentication::Credentials::new(
-            remote.username.clone(),
-            password,
-        ))
-        .build();
-    check_transport(&transport)
+        .credentials(Credentials::new(remote.username.clone(), secret))
+        .authentication(mechanisms)
+        .build())
 }
 
 fn check_transport(transport: &lettre::SmtpTransport) -> Result<(), String> {

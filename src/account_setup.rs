@@ -1,6 +1,6 @@
 use crate::{
     config::{Account, Config},
-    remote::{RemoteConfig, SessionPassword},
+    remote::SessionPassword,
     theme,
 };
 use ratatui::{
@@ -23,6 +23,7 @@ pub struct Form {
     pub values: [String; 10],
     pub field: usize,
     pub make_default: bool,
+    pub remember: bool,
     pub error: Option<String>,
     pub busy: bool,
     pub request: u64,
@@ -76,6 +77,7 @@ impl Form {
             remote.inbox,
             remote.sent,
         ];
+        let remember = remote.keyring;
         let make_default = config.maildir.is_none()
             || config.default_account.as_deref() == Some(account.id.as_str());
         Self {
@@ -84,6 +86,7 @@ impl Form {
             values,
             field: if mode == Mode::Login { 3 } else { 0 },
             make_default,
+            remember,
             error: None,
             busy: false,
             request: 0,
@@ -91,13 +94,12 @@ impl Form {
     }
 
     pub fn move_field(&mut self, backwards: bool) {
-        if self.mode == Mode::Login {
-            return;
-        }
-        self.field = if backwards {
-            (self.field + 10) % 11
+        self.field = if self.mode == Mode::Login {
+            if self.field == 3 { 11 } else { 3 }
+        } else if backwards {
+            (self.field + 11) % 12
         } else {
-            (self.field + 1) % 11
+            (self.field + 1) % 12
         };
         self.error = None;
     }
@@ -118,13 +120,7 @@ impl Form {
             }
             account.name = Some(self.values[0].trim().to_owned());
             account.email = Some(email.to_owned());
-            let mut remote = account.remote.clone().unwrap_or_else(|| RemoteConfig {
-                password_env: format!(
-                    "TERMAIL_{}_PASSWORD",
-                    account.id.replace('-', "_").to_uppercase()
-                ),
-                ..Default::default()
-            });
+            let mut remote = account.remote.clone().unwrap_or_default();
             remote.username = if self.values[2].trim().is_empty() {
                 email.to_owned()
             } else {
@@ -161,16 +157,16 @@ impl Form {
             .remote
             .as_mut()
             .ok_or((3, "This account has no IMAP settings.".into()))?;
+        remote.keyring = self.remember;
         if !self.values[3].is_empty() {
             remote.session_password = Some(std::sync::Arc::new(SessionPassword(
                 zeroize::Zeroizing::new(self.values[3].clone()),
             )));
         }
-        if remote.password().is_err() {
-            return Err((
-                3,
-                "Enter the account password. It stays in memory until you quit.".into(),
-            ));
+        if self.values[3].is_empty()
+            && (!remote.has_credentials() || self.remember && !remote.keyring_has_password())
+        {
+            return Err((3, "Enter the account password.".into()));
         }
         if account.maildir.is_none() {
             return Err((
@@ -208,7 +204,7 @@ impl Form {
                 self.values[4]
             )
         } else {
-            "IMAPS + SMTPS · settings are saved; passwords are not\nUsername defaults to your email address.".into()
+            "TLS, or STARTTLS on ports 143 and 587 · settings are saved\nUsername defaults to your email address.".into()
         };
         frame.render_widget(
             Paragraph::new(hint)
@@ -229,21 +225,26 @@ impl Form {
             "Sent folder",
         ];
         let fields: Vec<usize> = if self.mode == Mode::Login {
-            vec![3]
+            vec![3, 11]
         } else {
-            (0..11).collect()
+            (0..12).collect()
         };
         let items: Vec<ListItem> = fields
             .iter()
             .map(|&index| {
-                let (label, value) = if index == 10 {
+                let (label, value) = if index >= 10 {
+                    let checked = if index == 10 {
+                        self.make_default
+                    } else {
+                        self.remember
+                    };
                     (
-                        "Use by default",
-                        if self.make_default {
-                            "[x]".into()
+                        if index == 10 {
+                            "Use by default"
                         } else {
-                            "[ ]".into()
+                            "Remember"
                         },
+                        if checked { "[x]".into() } else { "[ ]".into() },
                     )
                 } else {
                     (
@@ -281,10 +282,12 @@ impl Form {
         let message = if self.busy {
             "Checking IMAP and SMTP… No message is sent."
         } else {
-            self.error.as_deref().unwrap_or(if self.mode == Mode::Edit {
-                "Password stays in memory. Leave it blank to keep the current password or use password_env."
+            self.error.as_deref().unwrap_or(if self.remember {
+                "Password is saved in the system keyring."
+            } else if self.mode == Mode::Edit {
+                "Password stays in memory. Leave it blank to keep the current one, or turn on Remember."
             } else {
-                "Password stays in memory. You will sign in again after restarting unless password_env is set."
+                "Password stays in memory until you quit. Turn on Remember to use the system keyring."
             })
         };
         frame.render_widget(
@@ -296,9 +299,9 @@ impl Form {
         let actions = if self.busy {
             "esc  Cancel setup"
         } else if self.mode == Mode::Login {
-            "enter  Sign in · esc  Work offline"
+            "enter  Sign in · space  Remember · esc  Work offline"
         } else {
-            "tab / shift+tab  Move · ctrl+s  Save and connect\nesc  Cancel · space  Toggle default account"
+            "tab / shift+tab  Move · ctrl+s  Save and connect\nesc  Cancel · space  Toggle option"
         };
         frame.render_widget(
             Paragraph::new(actions)
@@ -318,11 +321,9 @@ pub fn verify(account: &Account, cancelled: &std::sync::atomic::AtomicBool) -> R
         .as_ref()
         .ok_or("Set IMAP and SMTP details before connecting.")?;
     let mut session = crate::imap_client::connect(remote)?;
-    let folders = session
-        .examine(&remote.inbox)
-        .and_then(|_| session.examine(&remote.sent));
+    let folders = crate::imap_client::verify_folders(&mut session, remote);
     let _ = session.logout();
-    folders.map_err(|_| "Unable to open Inbox or Sent. Check the folder names.")?;
+    folders?;
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
         return Err("Sign-in cancelled.".into());
     }
@@ -409,6 +410,8 @@ pub(crate) mod tests {
             }
         }
         form.mode = Mode::Login;
+        form.move_field(false);
+        assert_eq!(form.field, 11);
         form.move_field(false);
         assert_eq!(form.field, 3);
     }

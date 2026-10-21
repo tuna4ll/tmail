@@ -678,7 +678,7 @@ mod tests {
         fs::write(&path, contents).unwrap();
         let mut config = Config::load(Some(&path)).unwrap();
         assert_eq!(config.maildir, Some(root.join("mail")));
-        assert_eq!(config.remote.as_ref().unwrap().sent, "INBOX.Sent");
+        assert!(config.remote.as_ref().unwrap().sent.is_empty());
         let identity = config.delivery_identity();
         config.remote.as_mut().unwrap().smtp_host = "other.example.test".into();
         assert_ne!(config.delivery_identity(), identity);
