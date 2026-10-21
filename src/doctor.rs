@@ -26,6 +26,23 @@ pub fn run(config: &Config) -> bool {
 }
 
 pub fn checks(config: &Config) -> Vec<Check> {
+    if config.accounts.len() < 2 {
+        return account_checks(config);
+    }
+    let mut checks = Vec::new();
+    for index in 0..config.accounts.len() {
+        let mut account = config.clone();
+        account.activate(index);
+        let id = config.accounts[index].id.clone();
+        checks.extend(account_checks(&account).into_iter().map(|mut check| {
+            check.detail = format!("{id} · {}", check.detail);
+            check
+        }));
+    }
+    checks
+}
+
+fn account_checks(config: &Config) -> Vec<Check> {
     let mut checks = Vec::new();
     checks.push(Check {
         ok: config.identity().is_some(),
@@ -67,15 +84,41 @@ pub fn checks(config: &Config) -> Vec<Check> {
     });
     checks.push(command_check("editor", &config.editor_command()));
     checks.push(if let Some(remote) = &config.remote {
-        Check {
-            ok: remote.validate().is_ok() && remote.password().is_ok(),
-            label: "sender",
-            detail: match remote.validate().and_then(|_| remote.password()) {
-                Ok(_) => format!(
-                    "IMAPS {}:{} · SMTPS {}:{}",
-                    remote.imap_host, remote.imap_port, remote.smtp_host, remote.smtp_port
-                ),
-                Err(error) => error,
+        let mode = |starttls: bool| if starttls { "STARTTLS" } else { "TLS" };
+        let servers = format!(
+            "IMAP {}:{} {} · SMTP {}:{} {}",
+            remote.imap_host,
+            remote.imap_port,
+            mode(remote.imap_security.starttls(remote.imap_port)),
+            remote.smtp_host,
+            remote.smtp_port,
+            mode(remote.smtp_security.starttls(remote.smtp_port)),
+        );
+        let interactive = remote.password_command.is_empty()
+            && !remote.keyring
+            && (remote.password_env.is_empty() || env::var_os(&remote.password_env).is_none());
+        match remote.validate() {
+            Err(error) => Check {
+                ok: false,
+                label: "sender",
+                detail: error,
+            },
+            Ok(()) if interactive => Check {
+                ok: true,
+                label: "sender",
+                detail: format!("{servers} · password asked at sign-in"),
+            },
+            Ok(()) => match remote.password() {
+                Ok(_) => Check {
+                    ok: true,
+                    label: "sender",
+                    detail: servers,
+                },
+                Err(error) => Check {
+                    ok: false,
+                    label: "sender",
+                    detail: error,
+                },
             },
         }
     } else if config

@@ -156,24 +156,7 @@ impl Config {
         }
         fs::create_dir_all(parent)
             .map_err(|_| "Unable to create the config directory. Check its permissions.")?;
-        let lock_path = path.with_file_name(format!(
-            ".{}.lock",
-            path.file_name().unwrap().to_string_lossy()
-        ));
-        let lock = match crate::storage::create(&lock_path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&lock_path)
-                    .map_err(|_| "Unable to lock the config file.")?
-            }
-            Err(_) => return Err("Unable to lock the config file.".into()),
-        };
-        lock.try_lock()
-            .map_err(|_| "Another process is saving this config. Try again.")?;
-        let _lock = ConfigLock(lock);
+        let _lock = ConfigLock::acquire(&path)?;
         let current = match fs::read_to_string(&path) {
             Ok(value) => Some(value),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -295,6 +278,83 @@ impl Config {
         result
     }
 
+    /// Removes an account from the config file. Its Maildir stays on disk.
+    pub fn remove_account(&mut self, id: &str) -> Result<(), String> {
+        let path = self
+            .path
+            .clone()
+            .ok_or("No config path is available. Start with --config PATH.")?;
+        let parent = path.parent().ok_or("Invalid config path.")?;
+        if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err("This config is a symlink. Restart with --config pointing to its target before saving.".into());
+        }
+        let _lock = ConfigLock::acquire(&path)?;
+        let current = fs::read_to_string(&path)
+            .map_err(|_| "Unable to read the config file. Check its permissions.")?;
+        if Some(&current) != self.snapshot.as_ref() {
+            return Err(
+                "Config changed outside Termail. Restart before saving account settings.".into(),
+            );
+        }
+        let mut document = current
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|_| "Config is invalid. Fix it before saving account settings.")?;
+        let accounts = document
+            .get_mut("accounts")
+            .and_then(toml_edit::Item::as_array_of_tables_mut)
+            .ok_or("Use [[accounts]] tables before editing accounts in Termail.")?;
+        let position = accounts
+            .iter()
+            .position(|table| table.get("id").and_then(toml_edit::Item::as_str) == Some(id))
+            .ok_or("The account no longer exists in config.")?;
+        if accounts.len() == 1 {
+            return Err("Add another account before removing the last one.".into());
+        }
+        accounts.remove(position);
+        let fallback = accounts
+            .iter()
+            .find_map(|table| table.get("id").and_then(toml_edit::Item::as_str))
+            .map(str::to_owned)
+            .unwrap_or_default();
+        if document
+            .get("default_account")
+            .and_then(toml_edit::Item::as_str)
+            == Some(id)
+        {
+            document["default_account"] = toml_edit::value(fallback);
+        }
+        let contents = document.to_string();
+        let temporary = parent.join(crate::storage::unique_name("config"));
+        let result = (|| {
+            crate::storage::write_new(&temporary, contents.as_bytes())
+                .map_err(|_| "Unable to write config. Check disk space and permissions.")?;
+            let mut saved = Self::load(Some(&temporary)).map_err(
+                |_| "Unable to remove the account. The original config was left unchanged.",
+            )?;
+            for account in &mut saved.accounts {
+                if let Some(remote) = &mut account.remote {
+                    remote.session_password = self
+                        .accounts
+                        .iter()
+                        .find(|old| old.id == account.id)
+                        .and_then(|old| old.remote.as_ref())
+                        .and_then(|old| old.session_password.clone());
+                }
+            }
+            let selected = saved.active_account_index();
+            saved.activate(selected);
+            saved.path = Some(path.clone());
+            crate::storage::rename(&temporary, &path)
+                .map_err(|_| "Unable to replace config. Check directory permissions.")?;
+            *self = saved;
+            Ok(())
+        })();
+        if temporary.exists() {
+            let _ = fs::remove_file(temporary);
+        }
+        result
+    }
+
     pub fn identity(&self) -> Option<String> {
         match (&self.name, &self.email) {
             (Some(name), Some(email)) => Some(crate::message::display_address(name, email)),
@@ -383,6 +443,29 @@ impl Account {
 }
 
 struct ConfigLock(fs::File);
+
+impl ConfigLock {
+    fn acquire(path: &Path) -> Result<Self, String> {
+        let lock_path = path.with_file_name(format!(
+            ".{}.lock",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let lock = match crate::storage::create(&lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                    .map_err(|_| "Unable to lock the config file.")?
+            }
+            Err(_) => return Err("Unable to lock the config file.".into()),
+        };
+        lock.try_lock()
+            .map_err(|_| "Another process is saving this config. Try again.")?;
+        Ok(Self(lock))
+    }
+}
 
 impl Drop for ConfigLock {
     fn drop(&mut self) {

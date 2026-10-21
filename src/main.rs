@@ -1,4 +1,5 @@
 mod account_setup;
+mod complete;
 mod config;
 mod delivery;
 mod doctor;
@@ -6,6 +7,7 @@ mod draft;
 #[cfg(test)]
 mod fake_imap;
 mod imap_client;
+mod log;
 mod mail;
 mod mailbox;
 mod message;
@@ -64,6 +66,7 @@ async fn main() -> color_eyre::Result<()> {
         print_help();
         return Ok(());
     };
+    log::init(options.log.clone())?;
     let config = Config::load(options.config_path.as_deref())?;
     if options.doctor {
         if !doctor::run(&config) {
@@ -113,6 +116,7 @@ pub struct App {
     running: bool,
     selected: usize,
     mails: Vec<Mail>,
+    contacts: Vec<String>,
     conversations: Vec<Conversation>,
     workspace: Option<Workspace>,
     reader: Option<Reader>,
@@ -145,6 +149,7 @@ pub struct App {
     searching: bool,
     filter: InboxFilter,
     undo: Option<UndoAction>,
+    confirm_delete: Option<String>,
     notice: Option<String>,
     mailbox_fingerprint: u64,
     pending_editor: Option<ComposeState>,
@@ -216,6 +221,7 @@ enum Overlay {
     Accounts {
         selected: usize,
         items: Vec<AccountItem>,
+        removing: bool,
     },
     Compose(ComposeState),
 }
@@ -226,6 +232,8 @@ struct ComposeState {
     error: Option<String>,
     /// The account to send from when composing in the all-accounts view.
     account: Option<usize>,
+    /// The focused field's value with its last entry completed; tab accepts it.
+    suggestion: Option<String>,
 }
 
 impl ComposeState {
@@ -301,6 +309,7 @@ impl App {
             running: false,
             selected: 0,
             mails: Vec::new(),
+            contacts: Vec::new(),
             conversations: Vec::new(),
             workspace: None,
             reader: None,
@@ -333,6 +342,7 @@ impl App {
             searching: false,
             filter: InboxFilter::All,
             undo: None,
+            confirm_delete: None,
             notice: None,
             mailbox_fingerprint: 0,
             pending_editor: None,
@@ -481,35 +491,31 @@ impl App {
                     conversation.subject,
                     conversation.mail_ids.len()
                 );
-                let subject_style = if !self.query.is_empty()
-                    && conversation
-                        .subject
-                        .to_lowercase()
-                        .contains(&self.query.to_lowercase())
-                {
+                let terms = mail::search_terms(&self.query);
+                let highlights = |value: &str, field: &str| {
+                    let value = value.to_lowercase();
+                    terms.iter().any(|term| {
+                        let needle = term
+                            .strip_prefix(field)
+                            .and_then(|rest| rest.strip_prefix(':'))
+                            .unwrap_or(term);
+                        !needle.is_empty() && !needle.contains(':') && value.contains(needle)
+                    })
+                };
+                let subject_style = if highlights(&conversation.subject, "subject") {
                     theme::title(true)
                 } else {
                     theme::text()
                 };
-                let lowered_query = self.query.to_lowercase();
-                let sender_query = lowered_query
-                    .strip_prefix("from:")
-                    .unwrap_or(&lowered_query)
-                    .trim();
-                let sender_style = if !sender_query.is_empty()
-                    && last_sender.to_lowercase().contains(sender_query)
-                {
+                let sender_style = if highlights(last_sender, "from") {
                     theme::title(true)
                 } else {
                     theme::muted()
                 };
-                let account = self.mails.iter().find_map(|mail| {
-                    conversation
-                        .mail_ids
-                        .contains(&mail.id)
-                        .then_some(mail.account.as_deref())
-                        .flatten()
-                });
+                let account = conversation
+                    .mails(&self.mails)
+                    .into_iter()
+                    .find_map(|mail| mail.account.as_deref());
                 let sender = match account {
                     Some(account) if matches!(self.source, MailboxSource::Unified(_)) => {
                         format!("from {last_sender} · {account}")
@@ -683,13 +689,22 @@ impl App {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key_event(key),
-            Event::Paste(text) => {
-                if let Some(Overlay::AccountSetup(form)) = &mut self.overlay
-                    && !form.busy
-                {
-                    form.input(&text);
+            Event::Paste(text) => match self.overlay.take() {
+                Some(Overlay::AccountSetup(mut form)) => {
+                    if !form.busy {
+                        form.input(&text);
+                    }
+                    self.overlay = Some(Overlay::AccountSetup(form));
                 }
-            }
+                Some(Overlay::Compose(mut state)) => {
+                    if let Some(value) = state.value_mut() {
+                        value.extend(text.chars().filter(|character| !character.is_control()));
+                    }
+                    self.suggest(&mut state);
+                    self.overlay = Some(Overlay::Compose(state));
+                }
+                overlay => self.overlay = overlay,
+            },
             Event::Mouse(mouse) => {
                 if self.overlay.is_none()
                     && !self.onboarding
@@ -706,6 +721,9 @@ impl App {
     }
 
     fn on_key_event(&mut self, key: KeyEvent) {
+        if key.code != KeyCode::Char('d') {
+            self.confirm_delete = None;
+        }
         if key.modifiers == KeyModifiers::CONTROL
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         {
@@ -999,6 +1017,7 @@ impl App {
                             field: 0,
                             error: None,
                             account,
+                            suggestion: None,
                         }))
                     }
                     Err(error) => self.notice = Some(format!("Unable to open draft: {error}")),
@@ -1076,6 +1095,7 @@ impl App {
             Ok(report) => {
                 let active_mail_id = self.active_mail_id();
                 self.mails = report.mails;
+                self.contacts = complete::contacts(&self.mails);
                 self.skipped = report.skipped.len();
                 let folders = self.folder_items();
                 if !folders
@@ -1231,6 +1251,10 @@ impl App {
         let Some(index) = self.mails.iter().position(|mail| mail.id == mail_id) else {
             return;
         };
+        if !archive && mail_folder(&self.mails[index]) == "Trash" {
+            self.delete_forever(index);
+            return;
+        }
         let snapshot = matches!(self.source, MailboxSource::Demo).then(|| self.mails.clone());
         let result = if archive {
             self.source.archive(&self.mails[index])
@@ -1273,6 +1297,27 @@ impl App {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn delete_forever(&mut self, index: usize) {
+        let id = self.mails[index].id.clone();
+        if self.confirm_delete.as_deref() != Some(id.as_str()) {
+            self.confirm_delete = Some(id);
+            self.notice = Some("Press d again to delete this message permanently.".into());
+            return;
+        }
+        self.confirm_delete = None;
+        match self.source.delete(&self.mails[index]) {
+            Ok(()) => {
+                self.mails.remove(index);
+                self.reader = None;
+                self.undo = None;
+                self.notice = Some("Deleted permanently".into());
+                self.refresh_fingerprint();
+                self.rebuild_mailbox(None);
+            }
+            Err(error) => self.notice = Some(format!("Unable to delete message: {error}")),
+        }
     }
 
     fn rebuild_mailbox(&mut self, mail_id: Option<&str>) {
@@ -1629,7 +1674,45 @@ impl App {
         } else {
             self.config.active_account_index() + usize::from(self.config.accounts.len() > 1)
         };
-        self.overlay = Some(Overlay::Accounts { selected, items });
+        self.overlay = Some(Overlay::Accounts {
+            selected,
+            items,
+            removing: false,
+        });
+    }
+
+    fn remove_account(&mut self, index: usize) {
+        if self.sending {
+            self.notice = Some("Wait for sending to finish before removing an account.".into());
+            return;
+        }
+        let Some(account) = self.config.accounts.get(index).cloned() else {
+            return;
+        };
+        match self.config.remove_account(&account.id) {
+            Ok(()) => {
+                if let Some(remote) = &account.remote
+                    && remote.keyring
+                {
+                    remote.forget_keyring_password();
+                }
+                self.stop_watchers();
+                self.syncing.remove(&account.id);
+                self.last_sync.remove(&account.id);
+                let root = account
+                    .maildir
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                let active = self.config.active_account_index();
+                self.select_account(Some(active));
+                self.notice = Some(format!(
+                    "Removed {}. Its mail stays in {root}.",
+                    account.label()
+                ));
+            }
+            Err(error) => self.notice = Some(error),
+        }
     }
 
     fn select_account(&mut self, index: Option<usize>) {
@@ -2195,8 +2278,24 @@ impl App {
                 KeyCode::Char('o') | KeyCode::Enter => self.save_active_attachment(*selected, true),
                 _ => self.overlay = Some(overlay),
             },
-            Overlay::Accounts { selected, items } => match key.code {
+            Overlay::Accounts {
+                selected,
+                items,
+                removing,
+            } => match key.code {
                 KeyCode::Esc => {}
+                KeyCode::Char('x') => {
+                    if let Some(index) = items.get(*selected).and_then(|item| item.index) {
+                        if *removing {
+                            self.remove_account(index);
+                        } else {
+                            *removing = true;
+                            self.overlay = Some(overlay);
+                        }
+                    } else {
+                        self.overlay = Some(overlay);
+                    }
+                }
                 KeyCode::Char('a') => self.open_account_setup(account_setup::Mode::Add),
                 KeyCode::Char('e') => {
                     if let Some(index) = items.get(*selected).and_then(|item| item.index) {
@@ -2212,10 +2311,12 @@ impl App {
                 }
                 KeyCode::Down | KeyCode::Char('j') if *selected + 1 < items.len() => {
                     *selected += 1;
+                    *removing = false;
                     self.overlay = Some(overlay);
                 }
                 KeyCode::Up | KeyCode::Char('k') if *selected > 0 => {
                     *selected -= 1;
+                    *removing = false;
                     self.overlay = Some(overlay);
                 }
                 KeyCode::Enter => {
@@ -2223,7 +2324,10 @@ impl App {
                         self.select_account(item.index);
                     }
                 }
-                _ => self.overlay = Some(overlay),
+                _ => {
+                    *removing = false;
+                    self.overlay = Some(overlay);
+                }
             },
             Overlay::DraftReady { .. }
             | Overlay::ComposeClose(_)
@@ -2334,6 +2438,7 @@ impl App {
                     composer,
                     error: None,
                     account,
+                    suggestion: None,
                 };
                 if reply && !forward {
                     self.pending_editor = Some(state);
@@ -2386,12 +2491,23 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => self.overlay = Some(Overlay::ComposeClose(state)),
+            KeyCode::Tab if state.suggestion.is_some() => {
+                if let (Some(suggestion), Some(value)) =
+                    (state.suggestion.take(), state.value_mut())
+                {
+                    *value = suggestion;
+                }
+                self.suggest(&mut state);
+                self.overlay = Some(Overlay::Compose(state));
+            }
             KeyCode::Tab | KeyCode::Down => {
                 state.move_next();
+                self.suggest(&mut state);
                 self.overlay = Some(Overlay::Compose(state));
             }
             KeyCode::BackTab | KeyCode::Up => {
                 state.move_previous();
+                self.suggest(&mut state);
                 self.overlay = Some(Overlay::Compose(state));
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
@@ -2417,6 +2533,7 @@ impl App {
                     value.pop();
                 }
                 state.error = None;
+                self.suggest(&mut state);
                 self.overlay = Some(Overlay::Compose(state));
             }
             KeyCode::Char(character)
@@ -2429,10 +2546,24 @@ impl App {
                     value.push(character);
                 }
                 state.error = None;
+                self.suggest(&mut state);
                 self.overlay = Some(Overlay::Compose(state));
             }
             _ => self.overlay = Some(Overlay::Compose(state)),
         }
+    }
+
+    fn suggest(&self, state: &mut ComposeState) {
+        state.suggestion = match state.field {
+            0..=2 => state
+                .value_mut()
+                .and_then(|value| complete::address(value, &self.contacts)),
+            5 => {
+                let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                complete::path(&state.composer.attachments, &base)
+            }
+            _ => None,
+        };
     }
 
     fn edit_composer_body(
@@ -2709,6 +2840,7 @@ const HELP: &[&str] = &[
     "message actions",
     "  m  read/unread     s  star/unstar",
     "  a  archive         d  move to Trash",
+    "  d d  in Trash: delete permanently",
     "  u  undo            c  compose",
     "  r  reply           A  reply all   F  forward",
     "  l  open links       v  attachments",
@@ -2717,7 +2849,9 @@ const HELP: &[&str] = &[
     "",
     "inbox",
     "  /  search      g  folders      1/2/3  filters",
-    "  p  accounts",
+    "     from: to: subject: body: in: is:unread is:starred",
+    "     has:attachment \"exact phrase\" -exclude",
+    "  p  accounts (a add · e edit · l sign in · x remove)",
     "",
     "compose",
     "  tab  next field      shift+tab  previous field",
@@ -2751,7 +2885,7 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
         Overlay::Folders { items, .. } => (50, (items.len() as u16 + 2).min(18)),
         Overlay::Links { items, .. } => (72, (items.len() as u16 + 2).min(16)),
         Overlay::Attachments { items, .. } => (64, (items.len() as u16 + 2).min(16)),
-        Overlay::Accounts { items, .. } => (52, (items.len() as u16 + 2).min(16)),
+        Overlay::Accounts { items, .. } => (64, (items.len() as u16 + 2).min(16)),
         Overlay::Compose(_) => (78, 20),
     };
     let screen = frame.area();
@@ -2928,7 +3062,11 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
             let mut state = ListState::default().with_selected(Some(*selected));
             frame.render_stateful_widget(list, area, &mut state);
         }
-        Overlay::Accounts { selected, items } => {
+        Overlay::Accounts {
+            selected,
+            items,
+            removing,
+        } => {
             let rows: Vec<ListItem> = items
                 .iter()
                 .map(|item| ListItem::new(item.label.clone()))
@@ -2941,7 +3079,11 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                     Block::bordered()
                         .border_style(theme::border(true))
                         .title_style(theme::title(true))
-                        .title(" accounts · a add · e edit · l sign in ")
+                        .title(if *removing {
+                            " press x again to remove · mail stays on disk "
+                        } else {
+                            " accounts · a add · e edit · l sign in · x remove "
+                        })
                         .bg(theme::SURFACE),
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
@@ -2989,7 +3131,24 @@ fn draw_compose(frame: &mut Frame, area: Rect, state: &ComposeState) {
             } else {
                 ""
             };
-            ListItem::new(format!("{label:<8} {value}{cursor}"))
+            let hint = state
+                .suggestion
+                .as_ref()
+                .filter(|_| index == state.field)
+                .map(|suggestion| {
+                    let entry = suggestion
+                        .trim_end_matches([',', ' '])
+                        .rsplit([',', ';'])
+                        .next()
+                        .unwrap_or_default()
+                        .trim();
+                    Span::styled(format!("  ⇥ {entry}"), theme::muted())
+                });
+            ListItem::new(Line::from_iter(
+                [Span::raw(format!("{label:<8} {value}{cursor}"))]
+                    .into_iter()
+                    .chain(hint),
+            ))
         })
         .collect();
     let list = List::new(items)
@@ -3040,7 +3199,7 @@ fn draw_compose(frame: &mut Frame, area: Rect, state: &ComposeState) {
     );
     frame.render_widget(
         Paragraph::new(
-            "tab / shift+tab  move    arrows / space  change format    enter  edit body\nctrl+s  review    ctrl+d  save draft    esc  close",
+            "tab  move or accept ⇥    shift+tab  back    space  format    enter  edit body\nctrl+s  review    ctrl+d  save draft    esc  close",
         )
         .style(theme::muted()),
         rows[4],
@@ -3062,6 +3221,7 @@ struct CliOptions {
     source: Option<MailboxSource>,
     config_path: Option<PathBuf>,
     doctor: bool,
+    log: Option<PathBuf>,
 }
 
 fn parse_options(
@@ -3071,6 +3231,7 @@ fn parse_options(
     let mut source = None;
     let mut config_path = None;
     let mut doctor = false;
+    let mut log = None;
 
     while let Some(argument) = args.next() {
         match argument.to_str() {
@@ -3086,6 +3247,12 @@ fn parse_options(
                     .ok_or_else(|| color_eyre::eyre::eyre!("--config needs a path"))?;
                 config_path = Some(PathBuf::from(path));
             }
+            Some("--log") => {
+                let path = args
+                    .next()
+                    .ok_or_else(|| color_eyre::eyre::eyre!("--log needs a path"))?;
+                log = Some(PathBuf::from(path));
+            }
             Some("--demo") => source = Some(MailboxSource::Demo),
             Some("doctor") => doctor = true,
             Some("--help" | "-h") => return Ok(None),
@@ -3098,15 +3265,17 @@ fn parse_options(
         source,
         config_path,
         doctor,
+        log,
     }))
 }
 
 fn print_help() {
-    println!("termail [doctor] [--config PATH] [--demo | --maildir PATH]");
+    println!("termail [doctor] [--config PATH] [--log PATH] [--demo | --maildir PATH]");
     println!();
     println!("  --demo          open the built-in mailbox");
     println!("  --maildir PATH  open a Maildir mailbox");
     println!("  --config PATH   load a config file");
+    println!("  --log PATH      append connection errors to a file (or set TERMAIL_LOG)");
     println!("  doctor          check account, Maildir, editor, and sender setup");
 }
 
@@ -3456,6 +3625,7 @@ mod tests {
                 field: 0,
                 error: None,
                 account: None,
+                suggestion: None,
             },
             false,
         );
@@ -3759,6 +3929,7 @@ mod tests {
             field: 0,
             error: None,
             account: None,
+            suggestion: None,
         }));
 
         assert!(screen.contains("From"));

@@ -272,23 +272,62 @@ impl Mail {
         self
     }
 
+    /// Matches every space-separated term. Terms may be quoted phrases, take a
+    /// `from:`, `to:`, `subject:`, `body:`, `in:`, `is:` or `has:` prefix, or start
+    /// with `-` to exclude.
     pub fn matches(&self, query: &str) -> bool {
-        let query = query.to_lowercase();
-        if let Some(sender) = query.strip_prefix("from:") {
-            return self.from.to_lowercase().contains(sender.trim());
-        }
-        self.subject.to_lowercase().contains(&query)
-            || self.from.to_lowercase().contains(&query)
-            || self.body.to_lowercase().contains(&query)
-            || self
-                .to
-                .iter()
-                .any(|value| value.to_lowercase().contains(&query))
-            || self
-                .cc
-                .iter()
-                .any(|value| value.to_lowercase().contains(&query))
+        search_terms(query)
+            .iter()
+            .all(|term| match term.strip_prefix('-') {
+                Some(term) if !term.is_empty() => !self.matches_term(term),
+                _ => self.matches_term(term),
+            })
     }
+
+    fn matches_term(&self, term: &str) -> bool {
+        let contains = |value: &str, needle: &str| value.to_lowercase().contains(needle);
+        match term.split_once(':') {
+            Some(("from", value)) => contains(&self.from, value),
+            Some(("to", value)) => self.to.iter().chain(&self.cc).any(|to| contains(to, value)),
+            Some(("subject", value)) => contains(&self.subject, value),
+            Some(("body", value)) => contains(&self.body, value),
+            Some(("in" | "folder", value)) => {
+                self.mailbox.as_deref().unwrap_or("INBOX").to_lowercase() == value
+            }
+            Some(("is", "unread")) => self.unread,
+            Some(("is", "read")) => !self.unread,
+            Some(("is", "starred" | "flagged")) => self.starred,
+            Some(("has", "attachment" | "attachments")) => self.attachment_count > 0,
+            _ => {
+                contains(&self.subject, term)
+                    || contains(&self.from, term)
+                    || contains(&self.body, term)
+                    || self.to.iter().chain(&self.cc).any(|to| contains(to, term))
+            }
+        }
+    }
+}
+
+/// Splits a search query into lowercased terms, keeping quoted phrases together.
+pub fn search_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for character in query.to_lowercase().chars() {
+        match character {
+            '"' => quoted = !quoted,
+            ' ' if !quoted => {
+                if !current.is_empty() {
+                    terms.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(character),
+        }
+    }
+    if !current.is_empty() {
+        terms.push(current);
+    }
+    terms
 }
 
 /// The bare, lowercased address from a display form such as `Name <a@b.test>`.

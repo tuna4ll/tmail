@@ -25,7 +25,8 @@ const MASS_DELETE_LIMIT: usize = 20;
 
 pub fn connect(remote: &RemoteConfig) -> Result<Session, String> {
     let secret = zeroize::Zeroizing::new(remote.password()?);
-    let tls = native_tls::TlsConnector::new().map_err(|_| "Unable to configure IMAP TLS.")?;
+    let tls = native_tls::TlsConnector::new()
+        .map_err(crate::log::fail("Unable to configure IMAP TLS."))?;
     connect_with_tls(remote, &secret, &tls)
 }
 
@@ -37,7 +38,7 @@ fn connect_with_tls(
     remote.validate()?;
     let addresses = (remote.imap_host.as_str(), remote.imap_port)
         .to_socket_addrs()
-        .map_err(|_| "Unable to resolve IMAP host.")?;
+        .map_err(crate::log::fail("Unable to resolve IMAP host."))?;
     let mut stream = None;
     for address in addresses {
         if let Ok(socket) = TcpStream::connect_timeout(&address, remote.timeout()) {
@@ -48,32 +49,42 @@ fn connect_with_tls(
     let stream = stream.ok_or("Unable to connect to IMAP server.")?;
     stream
         .set_read_timeout(Some(remote.timeout()))
-        .map_err(|_| "Unable to set IMAP timeout.")?;
+        .map_err(crate::log::fail("Unable to set IMAP timeout."))?;
     stream
         .set_write_timeout(Some(remote.timeout()))
-        .map_err(|_| "Unable to set IMAP timeout.")?;
+        .map_err(crate::log::fail("Unable to set IMAP timeout."))?;
     let client = if remote.imap_security.starttls(remote.imap_port) {
         let mut client = imap::Client::new(stream);
         client
             .read_greeting()
-            .map_err(|_| "Invalid IMAP greeting.")?;
+            .map_err(crate::log::fail("Invalid IMAP greeting."))?;
         client
             .secure(&remote.imap_host, tls)
-            .map_err(|_| "IMAP STARTTLS verification or handshake failed.")?
+            .map_err(crate::log::fail(
+                "IMAP STARTTLS verification or handshake failed.",
+            ))?
     } else {
         let stream = tls
             .connect(&remote.imap_host, stream)
-            .map_err(|_| "IMAP TLS verification or handshake failed.")?;
+            .map_err(crate::log::fail(
+                "IMAP TLS verification or handshake failed.",
+            ))?;
         let mut client = imap::Client::new(stream);
         client
             .read_greeting()
-            .map_err(|_| "Invalid IMAP greeting.")?;
+            .map_err(crate::log::fail("Invalid IMAP greeting."))?;
         client
     };
     match remote.auth {
         Auth::Password => client
             .login(&remote.username, secret)
-            .map_err(|_| "IMAP login failed. Check the username and password.".into()),
+            .map_err(|(error, _)| {
+                sign_in_failure(
+                    "IMAP login failed. Check the username and password.",
+                    &error,
+                    secret,
+                )
+            }),
         Auth::Xoauth2 => client
             .authenticate(
                 "XOAUTH2",
@@ -82,8 +93,26 @@ fn connect_with_tls(
                     token: secret,
                 },
             )
-            .map_err(|_| "IMAP OAuth2 sign-in failed. Refresh the access token.".into()),
+            .map_err(|(error, _)| {
+                sign_in_failure(
+                    "IMAP OAuth2 sign-in failed. Refresh the access token.",
+                    &error,
+                    secret,
+                )
+            }),
     }
+}
+
+/// Logs a rejected sign-in without the secret, which some servers echo back.
+fn sign_in_failure(message: &str, error: &imap::Error, secret: &str) -> String {
+    let detail = error.to_string();
+    let detail = if secret.is_empty() {
+        detail
+    } else {
+        detail.replace(secret, "[redacted]")
+    };
+    crate::log::write("error", format_args!("{message} ({detail})"));
+    message.into()
 }
 
 struct OAuth2<'a> {
@@ -176,7 +205,7 @@ fn discover<T: Read + Write>(
 ) -> Result<Vec<Folder>, String> {
     let names = session
         .list(Some(""), Some("*"))
-        .map_err(|_| "Unable to list IMAP folders.")?;
+        .map_err(crate::log::fail("Unable to list IMAP folders."))?;
     let mut listed = Vec::new();
     let mut delimiter = None;
     for name in names.iter() {
@@ -635,12 +664,13 @@ fn sync_session<T: Read + Write>(
         Err(error) => return Err(error.to_string()),
     };
     file.try_lock()
-        .map_err(|_| "This account is already syncing.")?;
+        .map_err(crate::log::fail("This account is already syncing."))?;
     let _lock = Lock(file);
     let state_path = directory.join("state.json");
     let mut state: SyncState = match fs::read(&state_path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|_| "Sync state is unreadable. Existing messages were left unchanged.")?,
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(crate::log::fail(
+            "Sync state is unreadable. Existing messages were left unchanged.",
+        ))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => SyncState::default(),
         Err(error) => return Err(error.to_string()),
     };
@@ -658,7 +688,7 @@ fn sync_session<T: Read + Write>(
             moves: capabilities.has_str("MOVE"),
             uidplus: capabilities.has_str("UIDPLUS"),
         })
-        .map_err(|_| "Unable to read IMAP capabilities.")?;
+        .map_err(crate::log::fail("Unable to read IMAP capabilities."))?;
     let folders = discover(session, remote, true)?;
     let mut report = Report::default();
 
@@ -716,7 +746,10 @@ fn reconcile<T: Read + Write>(
 ) -> Result<(), String> {
     let mailbox = session
         .select(&folder.remote)
-        .map_err(|_| format!("Unable to open IMAP folder {}.", folder.remote))?;
+        .map_err(crate::log::fail(format!(
+            "Unable to open IMAP folder {}.",
+            folder.remote
+        )))?;
     let validity = mailbox
         .uid_validity
         .ok_or("IMAP server did not return UIDVALIDITY.")?;
@@ -744,7 +777,7 @@ fn reconcile<T: Read + Write>(
     if mailbox.exists > 0 {
         let fetched = session
             .uid_fetch("1:*", "(UID FLAGS)")
-            .map_err(|_| "Unable to read IMAP message flags.")?;
+            .map_err(crate::log::fail("Unable to read IMAP message flags."))?;
         for message in fetched.iter() {
             if let Some(uid) = message.uid {
                 current.insert(uid, remote_flags(message.flags()));
@@ -796,7 +829,7 @@ fn reconcile<T: Read + Write>(
                 _ => {
                     session
                         .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
-                        .map_err(|_| "Unable to delete an IMAP message.")?;
+                        .map_err(crate::log::fail("Unable to delete an IMAP message."))?;
                     expunge.push(*uid);
                 }
             }
@@ -821,10 +854,10 @@ fn reconcile<T: Read + Write>(
             let contents = fs::read(path).map_err(|error| error.to_string())?;
             session
                 .append_with_flags(&folder.remote, &contents, &imap_flags(&local_flags))
-                .map_err(|_| "Unable to upload an edited message.")?;
+                .map_err(crate::log::fail("Unable to upload an edited message."))?;
             session
                 .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
-                .map_err(|_| "Unable to replace an edited message.")?;
+                .map_err(crate::log::fail("Unable to replace an edited message."))?;
             expunge.push(*uid);
             let _ = fs::remove_file(path);
             report.uploaded += 1;
@@ -862,7 +895,7 @@ fn reconcile<T: Read + Write>(
                         uid.to_string(),
                         format!("{operation} ({})", flags.join(" ")),
                     )
-                    .map_err(|_| "Unable to update IMAP message flags.")?;
+                    .map_err(crate::log::fail("Unable to update IMAP message flags."))?;
                 report.changed += 1;
             }
         }
@@ -908,14 +941,18 @@ fn move_message<T: Read + Write>(
     if capabilities.moves {
         session
             .uid_mv(uid.to_string(), target)
-            .map_err(|_| format!("Unable to move a message to {target}."))
+            .map_err(crate::log::fail(format!(
+                "Unable to move a message to {target}."
+            )))
     } else {
         session
             .uid_copy(uid.to_string(), target)
-            .map_err(|_| format!("Unable to copy a message to {target}."))?;
+            .map_err(crate::log::fail(format!(
+                "Unable to copy a message to {target}."
+            )))?;
         session
             .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
-            .map_err(|_| "Unable to remove a moved message.")?;
+            .map_err(crate::log::fail("Unable to remove a moved message."))?;
         expunge.push(uid);
         Ok(())
     }
@@ -936,7 +973,7 @@ fn expunge_messages<T: Read + Write>(
     } else {
         session.expunge().map(|_| ())
     };
-    result.map_err(|_| "Unable to expunge deleted IMAP messages.".into())
+    result.map_err(crate::log::fail("Unable to expunge deleted IMAP messages."))
 }
 
 fn fetch_new<T: Read + Write>(
@@ -961,7 +998,10 @@ fn fetch_new<T: Read + Write>(
     }
     let mailbox = session
         .select(&folder.remote)
-        .map_err(|_| format!("Unable to open IMAP folder {}.", folder.remote))?;
+        .map_err(crate::log::fail(format!(
+            "Unable to open IMAP folder {}.",
+            folder.remote
+        )))?;
     let validity = mailbox
         .uid_validity
         .ok_or("IMAP server did not return UIDVALIDITY.")?;
@@ -981,7 +1021,7 @@ fn fetch_new<T: Read + Write>(
     entry.validity = validity;
     let mut uids = session
         .uid_search("ALL")
-        .map_err(|_| "Unable to list IMAP messages.")?;
+        .map_err(crate::log::fail("Unable to list IMAP messages."))?;
 
     // Local messages the server has not seen: adopt the server copy when one exists,
     // otherwise upload them.
@@ -1004,7 +1044,7 @@ fn fetch_new<T: Read + Write>(
             let existing = match &id {
                 Some(id) if searchable_id(id) => session
                     .uid_search(format!("HEADER Message-ID \"<{id}>\""))
-                    .map_err(|_| "Unable to search IMAP messages.")?
+                    .map_err(crate::log::fail("Unable to search IMAP messages."))?
                     .into_iter()
                     .filter(|uid| !entry.messages.contains_key(uid))
                     .max(),
@@ -1013,7 +1053,7 @@ fn fetch_new<T: Read + Write>(
             if let Some(uid) = existing {
                 let fetched = session
                     .uid_fetch(uid.to_string(), "(UID FLAGS)")
-                    .map_err(|_| "Unable to read IMAP message flags.")?;
+                    .map_err(crate::log::fail("Unable to read IMAP message flags."))?;
                 let there = fetched
                     .iter()
                     .find(|message| message.uid == Some(uid))
@@ -1039,7 +1079,10 @@ fn fetch_new<T: Read + Write>(
             } else {
                 session
                     .append_with_flags(&folder.remote, &contents, &imap_flags(&flags))
-                    .map_err(|_| format!("Unable to upload a message to {}.", folder.remote))?;
+                    .map_err(crate::log::fail(format!(
+                        "Unable to upload a message to {}.",
+                        folder.remote
+                    )))?;
                 fs::remove_file(&path).map_err(|error| error.to_string())?;
                 report.uploaded += 1;
                 uploaded = true;
@@ -1049,7 +1092,7 @@ fn fetch_new<T: Read + Write>(
     if uploaded {
         uids = session
             .uid_search("ALL")
-            .map_err(|_| "Unable to list IMAP messages.")?;
+            .map_err(crate::log::fail("Unable to list IMAP messages."))?;
     }
     let mut pending: Vec<u32> = uids
         .into_iter()
@@ -1066,7 +1109,7 @@ fn fetch_new<T: Read + Write>(
             .join(",");
         let fetched = session
             .uid_fetch(set, "(UID FLAGS BODY.PEEK[])")
-            .map_err(|_| "Unable to download IMAP message.")?;
+            .map_err(crate::log::fail("Unable to download IMAP message."))?;
         for message in fetched.iter() {
             let Some(uid) = message.uid.filter(|uid| chunk.contains(uid)) else {
                 continue;
@@ -1202,7 +1245,9 @@ pub fn verify_folders(session: &mut Session, remote: &RemoteConfig) -> Result<()
     session
         .examine(&remote.inbox)
         .map(|_| ())
-        .map_err(|_| "Unable to open the Inbox. Check the folder name.".into())
+        .map_err(crate::log::fail(
+            "Unable to open the Inbox. Check the folder name.",
+        ))
 }
 
 /// Blocks until the server reports a change in the Inbox, the timeout passes, or
@@ -1233,11 +1278,13 @@ fn watch_session(
     }
     session
         .select(&remote.inbox)
-        .map_err(|_| "Unable to open the Inbox.")?;
+        .map_err(crate::log::fail("Unable to open the Inbox."))?;
     let started = std::time::Instant::now();
     let mut changed = false;
     while !stop.load(std::sync::atomic::Ordering::Relaxed) && started.elapsed() < timeout {
-        let idle = session.idle().map_err(|_| "Unable to start IDLE.")?;
+        let idle = session
+            .idle()
+            .map_err(crate::log::fail("Unable to start IDLE."))?;
         match idle.wait_with_timeout(std::time::Duration::from_secs(60)) {
             Ok(imap::extensions::idle::WaitOutcome::MailboxChanged) => {
                 changed = true;

@@ -86,7 +86,12 @@ fn smtp_transport(remote: &crate::remote::RemoteConfig) -> Result<lettre::SmtpTr
 fn check_transport(transport: &lettre::SmtpTransport) -> Result<(), String> {
     match transport.test_connection() {
         Ok(true) => Ok(()),
-        _ => Err("SMTP sign-in failed. Check the server, port and password.".into()),
+        result => {
+            if let Err(error) = result {
+                crate::log::write("smtp", error);
+            }
+            Err("SMTP sign-in failed. Check the server, port and password.".into())
+        }
     }
 }
 
@@ -109,6 +114,7 @@ fn smtp_with_transport(transport: &lettre::SmtpTransport, message: &[u8]) -> Res
         .send_raw(&envelope, &crate::message::wire_message(message))
         .map(|_| ())
         .map_err(|error| {
+            crate::log::write("smtp", &error);
             let code = error.status().map(|code| code.to_string());
             let mut cause = std::error::Error::source(&error);
             let mut tls_error = error.is_tls();

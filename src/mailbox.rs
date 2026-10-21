@@ -108,6 +108,23 @@ impl MailboxSource {
         self.move_to(mail, ".Trash")
     }
 
+    /// Removes a message for good. Sync then expunges it on the server.
+    pub fn delete(&self, mail: &Mail) -> Result<(), LoadError> {
+        let Some(root) = self.root_for(mail)? else {
+            return Ok(());
+        };
+        let path = mail.source_path.as_ref().ok_or_else(|| LoadError {
+            message: "Message has no Maildir path.".into(),
+        })?;
+        if !path.starts_with(root) {
+            return Err(LoadError {
+                message: "Message is outside the active Maildir.".into(),
+            });
+        }
+        fs::remove_file(path)?;
+        crate::storage::sync_parent(path).map_err(Into::into)
+    }
+
     pub fn mark_sent(&self, mail: &Mail) -> Result<Option<MaildirChange>, LoadError> {
         self.move_to(mail, ".Sent")
     }
