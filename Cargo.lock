@@ -2359,7 +2359,7 @@ dependencies = [
 [[package]]
 name = "ratatui-spinner"
 version = "0.4.18"
-source = "git+https://github.com/ratatui/ratatui-spinner#4489de894e1a29460b5976508b1a25499c3ba3b0"
+source = "git+https://github.com/ratatui/ratatui-spinner?rev=4489de894e1a29460b5976508b1a25499c3ba3b0#4489de894e1a29460b5976508b1a25499c3ba3b0"
 dependencies = [
  "ratatui",
 ]

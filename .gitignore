@@ -1,3 +1,8 @@
 /target
 /.local/
 /sandbox/sent.log
+/sandbox/*/.*/*/*
+!/sandbox/*/.*/*/.gitkeep
+/sandbox/*/.*/termail-state/
+/sandbox/downloads/*
+!/sandbox/downloads/.gitkeep
