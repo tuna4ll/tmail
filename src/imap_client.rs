@@ -475,6 +475,7 @@ pub fn initialize(root: &Path) -> Result<(), String> {
 pub struct Synced {
     pub summary: String,
     pub changed: bool,
+    pub downloaded: usize,
 }
 
 pub fn sync(remote: &RemoteConfig, root: &Path) -> Result<Synced, String> {
@@ -732,6 +733,7 @@ fn sync_session<T: Read + Write>(
     Ok(Synced {
         summary,
         changed: report.downloaded + report.changed + report.removed + report.uploaded > 0,
+        downloaded: report.downloaded,
     })
 }
 
@@ -1076,6 +1078,10 @@ fn fetch_new<T: Read + Write>(
                     },
                 );
                 uids.remove(&uid);
+            } else if name.starts_with("termail-imap-") {
+                // It came from the server and is no longer where sync left it; the
+                // server copy wherever it lives now is downloaded instead.
+                fs::remove_file(&path).map_err(|error| error.to_string())?;
             } else {
                 session
                     .append_with_flags(&folder.remote, &contents, &imap_flags(&flags))
@@ -1296,8 +1302,6 @@ fn watch_session(
     }
     Ok(changed)
 }
-
-
 
 #[cfg(test)]
 mod tests {

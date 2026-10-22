@@ -86,6 +86,14 @@ pub fn mail(id: &str, subject: &str) -> Vec<u8> {
 /// Serves connections until the test process ends.
 pub fn serve(server: Server, state: Shared) {
     let (listener, acceptor) = server.into_parts();
+    serve_with(listener, acceptor, state);
+}
+
+pub fn serve_with(
+    listener: std::net::TcpListener,
+    acceptor: native_tls::TlsAcceptor,
+    state: Shared,
+) {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else {
@@ -256,6 +264,11 @@ fn session<S: Read + Write>(mut stream: BufReader<S>, state: &Shared) -> std::io
                         header.as_ref().is_none_or(|value| {
                             String::from_utf8_lossy(&message.body)
                                 .to_lowercase()
+                                .replace("\r\n ", " ")
+                                .replace("\r\n\t", " ")
+                                .replace("\n ", " ")
+                                .replace("message-id:", "message-id: ")
+                                .replace("message-id:  ", "message-id: ")
                                 .contains(&format!("message-id: {value}"))
                         })
                     })

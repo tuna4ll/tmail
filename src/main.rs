@@ -67,6 +67,7 @@ async fn main() -> color_eyre::Result<()> {
         return Ok(());
     };
     log::init(options.log.clone())?;
+    mailbox::prune_caches();
     let config = Config::load(options.config_path.as_deref())?;
     if options.doctor {
         if !doctor::run(&config) {
@@ -116,6 +117,7 @@ pub struct App {
     running: bool,
     selected: usize,
     mails: Vec<Mail>,
+    folders: Vec<String>,
     contacts: Vec<String>,
     conversations: Vec<Conversation>,
     workspace: Option<Workspace>,
@@ -209,6 +211,8 @@ enum Overlay {
     Folders {
         selected: usize,
         items: Vec<FolderItem>,
+        /// Picking a destination for the active message instead of a folder to view.
+        moving: bool,
     },
     Links {
         selected: usize,
@@ -309,6 +313,7 @@ impl App {
             running: false,
             selected: 0,
             mails: Vec::new(),
+            folders: Vec::new(),
             contacts: Vec::new(),
             conversations: Vec::new(),
             workspace: None,
@@ -541,6 +546,11 @@ impl App {
             format!(
                 " {} · {} • {} skipped ",
                 self.account_label, self.active_folder, self.skipped
+            )
+        } else if !self.syncing.is_empty() {
+            format!(
+                " {} · {} • syncing ",
+                self.account_label, self.active_folder
             )
         } else if inbox_focused {
             format!(" {} · {} • active ", self.account_label, self.active_folder)
@@ -848,6 +858,10 @@ impl App {
                 self.start_draft(draft::Start::ReplyAll);
                 return;
             }
+            KeyCode::Char('M') => {
+                self.open_move_picker();
+                return;
+            }
             KeyCode::Char('F') => {
                 self.start_draft(draft::Start::Forward);
                 return;
@@ -1090,11 +1104,13 @@ impl App {
             }
             Ok(report) if report.mails.is_empty() => {
                 self.clear_mailbox();
+                self.folders = report.folders;
                 self.mailbox_state = MailboxState::Empty;
             }
             Ok(report) => {
                 let active_mail_id = self.active_mail_id();
                 self.mails = report.mails;
+                self.folders = report.folders;
                 self.contacts = complete::contacts(&self.mails);
                 self.skipped = report.skipped.len();
                 let folders = self.folder_items();
@@ -1365,6 +1381,7 @@ impl App {
             .mails
             .iter()
             .map(|mail| mail_folder(mail).into())
+            .chain(self.folders.iter().cloned())
             .collect();
         if matches!(
             self.source,
@@ -1402,7 +1419,70 @@ impl App {
             .iter()
             .position(|folder| folder.name == self.active_folder)
             .unwrap_or_default();
-        self.overlay = Some(Overlay::Folders { selected, items });
+        self.overlay = Some(Overlay::Folders {
+            selected,
+            items,
+            moving: false,
+        });
+    }
+
+    fn open_move_picker(&mut self) {
+        let Some(current) = self
+            .active_mail_id()
+            .and_then(|id| self.mails.iter().find(|mail| mail.id == id))
+            .map(|mail| mail_folder(mail).to_owned())
+        else {
+            return;
+        };
+        let items: Vec<FolderItem> = self
+            .folder_items()
+            .into_iter()
+            .filter(|folder| {
+                folder.name != current && !["Outbox", "Drafts"].contains(&folder.name.as_str())
+            })
+            .collect();
+        if items.is_empty() {
+            self.notice = Some("There is no other folder to move to.".into());
+            return;
+        }
+        self.overlay = Some(Overlay::Folders {
+            selected: 0,
+            items,
+            moving: true,
+        });
+    }
+
+    fn move_active_to(&mut self, folder: &str) {
+        if self.sending {
+            self.notice = Some("Wait for the current send before changing messages.".into());
+            return;
+        }
+        let Some(index) = self
+            .active_mail_id()
+            .and_then(|id| self.mails.iter().position(|mail| mail.id == id))
+        else {
+            return;
+        };
+        let snapshot = matches!(self.source, MailboxSource::Demo).then(|| self.mails.clone());
+        match self.source.move_to_named(&self.mails[index], folder) {
+            Ok(change) => {
+                if let Some(change) = &change {
+                    self.mails[index].source_path = Some(change.after_path().to_path_buf());
+                }
+                self.mails[index].mailbox = Some(folder.to_owned());
+                self.reader = None;
+                let label = format!("Moved message to {folder}");
+                self.undo = Some(UndoAction {
+                    change,
+                    demo_mails: snapshot,
+                    label: label.clone(),
+                });
+                self.notice = Some(label);
+                self.refresh_fingerprint();
+                self.rebuild_mailbox(None);
+            }
+            Err(error) => self.notice = Some(format!("Unable to move message: {error}")),
+        }
     }
 
     fn open_links(&mut self) {
@@ -2018,11 +2098,22 @@ impl App {
         match result {
             Ok(synced) => {
                 if !self.watchers.contains_key(&id) && remote.sync_interval_secs > 0 {
-                    self.watch_account(id, remote);
+                    self.watch_account(id.clone(), remote);
                 }
                 if visible && (synced.changed || manual) {
                     self.notice = Some(synced.summary);
                     self.reload();
+                } else if !visible && synced.downloaded > 0 {
+                    let label = self
+                        .config
+                        .accounts
+                        .iter()
+                        .find(|account| account.id == id)
+                        .map_or(id.clone(), config::Account::label);
+                    self.notice = Some(format!(
+                        "{} new in {label} · press p to switch",
+                        synced.downloaded
+                    ));
                 }
             }
             Err(error) => {
@@ -2223,7 +2314,11 @@ impl App {
                 }
                 _ => self.overlay = Some(overlay),
             },
-            Overlay::Folders { selected, items } => match key.code {
+            Overlay::Folders {
+                selected,
+                items,
+                moving,
+            } => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Down | KeyCode::Char('j') if *selected + 1 < items.len() => {
                     *selected += 1;
@@ -2235,9 +2330,14 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some(folder) = items.get(*selected) {
-                        self.active_folder = folder.name.clone();
-                        self.reader = None;
-                        self.rebuild_mailbox(None);
+                        if *moving {
+                            let name = folder.name.clone();
+                            self.move_active_to(&name);
+                        } else {
+                            self.active_folder = folder.name.clone();
+                            self.reader = None;
+                            self.rebuild_mailbox(None);
+                        }
                     }
                 }
                 _ => self.overlay = Some(overlay),
@@ -2841,6 +2941,7 @@ const HELP: &[&str] = &[
     "  m  read/unread     s  star/unstar",
     "  a  archive         d  move to Trash",
     "  d d  in Trash: delete permanently",
+    "  M  move to another folder",
     "  u  undo            c  compose",
     "  r  reply           A  reply all   F  forward",
     "  l  open links       v  attachments",
@@ -2860,7 +2961,7 @@ const HELP: &[&str] = &[
     "",
     "commands",
     "  :reload                 :filter unread",
-    "  :sync                   fetch new IMAP messages",
+    "  :sync                   sync every account now",
     "  :accounts               :account add / :account edit",
     "  :login                  enter an account password",
     "  :open maildir PATH      :compose  :reply  :quit",
@@ -2990,7 +3091,11 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                 area,
             );
         }
-        Overlay::Folders { selected, items } => {
+        Overlay::Folders {
+            selected,
+            items,
+            moving,
+        } => {
             let rows: Vec<ListItem> = items
                 .iter()
                 .map(|folder| {
@@ -3008,7 +3113,7 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                     Block::bordered()
                         .border_style(theme::border(true))
                         .title_style(theme::title(true))
-                        .title(" folders ")
+                        .title(if *moving { " move to " } else { " folders " })
                         .bg(theme::SURFACE),
                 );
             let mut state = ListState::default().with_selected(Some(*selected));

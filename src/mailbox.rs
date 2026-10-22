@@ -26,6 +26,8 @@ pub enum MailboxSource {
 #[derive(Debug)]
 pub struct LoadReport {
     pub mails: Vec<Mail>,
+    /// Every folder in the Maildir, including empty ones.
+    pub folders: Vec<String>,
     pub skipped: Vec<String>,
     pub attempted: usize,
 }
@@ -62,6 +64,7 @@ impl MailboxSource {
         match self {
             Self::Demo => Ok(LoadReport {
                 mails: demo_mails(),
+                folders: Vec::new(),
                 skipped: Vec::new(),
                 attempted: 7,
             }),
@@ -123,6 +126,24 @@ impl MailboxSource {
         }
         fs::remove_file(path)?;
         crate::storage::sync_parent(path).map_err(Into::into)
+    }
+
+    /// Moves a message to a folder by its display name, such as `INBOX` or `Work.Clients`.
+    pub fn move_to_named(
+        &self,
+        mail: &Mail,
+        name: &str,
+    ) -> Result<Option<MaildirChange>, LoadError> {
+        if name.is_empty() || name.contains(['/', '\\']) || name.starts_with('.') {
+            return Err(LoadError {
+                message: "Invalid folder name.".into(),
+            });
+        }
+        if name == "INBOX" {
+            self.move_to(mail, "")
+        } else {
+            self.move_to(mail, &format!(".{name}"))
+        }
     }
 
     pub fn mark_sent(&self, mail: &Mail) -> Result<Option<MaildirChange>, LoadError> {
@@ -204,9 +225,11 @@ impl MailboxSource {
             .ok_or_else(|| LoadError {
                 message: "Unable to parse the message attachment.".into(),
             })?;
-        let part = parsed.attachments().nth(index).ok_or_else(|| LoadError {
-            message: "Attachment is no longer available.".into(),
-        })?;
+        let part = *listed_attachments(&parsed)
+            .get(index)
+            .ok_or_else(|| LoadError {
+                message: "Attachment is no longer available.".into(),
+            })?;
         let fallback = format!("attachment-{}", index + 1);
         let name = safe_file_name(part.attachment_name().unwrap_or(&fallback));
         fs::create_dir_all(destination)?;
@@ -302,6 +325,7 @@ impl From<io::Error> for LoadError {
 
 fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
     let mut mails = Vec::new();
+    let mut folders = Vec::new();
     let mut skipped = crate::outbox::recover(path);
     let mut attempted = 0;
     let cache = load_cache(path).unwrap_or_default();
@@ -310,6 +334,7 @@ fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
     for folder in FolderIterator::new(path, Some("."))? {
         let folder = folder?;
         let mailbox = folder.name().unwrap_or("INBOX").to_owned();
+        folders.push(mailbox.clone());
         for message in folder {
             attempted += 1;
             let message = message?;
@@ -360,8 +385,8 @@ fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
                 .or_else(|| html_body.as_deref().map(readable_html))
                 .unwrap_or_default();
             let links = html_body.as_deref().map(extract_links).unwrap_or_default();
-            let attachments: Vec<Attachment> = parsed
-                .attachments()
+            let attachments: Vec<Attachment> = listed_attachments(&parsed)
+                .into_iter()
                 .enumerate()
                 .map(|(index, part)| {
                     let media_type = part
@@ -429,6 +454,7 @@ fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
     let _ = save_cache(path, &next_cache);
     Ok(LoadReport {
         mails,
+        folders,
         skipped,
         attempted,
     })
@@ -437,12 +463,14 @@ fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
 fn load_unified(accounts: &[(String, PathBuf)]) -> Result<LoadReport, LoadError> {
     let mut report = LoadReport {
         mails: Vec::new(),
+        folders: Vec::new(),
         skipped: Vec::new(),
         attempted: 0,
     };
     for (account, path) in accounts {
         let loaded = load_maildir(path)?;
         report.attempted += loaded.attempted;
+        report.folders.extend(loaded.folders);
         report.skipped.extend(loaded.skipped);
         report
             .mails
@@ -464,13 +492,38 @@ fn load_unified(accounts: &[(String, PathBuf)]) -> Result<LoadReport, LoadError>
     Ok(report)
 }
 
+/// Caches older than this belong to Maildirs that are no longer opened.
+const CACHE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60 * 60 * 24 * 30);
+
+fn cache_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join("termail-test-cache"));
+    }
+    ProjectDirs::from("com", "tunakilic", "termail").map(|dirs| dirs.cache_dir().to_path_buf())
+}
+
 fn cache_path(maildir: &Path) -> Option<PathBuf> {
     let mut hasher = DefaultHasher::new();
     maildir.hash(&mut hasher);
-    ProjectDirs::from("com", "tunakilic", "termail").map(|dirs| {
-        dirs.cache_dir()
-            .join(format!("maildir-v4-{:016x}.json", hasher.finish()))
-    })
+    cache_dir().map(|dir| dir.join(format!("maildir-v5-{:016x}.json", hasher.finish())))
+}
+
+/// Removes caches nobody has opened for a month.
+pub fn prune_caches() {
+    let Some(entries) = cache_dir().and_then(|dir| fs::read_dir(dir).ok()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|time| time.elapsed().ok())
+            .is_some_and(|age| age > CACHE_LIFETIME);
+        if stale && entry.file_name().to_string_lossy().starts_with("maildir-") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn load_cache(maildir: &Path) -> io::Result<BTreeMap<String, CachedMessage>> {
@@ -491,13 +544,19 @@ fn save_cache(maildir: &Path, cache: &BTreeMap<String, CachedMessage>) -> io::Re
     };
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
     }
-    let temporary = path.with_extension("json.tmp");
+    let temporary = path.with_file_name(crate::storage::unique_name("cache"));
     let contents = serde_json::to_vec(cache)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    fs::write(&temporary, contents)?;
-    if path.exists() {
-        fs::remove_file(&path)?;
+    // The cache holds message bodies, so it gets the same private mode as the mail.
+    if let Err(error) = crate::storage::write_new(&temporary, &contents) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
     }
     fs::rename(temporary, path)
 }
@@ -694,25 +753,25 @@ fn available_path(directory: &Path, name: &str) -> PathBuf {
     unreachable!()
 }
 
+/// Hashes file names and directory modification times. Adding, removing, renaming or
+/// replacing a message changes its directory, so no per-file metadata is needed.
 fn fingerprint_dir(path: &Path, fingerprint: &mut u64) -> io::Result<()> {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    fs::metadata(path)?.modified()?.hash(&mut hasher);
+    *fingerprint ^= hasher.finish();
     for entry in fs::read_dir(path)? {
         let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            let name = path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("");
-            if name == "tmp" {
+        let name = entry.file_name();
+        if entry.file_type()?.is_dir() {
+            if name == "tmp" || name == "termail-sync" {
                 continue;
             }
-            fingerprint_dir(&path, fingerprint)?;
-        } else if path.is_file() {
-            let metadata = entry.metadata()?;
+            fingerprint_dir(&entry.path(), fingerprint)?;
+        } else {
             let mut hasher = DefaultHasher::new();
             path.hash(&mut hasher);
-            metadata.len().hash(&mut hasher);
-            metadata.modified()?.hash(&mut hasher);
+            name.hash(&mut hasher);
             *fingerprint ^= hasher.finish();
         }
     }
@@ -725,6 +784,27 @@ fn clean_id(value: &str) -> String {
         .trim_start_matches('<')
         .trim_end_matches('>')
         .into()
+}
+
+/// The attachments a reader sees: pictures the HTML shows inline through `cid:` are part
+/// of the message body, not files.
+pub(crate) fn listed_attachments<'a>(
+    message: &'a mail_parser::Message<'a>,
+) -> Vec<&'a mail_parser::MessagePart<'a>> {
+    let html: String = (0..message.html_body_count())
+        .filter_map(|index| message.body_html(index))
+        .collect::<Vec<_>>()
+        .concat()
+        .to_lowercase();
+    message
+        .attachments()
+        .filter(|part| {
+            !part.content_id().is_some_and(|id| {
+                let id = clean_id(id).to_lowercase();
+                !id.is_empty() && html.contains(&format!("cid:{id}"))
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn format_addresses(addresses: &Address<'_>) -> Vec<String> {
