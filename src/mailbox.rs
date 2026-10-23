@@ -572,15 +572,7 @@ fn rename_with_flag(path: &Path, flag: char, enabled: bool) -> io::Result<Maildi
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid Maildir filename."))?;
-    let (base, current, separator) = if let Some((base, flags)) = file_name.rsplit_once(":2,") {
-        (base, flags, ":2,")
-    } else if let Some((base, flags)) = file_name.rsplit_once("!2,") {
-        (base, flags, "!2,")
-    } else if cfg!(target_os = "windows") {
-        (file_name, "", "!2,")
-    } else {
-        (file_name, "", ":2,")
-    };
+    let (base, current, separator) = crate::storage::maildir_info(file_name);
     let mut flags: Vec<char> = current.chars().filter(|value| *value != flag).collect();
     if enabled {
         flags.push(flag);
@@ -617,13 +609,7 @@ fn move_to_folder(path: &Path, folder: &Path) -> io::Result<MaildirChange> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid Maildir filename."))?;
-    let (base, flags, separator) = if let Some((base, flags)) = file_name.rsplit_once(":2,") {
-        (base, flags, ":2,")
-    } else if let Some((base, flags)) = file_name.rsplit_once("!2,") {
-        (base, flags, "!2,")
-    } else {
-        (file_name, "", if cfg!(windows) { "!2," } else { ":2," })
-    };
+    let (base, flags, separator) = crate::storage::maildir_info(file_name);
     let mut flags: Vec<char> = flags.chars().collect();
     if folder.file_name().is_some_and(|name| name == ".Sent") {
         flags.push('S');

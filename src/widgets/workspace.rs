@@ -235,8 +235,12 @@ fn conversation_flow(
         })
         .collect();
 
-    let mut flow = Flow::with_graph(nodes, edges)
-        .unwrap()
+    // A malformed thread (such as two messages sharing an ID) shows an empty map rather
+    // than taking the client down.
+    let Ok(flow) = Flow::with_graph(nodes, edges) else {
+        return Flow::new();
+    };
+    let mut flow = flow
         .with_theme(theme::flow())
         .with_selection_reveal(SelectionReveal::EnsureVisible)
         .with_min_zoom(0.8)

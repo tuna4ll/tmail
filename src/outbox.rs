@@ -56,13 +56,7 @@ pub fn status_path(root: &Path, message: &Path) -> Result<PathBuf, String> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or("Invalid Outbox filename.")?;
-    let name = name
-        .split(":2,")
-        .next()
-        .unwrap_or(name)
-        .split("!2,")
-        .next()
-        .unwrap_or(name);
+    let name = storage::maildir_info(name).0;
     Ok(outbox
         .join("termail-state")
         .join(format!("{name}.delivery")))

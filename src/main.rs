@@ -246,6 +246,40 @@ enum Overlay {
     Compose(ComposeState),
 }
 
+impl Overlay {
+    /// Moves the highlight in list overlays with j/k or the arrows. Returns whether the
+    /// key was used.
+    fn step_selection(&mut self, code: KeyCode) -> bool {
+        let down = matches!(code, KeyCode::Down | KeyCode::Char('j'));
+        if !down && !matches!(code, KeyCode::Up | KeyCode::Char('k')) {
+            return false;
+        }
+        let (selected, count) = match self {
+            Self::Folders {
+                selected, items, ..
+            } => (selected, items.len()),
+            Self::Links { selected, items } => (selected, items.len()),
+            Self::Attachments { selected, items } => (selected, items.len()),
+            Self::Accounts {
+                selected,
+                items,
+                removing,
+            } => {
+                // Moving to another account cancels a pending removal.
+                *removing = false;
+                (selected, items.len())
+            }
+            _ => return false,
+        };
+        *selected = if down {
+            (*selected + 1).min(count.saturating_sub(1))
+        } else {
+            selected.saturating_sub(1)
+        };
+        true
+    }
+}
+
 struct ComposeState {
     composer: draft::Composer,
     field: usize,
@@ -475,27 +509,8 @@ impl App {
                 &self.source,
                 self.spinner_tick,
             );
-            let hints = if matches!(self.overlay, Some(Overlay::Help { .. })) {
-                status_line(&[("j/k", "scroll"), ("esc", "close help")])
-            } else if matches!(self.overlay, Some(Overlay::Command(_))) {
-                status_line(&[("type", "command"), ("enter", "run"), ("esc", "cancel")])
-            } else if matches!(self.overlay, Some(Overlay::DraftReady { .. })) {
-                status_line(&[("s", "send"), ("e", "edit"), ("d", "save draft")])
-            } else if matches!(self.overlay, Some(Overlay::ComposeClose(_))) {
-                status_line(&[("s", "save draft"), ("d", "discard"), ("esc", "continue")])
-            } else if matches!(
-                self.overlay,
-                Some(Overlay::Folders { .. } | Overlay::Links { .. } | Overlay::Accounts { .. })
-            ) {
-                status_line(&[("j/k", "select"), ("enter", "open"), ("esc", "cancel")])
-            } else if matches!(self.overlay, Some(Overlay::Attachments { .. })) {
-                status_line(&[("j/k", "select"), ("s", "save"), ("o", "open")])
-            } else if matches!(self.overlay, Some(Overlay::Compose(_))) {
-                status_line(&[
-                    ("tab", "next field"),
-                    ("ctrl+s", "review"),
-                    ("esc", "close"),
-                ])
+            let hints = if let Some(hints) = self.overlay_hints() {
+                hints
             } else if let Some(notice) = &self.notice {
                 action_line(notice, false)
             } else {
@@ -679,27 +694,8 @@ impl App {
 
         self.list_offset = list_state.offset();
 
-        let hints = if matches!(self.overlay, Some(Overlay::Help { .. })) {
-            status_line(&[("j/k", "scroll"), ("esc", "close help")])
-        } else if matches!(self.overlay, Some(Overlay::Command(_))) {
-            status_line(&[("type", "command"), ("enter", "run"), ("esc", "cancel")])
-        } else if matches!(self.overlay, Some(Overlay::DraftReady { .. })) {
-            status_line(&[("s", "send"), ("e", "edit"), ("d", "save draft")])
-        } else if matches!(self.overlay, Some(Overlay::ComposeClose(_))) {
-            status_line(&[("s", "save draft"), ("d", "discard"), ("esc", "continue")])
-        } else if matches!(
-            self.overlay,
-            Some(Overlay::Folders { .. } | Overlay::Links { .. } | Overlay::Accounts { .. })
-        ) {
-            status_line(&[("j/k", "select"), ("enter", "open"), ("esc", "cancel")])
-        } else if matches!(self.overlay, Some(Overlay::Attachments { .. })) {
-            status_line(&[("j/k", "select"), ("s", "save"), ("o", "open")])
-        } else if matches!(self.overlay, Some(Overlay::Compose(_))) {
-            status_line(&[
-                ("tab", "next field"),
-                ("ctrl+s", "review"),
-                ("esc", "close"),
-            ])
+        let hints = if let Some(hints) = self.overlay_hints() {
+            hints
         } else if let Some(notice) = &self.notice {
             action_line(notice, self.undo.is_some())
         } else if self.searching {
@@ -755,6 +751,32 @@ impl App {
         if let Some(overlay) = &self.overlay {
             draw_overlay(frame, overlay);
         }
+    }
+
+    /// The status line for the open overlay, if any overlay has its own keys.
+    fn overlay_hints(&self) -> Option<Line<'static>> {
+        let hints: &[(&str, &str)] = match self.overlay.as_ref()? {
+            Overlay::Help { .. } => &[("j/k", "scroll"), ("esc", "close help")],
+            Overlay::Command(_) => &[("type", "command"), ("enter", "run"), ("esc", "cancel")],
+            Overlay::DraftReady { .. } => &[("s", "send"), ("e", "edit"), ("d", "save draft")],
+            Overlay::ComposeClose(_) => {
+                &[("s", "save draft"), ("d", "discard"), ("esc", "continue")]
+            }
+            Overlay::Folders { moving: true, .. } => {
+                &[("j/k", "select"), ("enter", "move here"), ("esc", "cancel")]
+            }
+            Overlay::Folders { .. } | Overlay::Links { .. } | Overlay::Accounts { .. } => {
+                &[("j/k", "select"), ("enter", "open"), ("esc", "cancel")]
+            }
+            Overlay::Attachments { .. } => &[("j/k", "select"), ("s", "save"), ("o", "open")],
+            Overlay::Compose(_) => &[
+                ("tab", "next field or accept ⇥"),
+                ("ctrl+s", "review"),
+                ("esc", "close"),
+            ],
+            Overlay::AccountSetup(_) | Overlay::DeliveryReview { .. } => return None,
+        };
+        Some(status_line(hints))
     }
 
     fn handle_event(&mut self, event: Event) {
@@ -2573,6 +2595,10 @@ impl App {
             }
             overlay => overlay,
         };
+        if overlay.step_selection(key.code) {
+            self.overlay = Some(overlay);
+            return true;
+        }
         match &mut overlay {
             Overlay::Help { scroll } => match key.code {
                 KeyCode::Esc | KeyCode::Char('?') => {}
@@ -2611,14 +2637,6 @@ impl App {
                 moving,
             } => match key.code {
                 KeyCode::Esc => {}
-                KeyCode::Down | KeyCode::Char('j') if *selected + 1 < items.len() => {
-                    *selected += 1;
-                    self.overlay = Some(overlay);
-                }
-                KeyCode::Up | KeyCode::Char('k') if *selected > 0 => {
-                    *selected -= 1;
-                    self.overlay = Some(overlay);
-                }
                 KeyCode::Enter => {
                     if let Some(folder) = items.get(*selected) {
                         if *moving {
@@ -2635,14 +2653,6 @@ impl App {
             },
             Overlay::Links { selected, items } => match key.code {
                 KeyCode::Esc => {}
-                KeyCode::Down | KeyCode::Char('j') if *selected + 1 < items.len() => {
-                    *selected += 1;
-                    self.overlay = Some(overlay);
-                }
-                KeyCode::Up | KeyCode::Char('k') if *selected > 0 => {
-                    *selected -= 1;
-                    self.overlay = Some(overlay);
-                }
                 KeyCode::Enter => {
                     if let Some(link) = items.get(*selected) {
                         self.notice = match opener::open(link) {
@@ -2655,16 +2665,8 @@ impl App {
                 }
                 _ => self.overlay = Some(overlay),
             },
-            Overlay::Attachments { selected, items } => match key.code {
+            Overlay::Attachments { selected, .. } => match key.code {
                 KeyCode::Esc => {}
-                KeyCode::Down | KeyCode::Char('j') if *selected + 1 < items.len() => {
-                    *selected += 1;
-                    self.overlay = Some(overlay);
-                }
-                KeyCode::Up | KeyCode::Char('k') if *selected > 0 => {
-                    *selected -= 1;
-                    self.overlay = Some(overlay);
-                }
                 KeyCode::Char('s') => self.save_active_attachment(*selected, false),
                 KeyCode::Char('o') | KeyCode::Enter => self.save_active_attachment(*selected, true),
                 _ => self.overlay = Some(overlay),
@@ -2699,16 +2701,6 @@ impl App {
                         self.select_account(Some(index));
                         self.open_account_setup(account_setup::Mode::Login);
                     }
-                }
-                KeyCode::Down | KeyCode::Char('j') if *selected + 1 < items.len() => {
-                    *selected += 1;
-                    *removing = false;
-                    self.overlay = Some(overlay);
-                }
-                KeyCode::Up | KeyCode::Char('k') if *selected > 0 => {
-                    *selected -= 1;
-                    *removing = false;
-                    self.overlay = Some(overlay);
                 }
                 KeyCode::Enter => {
                     if let Some(item) = items.get(*selected) {

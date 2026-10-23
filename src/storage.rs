@@ -4,6 +4,21 @@ use std::{
     path::Path,
 };
 
+/// The separator before Maildir info flags. Windows cannot use `:` in file names, so
+/// it takes the `!` that Dovecot uses there.
+pub const MAILDIR_SEPARATOR: &str = if cfg!(windows) { "!2," } else { ":2," };
+
+/// Splits a Maildir file name into its unique part, its flags and the separator it
+/// uses, accepting either convention.
+pub fn maildir_info(file_name: &str) -> (&str, &str, &'static str) {
+    for separator in [":2,", "!2,"] {
+        if let Some((base, flags)) = file_name.rsplit_once(separator) {
+            return (base, flags, separator);
+        }
+    }
+    (file_name, "", MAILDIR_SEPARATOR)
+}
+
 pub fn unique_name(prefix: &str) -> String {
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

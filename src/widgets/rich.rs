@@ -495,7 +495,7 @@ fn find_tag(value: &str, name: &str) -> Option<usize> {
         let start = position + offset;
         let after = start + 1 + name.len();
         if bytes.len() > after
-            && value[start + 1..after].eq_ignore_ascii_case(name)
+            && bytes[start + 1..after].eq_ignore_ascii_case(name.as_bytes())
             && matches!(bytes[after], b' ' | b'\t' | b'\n' | b'\r' | b'/' | b'>')
         {
             return Some(start);

@@ -487,14 +487,12 @@ pub fn sync(remote: &RemoteConfig, root: &Path) -> Result<Synced, String> {
 
 /// Splits a Maildir filename into its unique part and its info flags.
 fn split_flags(file_name: &str) -> (&str, &str) {
-    file_name
-        .rsplit_once(":2,")
-        .or_else(|| file_name.rsplit_once("!2,"))
-        .unwrap_or((file_name, ""))
+    let (base, flags, _) = storage::maildir_info(file_name);
+    (base, flags)
 }
 
 fn separator() -> &'static str {
-    if cfg!(windows) { "!2," } else { ":2," }
+    storage::MAILDIR_SEPARATOR
 }
 
 fn base_name(server: &str, folder: &str, validity: u32, uid: u32) -> String {
