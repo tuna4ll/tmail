@@ -27,7 +27,7 @@ impl MailCard {
             from: mail.from.clone(),
             subject: mail.subject.clone(),
             body: mail.body.clone(),
-            date: mail.date.clone(),
+            date: mail.timestamp.map(crate::mail::short_date),
             unread: mail.unread,
             starred: mail.starred,
             attachment_count: mail.attachment_count,
@@ -109,7 +109,7 @@ impl NodeContent for MailCard {
         if inner.height > 1 {
             let mut details = Vec::new();
             if let Some(date) = &self.date {
-                details.push(date.chars().take(10).collect());
+                details.push(date.clone());
             }
             if self.attachment_count > 0 {
                 details.push(format!("{} file", self.attachment_count));

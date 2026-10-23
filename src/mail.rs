@@ -308,6 +308,32 @@ impl Mail {
     }
 }
 
+/// A date for lists: the time today, the day this year, the full date before that.
+pub fn short_date(timestamp: i64) -> String {
+    use chrono::{Datelike, Local, TimeZone};
+    let Some(date) = Local.timestamp_opt(timestamp, 0).single() else {
+        return String::new();
+    };
+    let now = Local::now();
+    if date.date_naive() == now.date_naive() {
+        date.format("%H:%M").to_string()
+    } else if date.year() == now.year() {
+        date.format("%-d %b").to_string()
+    } else {
+        date.format("%-d %b %Y").to_string()
+    }
+}
+
+/// A full date in the local time zone, for message headers.
+pub fn long_date(timestamp: i64) -> String {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .map(|date| date.format("%a %-d %b %Y %H:%M").to_string())
+        .unwrap_or_default()
+}
+
 /// Splits a search query into lowercased terms, keeping quoted phrases together.
 pub fn search_terms(query: &str) -> Vec<String> {
     let mut terms = Vec::new();

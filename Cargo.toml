@@ -7,6 +7,7 @@ license = "MIT"
 edition = "2024"
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 color-eyre = "0.6.5"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 directories = "6.0.0"
@@ -30,6 +31,11 @@ toml = "1.1.6"
 toml_edit = "0.22.27"
 zeroize = "1.9.1"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+html2text = { version = "0.17", features = ["css"] }
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+unicode-width = "0.2"
 
 [dev-dependencies]
 rcgen = "0.14.5"

@@ -1,18 +1,25 @@
-use crate::{mail::Mail, theme};
+use crate::{
+    mail::Mail,
+    theme,
+    widgets::rich::{Body, Row, wrap},
+};
 use ratatui::{
     Frame,
     layout::{Margin, Rect},
     style::{Modifier, Style, Stylize},
-    text::{Line, Span, Text},
-    widgets::{
-        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-    },
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
+use ratatui_image::{Image, picker::Picker};
 
 pub struct Reader {
     mail_id: String,
     scroll: u16,
     max_scroll: u16,
+    body: Option<Body>,
+    /// Laid-out rows and the width they were laid out for.
+    rows: Option<(u16, Vec<Row>)>,
+    drew_images: bool,
 }
 
 impl Reader {
@@ -21,6 +28,9 @@ impl Reader {
             mail_id,
             scroll: 0,
             max_scroll: 0,
+            body: None,
+            rows: None,
+            drew_images: false,
         }
     }
 
@@ -36,45 +46,108 @@ impl Reader {
         self.scroll = self.scroll.saturating_sub(amount);
     }
 
-    pub fn draw(&mut self, frame: &mut Frame, area: Rect, mail: &Mail) {
+    /// Whether the last frame placed terminal graphics, which need a full redraw to
+    /// erase once they move or close.
+    pub fn shows_images(&self) -> bool {
+        self.drew_images
+    }
+
+    /// The message body with its pictures, read from the message file on first use.
+    pub fn body(&mut self, mail: &Mail) -> &mut Body {
+        self.body.get_or_insert_with(|| Body::load(mail))
+    }
+
+    /// Lays the message out again, after pictures arrive.
+    pub fn invalidate(&mut self) {
+        self.rows = None;
+    }
+
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect, mail: &Mail, picker: Option<&Picker>) {
         let area = reader_area(area);
-        self.render(frame, area, mail, true);
+        self.render(frame, area, mail, picker, true);
     }
 
-    pub fn draw_docked(&mut self, frame: &mut Frame, area: Rect, mail: &Mail) {
-        self.render(frame, area, mail, false);
+    pub fn draw_docked(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        mail: &Mail,
+        picker: Option<&Picker>,
+    ) {
+        self.render(frame, area, mail, picker, false);
     }
 
-    fn render(&mut self, frame: &mut Frame, area: Rect, mail: &Mail, clear: bool) {
-        let content = message_content(mail);
-        let text = message_text(mail);
+    fn render(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        mail: &Mail,
+        picker: Option<&Picker>,
+        clear: bool,
+    ) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme::border(true))
             .title_style(theme::title(true))
             .title(" message ")
             .bg(theme::SURFACE);
-        let reader = Paragraph::new(text)
-            .style(theme::text())
-            .wrap(Wrap { trim: false });
-        let viewport_height = area.height.saturating_sub(2) as usize;
-        let content_height = wrapped_line_count(&content, area.width.saturating_sub(2));
-        self.max_scroll = content_height.saturating_sub(viewport_height) as u16;
-        self.scroll = self.scroll.min(self.max_scroll);
-        let reader = reader.block(block).scroll((self.scroll, 0));
-
+        let inner = block.inner(area);
         if clear {
             frame.render_widget(Clear, area);
         }
-        frame.render_widget(reader, area);
+        frame.render_widget(block, area);
+        let width = inner.width;
+        if self
+            .rows
+            .as_ref()
+            .is_none_or(|(laid_out, _)| *laid_out != width)
+        {
+            let rows = self.layout(mail, width, picker);
+            self.rows = Some((width, rows));
+        }
+        let Some((_, rows)) = &self.rows else {
+            return;
+        };
+        let viewport = usize::from(inner.height);
+        self.max_scroll = rows.len().saturating_sub(viewport) as u16;
+        self.scroll = self.scroll.min(self.max_scroll);
+        let scroll = usize::from(self.scroll);
+        let mut drew_images = false;
+        for (offset, row) in rows.iter().enumerate().skip(scroll).take(viewport) {
+            let y = inner.y + (offset - scroll) as u16;
+            let line_area = Rect::new(inner.x, y, width, 1);
+            match row {
+                Row::Line(line) => frame
+                    .render_widget(Paragraph::new(line.clone()).style(theme::text()), line_area),
+                Row::Image { slot, height } => {
+                    let fits = offset - scroll + usize::from(*height) <= viewport;
+                    match self.body.as_ref().and_then(|body| body.protocol(*slot)) {
+                        Some(protocol) if fits => {
+                            frame.render_widget(
+                                Image::new(protocol),
+                                Rect::new(inner.x, y, width, *height),
+                            );
+                            drew_images = true;
+                        }
+                        _ => frame.render_widget(cut_image(), line_area),
+                    }
+                }
+                // Part of a picture that is scrolled half out of view.
+                Row::Covered { start } if *start < scroll => {
+                    frame.render_widget(cut_image(), line_area);
+                }
+                Row::Covered { .. } => {}
+            }
+        }
+        self.drew_images = drew_images;
 
         if self.max_scroll > 0 {
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
                 .end_symbol(None);
-            let mut state = ScrollbarState::new(content_height)
-                .position(self.scroll as usize)
-                .viewport_content_length(viewport_height);
+            let mut state = ScrollbarState::new(rows.len())
+                .position(scroll)
+                .viewport_content_length(viewport);
             frame.render_stateful_widget(
                 scrollbar,
                 area.inner(Margin {
@@ -85,9 +158,37 @@ impl Reader {
             );
         }
     }
+
+    fn layout(&mut self, mail: &Mail, width: u16, picker: Option<&Picker>) -> Vec<Row> {
+        let body = self.body(mail);
+        let blocked = body.has_blocked();
+        let mut rows: Vec<Row> = header_lines(mail, blocked)
+            .into_iter()
+            .flat_map(|line| wrap(line, width))
+            .map(Row::Line)
+            .collect();
+        rows.push(Row::Line(Line::default()));
+        rows.extend(self.body(mail).rows(width, picker));
+        if !mail.links.is_empty() {
+            rows.push(Row::Line(Line::default()));
+            rows.push(Row::Line(Line::styled("links", theme::muted())));
+            for (index, link) in mail.links.iter().enumerate() {
+                rows.extend(
+                    wrap(Line::from(format!("  {}. {link}", index + 1)), width)
+                        .into_iter()
+                        .map(Row::Line),
+                );
+            }
+        }
+        rows
+    }
 }
 
-fn message_text(mail: &Mail) -> Text<'static> {
+fn cut_image() -> Paragraph<'static> {
+    Paragraph::new("░".repeat(4)).style(theme::muted())
+}
+
+fn header_lines(mail: &Mail, blocked: bool) -> Vec<Line<'static>> {
     let mut lines = vec![header_line("from", &mail.from, true)];
     if !mail.to.is_empty() {
         lines.push(header_line("to", &mail.to.join(", "), false));
@@ -95,15 +196,27 @@ fn message_text(mail: &Mail) -> Text<'static> {
     if !mail.cc.is_empty() {
         lines.push(header_line("cc", &mail.cc.join(", "), false));
     }
-    if let Some(date) = &mail.date {
-        lines.push(header_line("date", date, false));
+    if let Some(timestamp) = mail.timestamp.filter(|_| mail.date.is_some()) {
+        lines.push(header_line(
+            "date",
+            &crate::mail::long_date(timestamp),
+            false,
+        ));
     }
     lines.push(header_line("subject", &mail.subject, true));
     if let Some(status) = &mail.delivery_status {
         lines.push(header_line("delivery", status, true));
     }
     if mail.html {
-        lines.push(header_line("format", "html · remote images blocked", false));
+        lines.push(header_line(
+            "format",
+            if blocked {
+                "html · remote images blocked · I to load"
+            } else {
+                "html"
+            },
+            false,
+        ));
     }
     for (index, attachment) in mail.attachments.iter().enumerate() {
         lines.push(header_line(
@@ -117,19 +230,7 @@ fn message_text(mail: &Mail) -> Text<'static> {
             false,
         ));
     }
-    lines.push(Line::default());
-    lines.extend(mail.body.lines().map(|line| Line::from(line.to_owned())));
-    if !mail.links.is_empty() {
-        lines.push(Line::default());
-        lines.push(Line::styled("links", theme::muted()));
-        lines.extend(
-            mail.links
-                .iter()
-                .enumerate()
-                .map(|(index, link)| Line::from(format!("  {}. {link}", index + 1))),
-        );
-    }
-    Text::from(lines)
+    lines
 }
 
 fn size_label(bytes: usize) -> String {
@@ -156,77 +257,9 @@ fn header_line(label: &str, value: &str, bold: bool) -> Line<'static> {
     ])
 }
 
-fn message_content(mail: &Mail) -> String {
-    let mut headers = vec![format!("from: {}", mail.from)];
-    if !mail.to.is_empty() {
-        headers.push(format!("to: {}", mail.to.join(", ")));
-    }
-    if !mail.cc.is_empty() {
-        headers.push(format!("cc: {}", mail.cc.join(", ")));
-    }
-    if let Some(date) = &mail.date {
-        headers.push(format!("date: {date}"));
-    }
-    headers.push(format!("subject: {}", mail.subject));
-    if mail.html {
-        headers.push("format: html · remote images blocked".into());
-    }
-    for attachment in &mail.attachments {
-        headers.push(format!(
-            "file: {} · {}",
-            attachment.name,
-            size_label(attachment.size)
-        ));
-    }
-    let links = mail
-        .links
-        .iter()
-        .enumerate()
-        .map(|(index, link)| format!("{}. {link}", index + 1))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if links.is_empty() {
-        format!("{}\n\n{}", headers.join("\n"), mail.body)
-    } else {
-        format!("{}\n\n{}\n\nlinks\n{links}", headers.join("\n"), mail.body)
-    }
-}
-
-fn wrapped_line_count(value: &str, width: u16) -> usize {
-    let width = width as usize;
-    if width == 0 {
-        return 0;
-    }
-
-    value
-        .split('\n')
-        .map(|line| {
-            let mut count = 1;
-            let mut used = 0;
-
-            for word in line.split_whitespace() {
-                let word_width = word.chars().count();
-                if used == 0 {
-                    count += word_width.saturating_sub(1) / width;
-                    used = word_width % width;
-                } else if used + 1 + word_width <= width {
-                    used += 1 + word_width;
-                } else {
-                    count += 1 + word_width.saturating_sub(1) / width;
-                    used = word_width % width;
-                }
-                if used == 0 {
-                    used = width;
-                }
-            }
-
-            count
-        })
-        .sum()
-}
-
 fn reader_area(area: Rect) -> Rect {
-    let width = area.width.saturating_sub(4).min(76);
+    // Wide enough for the 600-pixel layouts most HTML mail is designed for.
+    let width = area.width.saturating_sub(4).min(100);
     let height = area.height.saturating_sub(4);
 
     Rect::new(
@@ -242,13 +275,7 @@ mod tests {
     use crate::mail::{Attachment, demo_mails};
     use ratatui::{Terminal, backend::TestBackend};
 
-    use super::{Reader, wrapped_line_count};
-
-    #[test]
-    fn counts_wrapped_and_blank_lines() {
-        assert_eq!(wrapped_line_count("one two three\n\nfour", 7), 4);
-        assert_eq!(wrapped_line_count("123456789", 4), 3);
-    }
+    use super::Reader;
 
     #[test]
     fn keeps_scroll_in_bounds() {
@@ -269,7 +296,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| reader.draw_docked(frame, frame.area(), mail))
+            .draw(|frame| reader.draw_docked(frame, frame.area(), mail, None))
             .unwrap();
         let screen: String = terminal
             .backend()
@@ -299,7 +326,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| reader.draw_docked(frame, frame.area(), &mail))
+            .draw(|frame| reader.draw_docked(frame, frame.area(), &mail, None))
             .unwrap();
         let screen: String = terminal
             .backend()
@@ -309,7 +336,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
 
-        assert!(screen.contains("remote images blocked"));
+        assert!(screen.contains("html"));
         assert!(screen.contains("report.pdf"));
         assert!(screen.contains("https://example.com/report"));
     }

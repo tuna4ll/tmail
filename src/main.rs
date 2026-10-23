@@ -36,7 +36,8 @@ use std::{
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
 };
@@ -100,6 +101,11 @@ async fn main() -> color_eyre::Result<()> {
     execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
 
     let mut app = App::new(source, config);
+    // Ask the terminal which graphics protocol it speaks; half blocks work everywhere.
+    app.picker = Some(
+        ratatui_image::picker::Picker::from_query_stdio()
+            .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks()),
+    );
     app.prepare_accounts(needs_setup, explicit_source);
     let result = app.run(terminal).await;
 
@@ -139,6 +145,16 @@ pub struct App {
     watch_tx: mpsc::UnboundedSender<String>,
     watch_rx: mpsc::UnboundedReceiver<String>,
     watchers: std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Draws pictures with the terminal's graphics protocol, when one was detected.
+    picker: Option<ratatui_image::picker::Picker>,
+    image_tx: mpsc::UnboundedSender<(String, usize, Option<Vec<u8>>)>,
+    image_rx: mpsc::UnboundedReceiver<(String, usize, Option<Vec<u8>>)>,
+    /// Terminal graphics are not erased by ordinary redraws, so moving them needs a
+    /// full clear.
+    clear_screen: bool,
+    /// Where the inbox list was drawn and how far it is scrolled, for mouse clicks.
+    inbox_area: Option<Rect>,
+    list_offset: usize,
     setup_tx: mpsc::UnboundedSender<SetupResult>,
     setup_rx: mpsc::UnboundedReceiver<SetupResult>,
     setup_generation: u64,
@@ -302,6 +318,7 @@ impl App {
         let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
         let (sync_tx, sync_rx) = mpsc::unbounded_channel();
         let (watch_tx, watch_rx) = mpsc::unbounded_channel();
+        let (image_tx, image_rx) = mpsc::unbounded_channel();
         let (setup_tx, setup_rx) = mpsc::unbounded_channel();
         let account_label = config
             .accounts
@@ -335,6 +352,12 @@ impl App {
             watch_tx,
             watch_rx,
             watchers: Default::default(),
+            picker: None,
+            image_tx,
+            image_rx,
+            clear_screen: false,
+            inbox_area: None,
+            list_offset: 0,
             setup_tx,
             setup_rx,
             setup_generation: 0,
@@ -367,6 +390,9 @@ impl App {
         let mut event_stream = EventStream::new();
 
         while self.running {
+            if std::mem::take(&mut self.clear_screen) {
+                terminal.clear()?;
+            }
             terminal.draw(|frame| self.draw(frame))?;
             tokio::select! {
                 _ = animation.tick() => {
@@ -381,6 +407,17 @@ impl App {
                 result = self.sync_rx.recv() => {
                     if let Some((account, result)) = result {
                         self.finish_sync(account, result);
+                    }
+                }
+                image = self.image_rx.recv() => {
+                    if let Some((mail_id, slot, bytes)) = image
+                        && let Some(reader) = &mut self.reader
+                        && reader.mail_id() == mail_id
+                        && let Some(mail) = self.mails.iter().find(|mail| mail.id == mail_id)
+                    {
+                        reader.body(mail).finish_remote(slot, bytes);
+                        reader.invalidate();
+                        self.clear_screen = true;
                     }
                 }
                 account = self.watch_rx.recv() => {
@@ -521,11 +558,19 @@ impl App {
                     .mails(&self.mails)
                     .into_iter()
                     .find_map(|mail| mail.account.as_deref());
+                let date = conversation
+                    .mails(&self.mails)
+                    .iter()
+                    .filter_map(|mail| mail.timestamp)
+                    .max()
+                    .map(mail::short_date)
+                    .unwrap_or_default();
                 let sender = match account {
                     Some(account) if matches!(self.source, MailboxSource::Unified(_)) => {
-                        format!("from {last_sender} · {account}")
+                        format!("{date} · {last_sender} · {account}")
                     }
-                    _ => format!("from {last_sender}"),
+                    _ if date.is_empty() => format!("from {last_sender}"),
+                    _ => format!("{date} · {last_sender}"),
                 };
                 ListItem::new(vec![
                     Line::styled(subject, subject_style),
@@ -536,6 +581,16 @@ impl App {
 
         let inbox_focused = self.reader.is_none() && self.focus == Pane::Inbox;
         let workspace_focused = self.reader.is_none() && self.focus == Pane::Workspace;
+        let unread = self
+            .mails
+            .iter()
+            .filter(|mail| mail.unread && mail_folder(mail) == self.active_folder)
+            .count();
+        let folder = if unread > 0 {
+            format!("{} ({unread})", self.active_folder)
+        } else {
+            self.active_folder.clone()
+        };
         let title = if self.searching {
             format!(" search: {}_ ", self.query)
         } else if !self.query.is_empty() {
@@ -544,18 +599,15 @@ impl App {
             format!(" inbox • {} ", self.filter.label())
         } else if self.skipped > 0 {
             format!(
-                " {} · {} • {} skipped ",
-                self.account_label, self.active_folder, self.skipped
+                " {} · {folder} • {} skipped ",
+                self.account_label, self.skipped
             )
         } else if !self.syncing.is_empty() {
-            format!(
-                " {} · {} • syncing ",
-                self.account_label, self.active_folder
-            )
+            format!(" {} · {folder} • syncing ", self.account_label)
         } else if inbox_focused {
-            format!(" {} · {} • active ", self.account_label, self.active_folder)
+            format!(" {} · {folder} • active ", self.account_label)
         } else {
-            format!(" {} · {} ", self.account_label, self.active_folder)
+            format!(" {} · {folder} ", self.account_label)
         };
         let list = List::new(items)
             .style(theme::text())
@@ -570,12 +622,17 @@ impl App {
                     .title_style(theme::title(inbox_focused))
                     .title(title),
             );
-        let mut list_state = ListState::default().with_selected(Some(self.selected));
+        let mut list_state = ListState::default()
+            .with_offset(self.list_offset)
+            .with_selected(Some(self.selected));
 
         let mut docked_reader_area = None;
         if rows[0].width < MIN_SPLIT_WIDTH {
             match self.focus {
-                Pane::Inbox => frame.render_stateful_widget(list, rows[0], &mut list_state),
+                Pane::Inbox => {
+                    frame.render_stateful_widget(list, rows[0], &mut list_state);
+                    self.inbox_area = Some(rows[0]);
+                }
                 Pane::Workspace => {
                     if visible.is_empty() {
                         draw_no_matches(
@@ -604,6 +661,7 @@ impl App {
                 .constraints(constraints)
                 .split(rows[0]);
             frame.render_stateful_widget(list, areas[0], &mut list_state);
+            self.inbox_area = Some(areas[0]);
             if visible.is_empty() {
                 draw_no_matches(
                     frame,
@@ -618,6 +676,8 @@ impl App {
                 docked_reader_area = Some(areas[2]);
             }
         }
+
+        self.list_offset = list_state.offset();
 
         let hints = if matches!(self.overlay, Some(Overlay::Help { .. })) {
             status_line(&[("j/k", "scroll"), ("esc", "close help")])
@@ -650,6 +710,7 @@ impl App {
                 ("r/A/F", "reply/all/forward"),
                 ("l", "links"),
                 ("v", "files"),
+                ("I", "images"),
                 ("m/s", "read/star"),
                 ("a/d", "archive/trash"),
                 ("esc", "close"),
@@ -685,9 +746,9 @@ impl App {
             && let Some(mail) = self.mails.iter().find(|mail| mail.id == reader.mail_id())
         {
             if let Some(area) = docked_reader_area {
-                reader.draw_docked(frame, area, mail);
+                reader.draw_docked(frame, area, mail, self.picker.as_ref());
             } else {
-                reader.draw(frame, frame.area(), mail);
+                reader.draw(frame, frame.area(), mail, self.picker.as_ref());
             }
         }
 
@@ -697,6 +758,9 @@ impl App {
     }
 
     fn handle_event(&mut self, event: Event) {
+        if matches!(event, Event::Key(_)) && self.graphics_shown() {
+            self.clear_screen = true;
+        }
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key_event(key),
             Event::Paste(text) => match self.overlay.take() {
@@ -716,10 +780,24 @@ impl App {
                 overlay => self.overlay = overlay,
             },
             Event::Mouse(mouse) => {
-                if self.overlay.is_none()
-                    && !self.onboarding
-                    && self.reader.is_none()
-                    && !self.visible_conversations().is_empty()
+                if self.overlay.is_some() || self.onboarding {
+                    return;
+                }
+                if let Some(reader) = &mut self.reader {
+                    match mouse.kind {
+                        MouseEventKind::ScrollDown => reader.scroll_down(3),
+                        MouseEventKind::ScrollUp => reader.scroll_up(3),
+                        _ => return,
+                    }
+                    if reader.shows_images() && !self.uses_halfblocks() {
+                        self.clear_screen = true;
+                    }
+                    return;
+                }
+                if self.handle_inbox_mouse(mouse) {
+                    return;
+                }
+                if !self.visible_conversations().is_empty()
                     && let Some(workspace) = &mut self.workspace
                     && let Some(mail_id) = workspace.handle_mouse(mouse)
                 {
@@ -878,6 +956,14 @@ impl App {
                 self.open_attachments();
                 return;
             }
+            KeyCode::Char('I') if self.reader.is_some() => {
+                self.load_remote_images();
+                return;
+            }
+            KeyCode::Char('O') if self.reader.is_some() => {
+                self.open_in_browser();
+                return;
+            }
             _ => {}
         }
 
@@ -890,8 +976,14 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.reader.as_mut().unwrap().scroll_up(1);
                 }
-                KeyCode::PageDown => self.reader.as_mut().unwrap().scroll_down(5),
-                KeyCode::PageUp => self.reader.as_mut().unwrap().scroll_up(5),
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    self.reader.as_mut().unwrap().scroll_down(10);
+                }
+                KeyCode::PageUp => self.reader.as_mut().unwrap().scroll_up(10),
+                KeyCode::Home => self.reader.as_mut().unwrap().scroll_up(u16::MAX),
+                KeyCode::End => self.reader.as_mut().unwrap().scroll_down(u16::MAX),
+                KeyCode::Char('n') => self.open_adjacent(true),
+                KeyCode::Char('N') => self.open_adjacent(false),
                 _ => {}
             }
             return;
@@ -949,6 +1041,17 @@ impl App {
                 self.sync_workspace();
             }
 
+            (_, KeyCode::PageDown) if self.focus == Pane::Inbox => {
+                self.select_conversation(self.selected + 10);
+            }
+            (_, KeyCode::PageUp) if self.focus == Pane::Inbox => {
+                self.select_conversation(self.selected.saturating_sub(10));
+            }
+            (_, KeyCode::Home) if self.focus == Pane::Inbox => self.select_conversation(0),
+            (_, KeyCode::End) if self.focus == Pane::Inbox => {
+                self.select_conversation(usize::MAX);
+            }
+
             (
                 _,
                 KeyCode::Left
@@ -980,6 +1083,84 @@ impl App {
             }
 
             _ => {}
+        }
+    }
+
+    /// Scrolls the inbox with the wheel; a click selects a conversation and a click on
+    /// the selected one opens it.
+    fn handle_inbox_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let Some(area) = self.inbox_area else {
+            return false;
+        };
+        let inside = mouse.column >= area.x
+            && mouse.column < area.x + area.width
+            && mouse.row > area.y
+            && mouse.row + 1 < area.y + area.height;
+        if !inside || !matches!(self.mailbox_state, MailboxState::Ready) {
+            return false;
+        }
+        let count = self.visible_conversations().len();
+        match mouse.kind {
+            MouseEventKind::ScrollDown => self.select_conversation(self.selected + 1),
+            MouseEventKind::ScrollUp => self.select_conversation(self.selected.saturating_sub(1)),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let index = self.list_offset + usize::from(mouse.row - area.y - 1) / 2;
+                if index >= count {
+                    return true;
+                }
+                self.focus = Pane::Inbox;
+                if index == self.selected {
+                    if let Some(mail_id) = self
+                        .selected_conversation()
+                        .and_then(Conversation::latest_mail_id)
+                        .map(str::to_owned)
+                    {
+                        self.open_mail(&mail_id);
+                    }
+                } else {
+                    self.select_conversation(index);
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn select_conversation(&mut self, index: usize) {
+        let count = self.visible_conversations().len();
+        if count == 0 {
+            return;
+        }
+        let index = index.min(count - 1);
+        if index != self.selected {
+            self.selected = index;
+            self.sync_workspace();
+        }
+    }
+
+    /// Opens the newest message of the next or previous conversation in the list.
+    fn open_adjacent(&mut self, forward: bool) {
+        let count = self.visible_conversations().len();
+        let target = if forward {
+            self.selected + 1
+        } else {
+            self.selected.wrapping_sub(1)
+        };
+        if target >= count {
+            self.notice = Some(if forward {
+                "This is the last conversation.".into()
+            } else {
+                "This is the first conversation.".into()
+            });
+            return;
+        }
+        self.select_conversation(target);
+        if let Some(mail_id) = self
+            .selected_conversation()
+            .and_then(Conversation::latest_mail_id)
+            .map(str::to_owned)
+        {
+            self.open_mail(&mail_id);
         }
     }
 
@@ -1356,6 +1537,17 @@ impl App {
                 .iter()
                 .any(|mail| mail_folder(mail) == active)
         });
+        // Newest activity first, like every other mail client.
+        conversations.sort_by_cached_key(|conversation| {
+            std::cmp::Reverse(
+                conversation
+                    .mails(&self.mails)
+                    .iter()
+                    .filter_map(|mail| mail.timestamp)
+                    .max()
+                    .unwrap_or_default(),
+            )
+        });
         self.conversations = conversations;
         let visible = self.visible_conversations();
         self.selected = mail_id
@@ -1482,6 +1674,105 @@ impl App {
                 self.rebuild_mailbox(None);
             }
             Err(error) => self.notice = Some(format!("Unable to move message: {error}")),
+        }
+    }
+
+    /// Half-block pictures are ordinary cells that redraw cleanly; graphics protocols
+    /// leave pixels behind until the screen is cleared.
+    fn uses_halfblocks(&self) -> bool {
+        self.picker.as_ref().is_none_or(|picker| {
+            picker.protocol_type() == ratatui_image::picker::ProtocolType::Halfblocks
+        })
+    }
+
+    fn graphics_shown(&self) -> bool {
+        !self.uses_halfblocks() && self.reader.as_ref().is_some_and(Reader::shows_images)
+    }
+
+    fn open_in_browser(&mut self) {
+        let Some(mail) = self
+            .reader
+            .as_ref()
+            .and_then(|reader| self.mails.iter().find(|mail| mail.id == reader.mail_id()))
+        else {
+            return;
+        };
+        self.notice = Some(
+            match widgets::rich::export_html(mail)
+                .and_then(|path| opener::open(&path).map_err(std::io::Error::other))
+            {
+                Ok(()) => "Opened the message in your browser.".into(),
+                Err(error) => format!("Unable to open in the browser: {error}"),
+            },
+        );
+    }
+
+    fn mark_folder_read(&mut self) {
+        if self.sending {
+            self.notice = Some("Wait for the current send before changing messages.".into());
+            return;
+        }
+        let indices: Vec<usize> = self
+            .mails
+            .iter()
+            .enumerate()
+            .filter(|(_, mail)| mail.unread && mail_folder(mail) == self.active_folder)
+            .map(|(index, _)| index)
+            .collect();
+        if indices.is_empty() {
+            self.notice = Some(format!(
+                "Everything in {} is already read.",
+                self.active_folder
+            ));
+            return;
+        }
+        let mut failed = 0;
+        for index in &indices {
+            match self.source.set_seen(&self.mails[*index], true) {
+                Ok(change) => {
+                    if let Some(change) = change {
+                        self.mails[*index].source_path = Some(change.after_path().to_path_buf());
+                    }
+                    self.mails[*index].unread = false;
+                }
+                Err(_) => failed += 1,
+            }
+        }
+        self.undo = None;
+        self.notice = Some(if failed == 0 {
+            format!("Marked {} messages read", indices.len())
+        } else {
+            format!(
+                "Marked {} messages read · {failed} could not be changed",
+                indices.len() - failed
+            )
+        });
+        self.refresh_fingerprint();
+        self.rebuild_mailbox(self.active_mail_id().as_deref());
+    }
+
+    /// Downloads the open message's remote pictures, which stay blocked until asked
+    /// for because they can reveal that the message was read.
+    fn load_remote_images(&mut self) {
+        let Some(reader) = &mut self.reader else {
+            return;
+        };
+        let Some(mail) = self.mails.iter().find(|mail| mail.id == reader.mail_id()) else {
+            return;
+        };
+        let requests = reader.body(mail).start_remote();
+        if requests.is_empty() {
+            self.notice = Some("This message has no remote images.".into());
+            return;
+        }
+        reader.invalidate();
+        self.notice = Some(format!("Loading {} remote images…", requests.len()));
+        for (slot, url) in requests {
+            let sender = self.image_tx.clone();
+            let mail_id = reader.mail_id().to_owned();
+            tokio::task::spawn_blocking(move || {
+                let _ = sender.send((mail_id, slot, widgets::rich::fetch(&url)));
+            });
         }
     }
 
@@ -2448,6 +2739,7 @@ impl App {
             "login" => self.open_account_setup(account_setup::Mode::Login),
             "reload" => self.reload(),
             "sync" => self.start_sync(),
+            "mark read" => self.mark_folder_read(),
             "filter all" => {
                 self.filter = InboxFilter::All;
                 self.refresh_inbox();
@@ -2935,6 +3227,8 @@ fn draw_no_matches(frame: &mut Frame, area: Rect, folder: &str, folder_empty: bo
 const HELP: &[&str] = &[
     "navigation",
     "  j/k or arrows  select     tab  switch pane",
+    "  pgup/pgdn home/end  jump   mouse  wheel and click",
+    "  reading: space  page   n/N  next/previous conversation",
     "  enter          open / resume draft     esc  close",
     "",
     "message actions",
@@ -2945,6 +3239,7 @@ const HELP: &[&str] = &[
     "  u  undo            c  compose",
     "  r  reply           A  reply all   F  forward",
     "  l  open links       v  attachments",
+    "  I  load remote images     O  open in the browser",
     "  x  retry selected Outbox message",
     "  z  resolve unconfirmed Outbox delivery",
     "",
@@ -2962,6 +3257,7 @@ const HELP: &[&str] = &[
     "commands",
     "  :reload                 :filter unread",
     "  :sync                   sync every account now",
+    "  :mark read              mark the whole folder read",
     "  :accounts               :account add / :account edit",
     "  :login                  enter an account password",
     "  :open maildir PATH      :compose  :reply  :quit",
