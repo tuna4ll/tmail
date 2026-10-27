@@ -16,6 +16,8 @@ pub struct Summary {
     pub subject: String,
     pub format: MessageFormat,
     pub attachments: Vec<PathBuf>,
+    /// Likely mistakes to show before sending.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -260,7 +262,10 @@ impl Composer {
 
     pub fn summary(&self, base: &Path) -> Result<Summary, DraftError> {
         self.validate_identity()?;
-        inspect(self.source()?.as_bytes(), base)
+        let mut summary = inspect(self.source()?.as_bytes(), base)?;
+        let body = fs::read_to_string(&self.body_path).unwrap_or_default();
+        summary.warnings = warnings(&summary, &self.subject, &body);
+        Ok(summary)
     }
 
     pub fn message(&self, base: &Path) -> Result<Vec<u8>, DraftError> {
@@ -427,6 +432,43 @@ fn forwarded(mail: &Mail) -> String {
     )
 }
 
+/// Servers commonly refuse messages above 25 MB, and encoding adds about a third.
+const LARGE_ATTACHMENTS: u64 = 18 * 1024 * 1024;
+
+fn warnings(summary: &Summary, subject: &str, body: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if subject.trim().is_empty() {
+        warnings.push("The subject is empty.".into());
+    }
+    // Only the new text counts: quotes, the signature and forwarded mail are skipped.
+    let written = body
+        .lines()
+        .take_while(|line| *line != "-- " && !line.starts_with("---------- Forwarded"))
+        .filter(|line| !line.starts_with('>'))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let mentions = ["attach", "enclosed", "ekte", "ekli", "ek olarak", "iliştir"]
+        .iter()
+        .any(|word| written.contains(word));
+    if mentions && summary.attachments.is_empty() {
+        warnings.push("The message mentions an attachment, but none is added.".into());
+    }
+    let size: u64 = summary
+        .attachments
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .sum();
+    if size > LARGE_ATTACHMENTS {
+        warnings.push(format!(
+            "Attachments total {:.1} MB; many servers reject messages over 25 MB.",
+            size as f64 / (1024.0 * 1024.0)
+        ));
+    }
+    warnings
+}
+
 fn one_line(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }
@@ -482,6 +524,7 @@ fn inspect_message(
             .map(|_| MessageFormat::Html)
             .unwrap_or(MessageFormat::Plain),
         attachments,
+        warnings: Vec::new(),
     })
 }
 

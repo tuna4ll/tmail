@@ -67,6 +67,7 @@ impl Conversation {
         self.mails(mails).last().map(|mail| mail.from.as_str())
     }
 
+    #[cfg(test)]
     pub fn latest_mail_id(&self) -> Option<&str> {
         self.mail_ids.last().map(String::as_str)
     }
@@ -291,6 +292,7 @@ impl Mail {
             Some(("to", value)) => self.to.iter().chain(&self.cc).any(|to| contains(to, value)),
             Some(("subject", value)) => contains(&self.subject, value),
             Some(("body", value)) => contains(&self.body, value),
+            Some(("in", "all")) => true,
             Some(("in" | "folder", value)) => {
                 self.mailbox.as_deref().unwrap_or("INBOX").to_lowercase() == value
             }

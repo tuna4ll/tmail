@@ -154,6 +154,8 @@ pub struct App {
     clear_screen: bool,
     /// Where the inbox list was drawn and how far it is scrolled, for mouse clicks.
     inbox_area: Option<Rect>,
+    /// Whether the conversations were grouped across every folder for `in:all`.
+    built_everywhere: bool,
     list_offset: usize,
     setup_tx: mpsc::UnboundedSender<SetupResult>,
     setup_rx: mpsc::UnboundedReceiver<SetupResult>,
@@ -190,7 +192,7 @@ struct SetupResult {
 }
 
 struct UndoAction {
-    change: Option<MaildirChange>,
+    changes: Vec<MaildirChange>,
     demo_mails: Option<Vec<Mail>>,
     label: String,
 }
@@ -391,6 +393,7 @@ impl App {
             image_rx,
             clear_screen: false,
             inbox_area: None,
+            built_everywhere: false,
             list_offset: 0,
             setup_tx,
             setup_rx,
@@ -587,6 +590,13 @@ impl App {
                     _ if date.is_empty() => format!("from {last_sender}"),
                     _ => format!("{date} · {last_sender}"),
                 };
+                // Results from every folder say where they live.
+                let sender = match conversation.mails(&self.mails).last() {
+                    Some(mail) if self.built_everywhere => {
+                        format!("{sender} · {}", mail_folder(mail))
+                    }
+                    _ => sender,
+                };
                 ListItem::new(vec![
                     Line::styled(subject, subject_style),
                     Line::styled(sender, sender_style),
@@ -765,7 +775,8 @@ impl App {
             Overlay::Folders { moving: true, .. } => {
                 &[("j/k", "select"), ("enter", "move here"), ("esc", "cancel")]
             }
-            Overlay::Folders { .. } | Overlay::Links { .. } | Overlay::Accounts { .. } => {
+            Overlay::Links { .. } => &[("j/k", "select"), ("enter", "open"), ("y", "copy")],
+            Overlay::Folders { .. } | Overlay::Accounts { .. } => {
                 &[("j/k", "select"), ("enter", "open"), ("esc", "cancel")]
             }
             Overlay::Attachments { .. } => &[("j/k", "select"), ("s", "save"), ("o", "open")],
@@ -885,18 +896,11 @@ impl App {
                     self.query.clear();
                     self.refresh_inbox();
                 }
-                KeyCode::Backspace => {
-                    self.query.pop();
-                    self.refresh_inbox();
+                _ => {
+                    if edit_text(&mut self.query, key) {
+                        self.refresh_inbox();
+                    }
                 }
-                KeyCode::Char(character)
-                    if !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    self.query.push(character);
-                    self.refresh_inbox();
-                }
-                _ => {}
             }
             return;
         }
@@ -1090,10 +1094,7 @@ impl App {
 
             (_, KeyCode::Enter | KeyCode::Char(' ')) => {
                 let mail_id = match self.focus {
-                    Pane::Inbox => self
-                        .selected_conversation()
-                        .and_then(Conversation::latest_mail_id)
-                        .map(str::to_owned),
+                    Pane::Inbox => self.entry_mail_id(),
                     Pane::Workspace => self
                         .workspace
                         .as_ref()
@@ -1132,11 +1133,7 @@ impl App {
                 }
                 self.focus = Pane::Inbox;
                 if index == self.selected {
-                    if let Some(mail_id) = self
-                        .selected_conversation()
-                        .and_then(Conversation::latest_mail_id)
-                        .map(str::to_owned)
-                    {
+                    if let Some(mail_id) = self.entry_mail_id() {
                         self.open_mail(&mail_id);
                     }
                 } else {
@@ -1177,21 +1174,13 @@ impl App {
             return;
         }
         self.select_conversation(target);
-        if let Some(mail_id) = self
-            .selected_conversation()
-            .and_then(Conversation::latest_mail_id)
-            .map(str::to_owned)
-        {
+        if let Some(mail_id) = self.entry_mail_id() {
             self.open_mail(&mail_id);
         }
     }
 
     fn sync_workspace(&mut self) {
-        let Some(mail_id) = self
-            .selected_conversation()
-            .and_then(Conversation::latest_mail_id)
-            .map(str::to_owned)
-        else {
+        let Some(mail_id) = self.entry_mail_id() else {
             return;
         };
         let thread = self.selected_thread();
@@ -1359,81 +1348,125 @@ impl App {
                     .as_ref()
                     .and_then(Workspace::selected_mail_id)
             })
-            .or_else(|| {
-                self.selected_conversation()
-                    .and_then(Conversation::latest_mail_id)
-                    .map(str::to_owned)
-            })
+            .or_else(|| self.entry_mail_id())
+    }
+
+    /// The messages an action applies to: the open or highlighted message, or the whole
+    /// conversation when it is chosen in the list. `folder_only` keeps just the
+    /// conversation's messages in the open folder.
+    fn action_targets(&self, folder_only: bool) -> Vec<usize> {
+        if self.reader.is_none()
+            && self.focus == Pane::Inbox
+            && let Some(conversation) = self.selected_conversation()
+        {
+            return conversation
+                .positions
+                .iter()
+                .copied()
+                .filter(|index| {
+                    self.mails.get(*index).is_some_and(|mail| {
+                        !folder_only
+                            || self.built_everywhere
+                            || mail_folder(mail) == self.active_folder
+                    })
+                })
+                .collect();
+        }
+        self.active_mail_id()
+            .and_then(|id| self.mails.iter().position(|mail| mail.id == id))
+            .into_iter()
+            .collect()
+    }
+
+    /// Applies `change` to each target, keeping every file move so `u` can undo them.
+    fn change_messages(
+        &mut self,
+        targets: &[usize],
+        label: &str,
+        mut change: impl FnMut(&MailboxSource, &mut Mail) -> Result<Option<MaildirChange>, LoadError>,
+    ) {
+        if self.sending {
+            self.notice = Some("Wait for the current send before changing messages.".into());
+            return;
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let keep = self.active_mail_id();
+        let snapshot = matches!(self.source, MailboxSource::Demo).then(|| self.mails.clone());
+        let mut changes = Vec::new();
+        let mut failure = None;
+        for index in targets {
+            match change(&self.source, &mut self.mails[*index]) {
+                Ok(Some(moved)) => {
+                    self.mails[*index].source_path = Some(moved.after_path().to_path_buf());
+                    changes.push(moved);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        let label = if targets.len() > 1 {
+            format!("{label} · {} messages", targets.len())
+        } else {
+            label.to_owned()
+        };
+        self.notice = Some(match failure {
+            Some(error) => format!("{label} stopped: {error}"),
+            None => label.clone(),
+        });
+        self.undo = Some(UndoAction {
+            changes,
+            demo_mails: snapshot,
+            label,
+        });
+        self.refresh_fingerprint();
+        self.rebuild_mailbox(keep.as_deref());
     }
 
     fn toggle_read(&mut self) {
-        if self.sending {
-            self.notice = Some("Wait for the current send before changing messages.".into());
-            return;
-        }
-        let Some(mail_id) = self.active_mail_id() else {
-            return;
+        let targets = self.action_targets(false);
+        // Anything unread makes the action "mark read"; otherwise it marks unread.
+        let seen = targets.iter().any(|index| self.mails[*index].unread);
+        let targets: Vec<usize> = if seen {
+            targets
+                .into_iter()
+                .filter(|index| self.mails[*index].unread)
+                .collect()
+        } else {
+            targets.last().copied().into_iter().collect()
         };
-        let Some(index) = self.mails.iter().position(|mail| mail.id == mail_id) else {
-            return;
-        };
-        let target_seen = self.mails[index].unread;
-        let snapshot = matches!(self.source, MailboxSource::Demo).then(|| self.mails.clone());
-        match self.source.set_seen(&self.mails[index], target_seen) {
-            Ok(change) => {
-                if let Some(change) = &change {
-                    self.mails[index].source_path = Some(change.after_path().to_path_buf());
-                }
-                self.mails[index].unread = !target_seen;
-                let label = if target_seen {
-                    "Marked read"
-                } else {
-                    "Marked unread"
-                };
-                self.undo = Some(UndoAction {
-                    change,
-                    demo_mails: snapshot,
-                    label: label.into(),
-                });
-                self.notice = Some(label.into());
-                self.refresh_fingerprint();
-                self.rebuild_mailbox(Some(&mail_id));
-            }
-            Err(error) => self.notice = Some(format!("Unable to update message: {error}")),
-        }
+        let label = if seen { "Marked read" } else { "Marked unread" };
+        self.change_messages(&targets, label, |source, mail| {
+            let change = source.set_seen(mail, seen)?;
+            mail.unread = !seen;
+            Ok(change)
+        });
     }
 
     fn toggle_starred(&mut self) {
-        if self.sending {
-            self.notice = Some("Wait for the current send before changing messages.".into());
-            return;
-        }
-        let Some(mail_id) = self.active_mail_id() else {
-            return;
+        let targets = self.action_targets(false);
+        // A starred conversation is unstarred; otherwise its newest message gets the star.
+        let starred: Vec<usize> = targets
+            .iter()
+            .copied()
+            .filter(|index| self.mails[*index].starred)
+            .collect();
+        let star = starred.is_empty();
+        let targets: Vec<usize> = if star {
+            targets.last().copied().into_iter().collect()
+        } else {
+            starred
         };
-        let Some(index) = self.mails.iter().position(|mail| mail.id == mail_id) else {
-            return;
-        };
-        let target = !self.mails[index].starred;
-        let snapshot = matches!(self.source, MailboxSource::Demo).then(|| self.mails.clone());
-        match self.source.set_starred(&self.mails[index], target) {
-            Ok(change) => {
-                if let Some(change) = &change {
-                    self.mails[index].source_path = Some(change.after_path().to_path_buf());
-                }
-                self.mails[index].starred = target;
-                let label = if target { "Starred" } else { "Removed star" };
-                self.undo = Some(UndoAction {
-                    change,
-                    demo_mails: snapshot,
-                    label: label.into(),
-                });
-                self.notice = Some(label.into());
-                self.refresh_fingerprint();
-                self.rebuild_mailbox(Some(&mail_id));
-            }
-            Err(error) => self.notice = Some(format!("Unable to update message: {error}")),
-        }
+        let label = if star { "Starred" } else { "Removed star" };
+        self.change_messages(&targets, label, |source, mail| {
+            let change = source.set_starred(mail, star)?;
+            mail.starred = star;
+            Ok(change)
+        });
     }
 
     fn undo_last(&mut self) {
@@ -1448,61 +1481,61 @@ impl App {
             self.mails = mails;
             self.rebuild_mailbox(None);
             self.notice = Some(format!("Undid {}", undo.label.to_lowercase()));
-        } else if let Some(change) = undo.change {
-            match change.undo() {
-                Ok(()) => {
-                    self.notice = Some(format!("Undid {}", undo.label.to_lowercase()));
-                    self.reload();
-                }
-                Err(error) => self.notice = Some(format!("Unable to undo: {error}")),
+            return;
+        }
+        let mut failure = None;
+        for change in undo.changes.into_iter().rev() {
+            if let Err(error) = change.undo() {
+                failure = Some(error);
             }
         }
+        self.notice = Some(match failure {
+            Some(error) => format!("Unable to undo everything: {error}"),
+            None => format!("Undid {}", undo.label.to_lowercase()),
+        });
+        self.reload();
     }
 
     fn move_active_message(&mut self, archive: bool) {
-        if self.sending {
-            self.notice = Some("Wait for the current send before changing messages.".into());
+        let targets = self.action_targets(true);
+        if targets.is_empty() {
             return;
         }
-        let Some(mail_id) = self.active_mail_id() else {
-            return;
-        };
-        let Some(index) = self.mails.iter().position(|mail| mail.id == mail_id) else {
-            return;
-        };
-        if !archive && mail_folder(&self.mails[index]) == "Trash" {
-            self.delete_forever(index);
+        if !archive
+            && targets
+                .iter()
+                .all(|index| mail_folder(&self.mails[*index]) == "Trash")
+        {
+            self.delete_forever(targets);
             return;
         }
-        let snapshot = matches!(self.source, MailboxSource::Demo).then(|| self.mails.clone());
-        let result = if archive {
-            self.source.archive(&self.mails[index])
+        let (folder, label) = if archive {
+            ("Archive", "Archived")
         } else {
-            self.source.trash(&self.mails[index])
+            ("Trash", "Moved to Trash")
         };
-        match result {
-            Ok(change) => {
-                if let Some(change) = &change {
-                    self.mails[index].source_path = Some(change.after_path().to_path_buf());
-                }
-                self.mails[index].mailbox = Some(if archive { "Archive" } else { "Trash" }.into());
-                self.reader = None;
-                let label = if archive {
-                    "Archived message"
-                } else {
-                    "Moved message to Trash"
-                };
-                self.undo = Some(UndoAction {
-                    change,
-                    demo_mails: snapshot,
-                    label: label.into(),
-                });
-                self.notice = Some(label.into());
-                self.refresh_fingerprint();
-                self.rebuild_mailbox(None);
-            }
-            Err(error) => self.notice = Some(format!("Unable to move message: {error}")),
-        }
+        self.reader = None;
+        self.change_messages(&targets, label, |source, mail| {
+            let change = if archive {
+                source.archive(mail)?
+            } else {
+                source.trash(mail)?
+            };
+            mail.mailbox = Some(folder.into());
+            Ok(change)
+        });
+    }
+
+    /// The message a conversation opens on: its newest message in the open folder, so
+    /// opening an Inbox thread never lands on a copy in Sent.
+    fn entry_mail_id(&self) -> Option<String> {
+        let mails = self.selected_conversation()?.mails(&self.mails);
+        mails
+            .iter()
+            .rev()
+            .find(|mail| mail_folder(mail) == self.active_folder)
+            .or(mails.last())
+            .map(|mail| mail.id.clone())
     }
 
     /// The messages of the selected conversation, from every folder it spans.
@@ -1518,46 +1551,69 @@ impl App {
             .unwrap_or_default()
     }
 
-    fn delete_forever(&mut self, index: usize) {
-        let id = self.mails[index].id.clone();
-        if self.confirm_delete.as_deref() != Some(id.as_str()) {
-            self.confirm_delete = Some(id);
-            self.notice = Some("Press d again to delete this message permanently.".into());
+    fn delete_forever(&mut self, mut targets: Vec<usize>) {
+        let key = targets
+            .iter()
+            .map(|index| self.mails[*index].id.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if self.confirm_delete.as_deref() != Some(key.as_str()) {
+            self.confirm_delete = Some(key);
+            self.notice = Some(if targets.len() > 1 {
+                format!(
+                    "Press d again to delete these {} messages permanently.",
+                    targets.len()
+                )
+            } else {
+                "Press d again to delete this message permanently.".into()
+            });
             return;
         }
         self.confirm_delete = None;
-        match self.source.delete(&self.mails[index]) {
-            Ok(()) => {
-                self.mails.remove(index);
-                self.reader = None;
-                self.undo = None;
-                self.notice = Some("Deleted permanently".into());
-                self.refresh_fingerprint();
-                self.rebuild_mailbox(None);
+        self.reader = None;
+        self.undo = None;
+        targets.sort_unstable_by(|a, b| b.cmp(a));
+        let count = targets.len();
+        for index in targets {
+            if let Err(error) = self.source.delete(&self.mails[index]) {
+                self.notice = Some(format!("Unable to delete message: {error}"));
+                self.reload();
+                return;
             }
-            Err(error) => self.notice = Some(format!("Unable to delete message: {error}")),
+            self.mails.remove(index);
         }
+        self.notice = Some(if count > 1 {
+            format!("Deleted {count} messages permanently")
+        } else {
+            "Deleted permanently".into()
+        });
+        self.refresh_fingerprint();
+        self.rebuild_mailbox(None);
     }
 
     fn rebuild_mailbox(&mut self, mail_id: Option<&str>) {
         // Threads draw on every folder except the bins and queues, so the map shows
         // replies from Sent next to the Inbox messages they answer.
+        // `in:all` searches every folder, bins included.
+        let everywhere = self.searches_everywhere();
+        self.built_everywhere = everywhere;
         let active = self.active_folder.clone();
         let mut conversations = group_conversations_where(&self.mails, |mail| {
             let folder = mail_folder(mail);
             if folder == active {
                 Some(0)
-            } else if ["Trash", "Junk", "Outbox", "Drafts"].contains(&folder) {
+            } else if !everywhere && ["Trash", "Junk", "Outbox", "Drafts"].contains(&folder) {
                 None
             } else {
                 Some(1)
             }
         });
         conversations.retain(|conversation| {
-            conversation
-                .mails(&self.mails)
-                .iter()
-                .any(|mail| mail_folder(mail) == active)
+            everywhere
+                || conversation
+                    .mails(&self.mails)
+                    .iter()
+                    .any(|mail| mail_folder(mail) == active)
         });
         // Newest activity first, like every other mail client.
         conversations.sort_by_cached_key(|conversation| {
@@ -1585,9 +1641,8 @@ impl App {
             .min(visible.len().saturating_sub(1));
         let thread = self.selected_thread();
         self.workspace = self
-            .selected_conversation()
-            .and_then(Conversation::latest_mail_id)
-            .map(|mail_id| Workspace::new(&thread, mail_id));
+            .entry_mail_id()
+            .map(|mail_id| Workspace::new(&thread, &mail_id));
     }
 
     fn folder_items(&self) -> Vec<FolderItem> {
@@ -1667,36 +1722,14 @@ impl App {
     }
 
     fn move_active_to(&mut self, folder: &str) {
-        if self.sending {
-            self.notice = Some("Wait for the current send before changing messages.".into());
-            return;
-        }
-        let Some(index) = self
-            .active_mail_id()
-            .and_then(|id| self.mails.iter().position(|mail| mail.id == id))
-        else {
-            return;
-        };
-        let snapshot = matches!(self.source, MailboxSource::Demo).then(|| self.mails.clone());
-        match self.source.move_to_named(&self.mails[index], folder) {
-            Ok(change) => {
-                if let Some(change) = &change {
-                    self.mails[index].source_path = Some(change.after_path().to_path_buf());
-                }
-                self.mails[index].mailbox = Some(folder.to_owned());
-                self.reader = None;
-                let label = format!("Moved message to {folder}");
-                self.undo = Some(UndoAction {
-                    change,
-                    demo_mails: snapshot,
-                    label: label.clone(),
-                });
-                self.notice = Some(label);
-                self.refresh_fingerprint();
-                self.rebuild_mailbox(None);
-            }
-            Err(error) => self.notice = Some(format!("Unable to move message: {error}")),
-        }
+        let targets = self.action_targets(true);
+        self.reader = None;
+        let label = format!("Moved to {folder}");
+        self.change_messages(&targets, &label, |source, mail| {
+            let change = source.move_to_named(mail, folder)?;
+            mail.mailbox = Some(folder.to_owned());
+            Ok(change)
+        });
     }
 
     /// Half-block pictures are ordinary cells that redraw cleanly; graphics protocols
@@ -2618,18 +2651,10 @@ impl App {
                     let command = input.trim().to_owned();
                     self.run_command(&command);
                 }
-                KeyCode::Backspace => {
-                    input.pop();
+                _ => {
+                    edit_text(input, key);
                     self.overlay = Some(overlay);
                 }
-                KeyCode::Char(character)
-                    if !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    input.push(character);
-                    self.overlay = Some(overlay);
-                }
-                _ => self.overlay = Some(overlay),
             },
             Overlay::Folders {
                 selected,
@@ -2653,6 +2678,12 @@ impl App {
             },
             Overlay::Links { selected, items } => match key.code {
                 KeyCode::Esc => {}
+                KeyCode::Char('y') => {
+                    if let Some(link) = items.get(*selected) {
+                        copy_to_clipboard(link);
+                        self.notice = Some("Link copied to the clipboard.".into());
+                    }
+                }
                 KeyCode::Enter => {
                     if let Some(link) = items.get(*selected) {
                         self.notice = match opener::open(link) {
@@ -2912,28 +2943,15 @@ impl App {
                 state.move_next();
                 self.overlay = Some(Overlay::Compose(state));
             }
-            KeyCode::Backspace => {
-                if let Some(value) = state.value_mut() {
-                    value.pop();
+            _ => {
+                if let Some(value) = state.value_mut()
+                    && edit_text(value, key)
+                {
+                    state.error = None;
+                    self.suggest(&mut state);
                 }
-                state.error = None;
-                self.suggest(&mut state);
                 self.overlay = Some(Overlay::Compose(state));
             }
-            KeyCode::Char(character)
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT)
-                    && state.field != ComposeState::FORMAT_FIELD
-                    && state.field != ComposeState::BODY_FIELD =>
-            {
-                if let Some(value) = state.value_mut() {
-                    value.push(character);
-                }
-                state.error = None;
-                self.suggest(&mut state);
-                self.overlay = Some(Overlay::Compose(state));
-            }
-            _ => self.overlay = Some(Overlay::Compose(state)),
         }
     }
 
@@ -3088,7 +3106,16 @@ impl App {
         self.conversations.get(index)
     }
 
+    fn searches_everywhere(&self) -> bool {
+        mail::search_terms(&self.query)
+            .iter()
+            .any(|term| term == "in:all")
+    }
+
     fn refresh_inbox(&mut self) {
+        if self.searches_everywhere() != self.built_everywhere {
+            self.rebuild_mailbox(self.active_mail_id().as_deref());
+        }
         let count = self.visible_conversations().len();
         self.selected = self.selected.min(count.saturating_sub(1));
         if count > 0 {
@@ -3237,12 +3264,13 @@ const HELP: &[&str] = &[
     "",
     "inbox",
     "  /  search      g  folders      1/2/3  filters",
-    "     from: to: subject: body: in: is:unread is:starred",
+    "     from: to: subject: body: in: in:all is:unread is:starred",
     "     has:attachment \"exact phrase\" -exclude",
     "  p  accounts (a add · e edit · l sign in · x remove)",
     "",
     "compose",
     "  tab  next field      shift+tab  previous field",
+    "  ctrl+w  delete word   ctrl+u  clear field",
     "  arrows/space  format      enter on Body  $EDITOR",
     "  ctrl+s  review             ctrl+d  save draft",
     "",
@@ -3269,7 +3297,7 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
         Overlay::DeliveryReview { .. } => (72, 12),
         Overlay::Help { .. } => (66, 23),
         Overlay::Command(_) => (64, 3),
-        Overlay::DraftReady { .. } => (68, 11),
+        Overlay::DraftReady { summary, .. } => (68, 11 + summary.warnings.len() as u16),
         Overlay::ComposeClose(_) => (58, 7),
         Overlay::Folders { items, .. } => (50, (items.len() as u16 + 2).min(18)),
         Overlay::Links { items, .. } => (72, (items.len() as u16 + 2).min(16)),
@@ -3341,23 +3369,37 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
             } else {
                 format!("\nBcc: {}", summary.bcc)
             };
+            let mut lines: Vec<Line> = format!(
+                "To: {}{cc}{bcc}\nSubject: {}\nFormat: {} · Attachments: {}",
+                summary.to,
+                summary.subject,
+                summary.format.label(),
+                summary.attachments.len()
+            )
+            .lines()
+            .map(|line| Line::from(line.to_owned()))
+            .collect();
+            lines.extend(
+                summary
+                    .warnings
+                    .iter()
+                    .map(|warning| Line::styled(format!("! {warning}"), theme::title(true))),
+            );
+            lines.push(Line::default());
+            lines.push(Line::from(
+                " s  Send     e  Edit     d  Save draft     esc  Back",
+            ));
             frame.render_widget(
-                Paragraph::new(format!(
-                    "To: {}{cc}{bcc}\nSubject: {}\nFormat: {} · Attachments: {}\n\n s  Send     e  Edit     d  Save draft     esc  Back",
-                    summary.to,
-                    summary.subject,
-                    summary.format.label(),
-                    summary.attachments.len()
-                ))
-                .style(theme::text())
-                .block(
-                    Block::bordered()
-                        .border_style(theme::border(true))
-                        .title_style(theme::title(true))
-                        .title(" choose an action ")
-                        .bg(theme::SURFACE),
-                )
-                .wrap(Wrap { trim: true }),
+                Paragraph::new(lines)
+                    .style(theme::text())
+                    .block(
+                        Block::bordered()
+                            .border_style(theme::border(true))
+                            .title_style(theme::title(true))
+                            .title(" choose an action ")
+                            .bg(theme::SURFACE),
+                    )
+                    .wrap(Wrap { trim: true }),
                 area,
             );
         }
@@ -3421,7 +3463,7 @@ fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                     Block::bordered()
                         .border_style(theme::border(true))
                         .title_style(theme::title(true))
-                        .title(" links · enter to open ")
+                        .title(" links · enter to open · y to copy ")
                         .bg(theme::SURFACE),
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
@@ -3601,6 +3643,50 @@ fn draw_compose(frame: &mut Frame, area: Rect, state: &ComposeState) {
 
 fn reader_is_docked(width: u16, reader_open: bool) -> bool {
     reader_open && width >= MIN_DOCK_WIDTH
+}
+
+/// Line editing shared by every text field: typing, backspace, ctrl+w to delete a
+/// word and ctrl+u to clear. Returns whether the key changed or belonged to the field.
+fn edit_text(value: &mut String, key: KeyEvent) -> bool {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => delete_word(value),
+        KeyCode::Backspace => {
+            value.pop();
+        }
+        KeyCode::Char('w' | 'W') if control => delete_word(value),
+        KeyCode::Char('u' | 'U') if control => value.clear(),
+        KeyCode::Char(character) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
+            value.push(character);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Copies through the terminal (OSC 52), which also works over SSH.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    let mut output = stdout();
+    let _ = write!(
+        output,
+        "\x1b]52;c;{}\x07",
+        widgets::rich::base64(text.as_bytes())
+    );
+    let _ = output.flush();
+}
+
+fn delete_word(value: &mut String) {
+    let trimmed = value
+        .trim_end_matches(|character: char| character.is_whitespace() || ",;".contains(character))
+        .len();
+    value.truncate(trimmed);
+    let start = value
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace() || ",;".contains(*character))
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    value.truncate(start);
 }
 
 fn action_key(key: KeyEvent, expected: char) -> bool {
