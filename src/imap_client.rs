@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     io::{Read, Write},
     net::{TcpStream, ToSocketAddrs},
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    remote::{Auth, RemoteConfig},
+    remote::{Auth, RemoteConfig, RemoteError},
     storage,
 };
 
@@ -23,8 +23,8 @@ const FETCH_CHUNK: usize = 25;
 /// Local deletions above this count are treated as a reset cache, not user intent.
 const MASS_DELETE_LIMIT: usize = 20;
 
-pub fn connect(remote: &RemoteConfig) -> Result<Session, String> {
-    let secret = zeroize::Zeroizing::new(remote.password()?);
+pub fn connect(remote: &RemoteConfig) -> Result<Session, RemoteError> {
+    let secret = zeroize::Zeroizing::new(remote.password().map_err(RemoteError::auth)?);
     let tls = native_tls::TlsConnector::new()
         .map_err(crate::log::fail("Unable to configure IMAP TLS."))?;
     connect_with_tls(remote, &secret, &tls)
@@ -34,7 +34,7 @@ fn connect_with_tls(
     remote: &RemoteConfig,
     secret: &str,
     tls: &native_tls::TlsConnector,
-) -> Result<Session, String> {
+) -> Result<Session, RemoteError> {
     remote.validate()?;
     let addresses = (remote.imap_host.as_str(), remote.imap_port)
         .to_socket_addrs()
@@ -46,36 +46,31 @@ fn connect_with_tls(
             break;
         }
     }
-    let stream = stream.ok_or("Unable to connect to IMAP server.")?;
+    let mut stream = stream.ok_or("Unable to connect to IMAP server.")?;
     stream
         .set_read_timeout(Some(remote.timeout()))
         .map_err(crate::log::fail("Unable to set IMAP timeout."))?;
     stream
         .set_write_timeout(Some(remote.timeout()))
         .map_err(crate::log::fail("Unable to set IMAP timeout."))?;
-    let client = if remote.imap_security.starttls(remote.imap_port) {
-        let mut client = imap::Client::new(stream);
+    let starttls = remote.imap_security.starttls(remote.imap_port);
+    if starttls {
+        start_tls(&mut stream)?;
+    }
+    let stream = tls
+        .connect(&remote.imap_host, stream)
+        .map_err(crate::log::fail(if starttls {
+            "IMAP STARTTLS verification or handshake failed."
+        } else {
+            "IMAP TLS verification or handshake failed."
+        }))?;
+    let mut client = imap::Client::new(stream);
+    if !starttls {
         client
             .read_greeting()
             .map_err(crate::log::fail("Invalid IMAP greeting."))?;
-        client
-            .secure(&remote.imap_host, tls)
-            .map_err(crate::log::fail(
-                "IMAP STARTTLS verification or handshake failed.",
-            ))?
-    } else {
-        let stream = tls
-            .connect(&remote.imap_host, stream)
-            .map_err(crate::log::fail(
-                "IMAP TLS verification or handshake failed.",
-            ))?;
-        let mut client = imap::Client::new(stream);
-        client
-            .read_greeting()
-            .map_err(crate::log::fail("Invalid IMAP greeting."))?;
-        client
-    };
-    match remote.auth {
+    }
+    let result = match remote.auth {
         Auth::Password => client
             .login(&remote.username, secret)
             .map_err(|(error, _)| {
@@ -100,6 +95,46 @@ fn connect_with_tls(
                     secret,
                 )
             }),
+    };
+    if result.is_err() {
+        remote.forget_cached();
+    }
+    result.map_err(RemoteError::auth)
+}
+
+/// Upgrades a plain connection before any credentials are sent. Reads byte by byte so
+/// nothing that belongs to the TLS handshake is buffered away.
+fn start_tls(stream: &mut TcpStream) -> Result<(), String> {
+    fn line(stream: &mut TcpStream) -> Result<String, String> {
+        let mut bytes = Vec::new();
+        let mut byte = [0];
+        while bytes.len() < 8192 {
+            stream
+                .read_exact(&mut byte)
+                .map_err(crate::log::fail("Invalid IMAP greeting."))?;
+            bytes.push(byte[0]);
+            if bytes.ends_with(b"\r\n") {
+                return Ok(String::from_utf8_lossy(&bytes).into_owned());
+            }
+        }
+        Err("Invalid IMAP greeting.".into())
+    }
+    let greeting = line(stream)?;
+    if !greeting.starts_with("* OK") && !greeting.starts_with("* PREAUTH") {
+        return Err("Invalid IMAP greeting.".into());
+    }
+    stream
+        .write_all(b"t0 STARTTLS\r\n")
+        .map_err(crate::log::fail("IMAP STARTTLS request failed."))?;
+    loop {
+        let reply = line(stream)?;
+        if let Some(status) = reply.strip_prefix("t0 ") {
+            return if status.to_ascii_uppercase().starts_with("OK") {
+                Ok(())
+            } else {
+                Err("The IMAP server refused STARTTLS.".into())
+            };
+        }
     }
 }
 
@@ -203,6 +238,20 @@ fn discover<T: Read + Write>(
     remote: &RemoteConfig,
     create: bool,
 ) -> Result<Vec<Folder>, String> {
+    discover_layout(session, remote, create).map(|(folders, _)| folders)
+}
+
+/// Where new folders go: the hierarchy delimiter and the prefix they need.
+struct Layout {
+    delimiter: Option<String>,
+    prefix: String,
+}
+
+fn discover_layout<T: Read + Write>(
+    session: &mut imap::Session<T>,
+    remote: &RemoteConfig,
+    create: bool,
+) -> Result<(Vec<Folder>, Layout), String> {
     let names = session
         .list(Some(""), Some("*"))
         .map_err(crate::log::fail("Unable to list IMAP folders."))?;
@@ -212,10 +261,20 @@ fn discover<T: Read + Write>(
         let attributes: Vec<String> = name
             .attributes()
             .iter()
-            .map(|attribute| match attribute {
-                imap::types::NameAttribute::NoSelect => "\\noselect".into(),
-                imap::types::NameAttribute::Custom(value) => value.to_lowercase(),
-                _ => String::new(),
+            .map(|attribute| {
+                use imap_proto::NameAttribute;
+                match attribute {
+                    NameAttribute::NoSelect => "\\noselect".into(),
+                    NameAttribute::All => "\\all".into(),
+                    NameAttribute::Archive => "\\archive".into(),
+                    NameAttribute::Drafts => "\\drafts".into(),
+                    NameAttribute::Flagged => "\\flagged".into(),
+                    NameAttribute::Junk => "\\junk".into(),
+                    NameAttribute::Sent => "\\sent".into(),
+                    NameAttribute::Trash => "\\trash".into(),
+                    NameAttribute::Extension(value) => value.to_lowercase(),
+                    _ => String::new(),
+                }
             })
             .collect();
         if delimiter.is_none() {
@@ -277,17 +336,17 @@ fn discover<T: Read + Write>(
             roles.insert(name.clone(), role);
         }
     }
+    let prefix = match &delimiter {
+        Some(separator)
+            if listed
+                .iter()
+                .any(|(name, ..)| name.starts_with(&format!("{inbox}{separator}"))) =>
+        {
+            format!("{inbox}{separator}")
+        }
+        _ => String::new(),
+    };
     if create {
-        let prefix = match &delimiter {
-            Some(separator)
-                if listed
-                    .iter()
-                    .any(|(name, ..)| name.starts_with(&format!("{inbox}{separator}"))) =>
-            {
-                format!("{inbox}{separator}")
-            }
-            _ => String::new(),
-        };
         for (role, name) in [(Role::Trash, "Trash"), (Role::Archive, "Archive")] {
             if roles.values().any(|assigned| *assigned == role) {
                 continue;
@@ -342,7 +401,7 @@ fn discover<T: Read + Write>(
         });
     }
     folders.sort_by_key(|folder| folder.role != Some(Role::Inbox));
-    Ok(folders)
+    Ok((folders, Layout { delimiter, prefix }))
 }
 
 fn last_component(name: &str, separator: Option<&str>) -> String {
@@ -394,16 +453,58 @@ pub fn decode_utf7(value: &str) -> String {
     output
 }
 
+/// Encodes a folder name in IMAP's modified UTF-7.
+pub fn encode_utf7(value: &str) -> String {
+    let mut output = String::new();
+    let mut pending: Vec<u16> = Vec::new();
+    let flush = |pending: &mut Vec<u16>, output: &mut String| {
+        if pending.is_empty() {
+            return;
+        }
+        let bytes: Vec<u8> = pending.iter().flat_map(|unit| unit.to_be_bytes()).collect();
+        let encoded = crate::widgets::rich::base64(&bytes)
+            .trim_end_matches('=')
+            .replace('/', ",");
+        output.push('&');
+        output.push_str(&encoded);
+        output.push('-');
+        pending.clear();
+    };
+    for character in value.chars() {
+        if (' '..='~').contains(&character) {
+            flush(&mut pending, &mut output);
+            if character == '&' {
+                output.push_str("&-");
+            } else {
+                output.push(character);
+            }
+        } else {
+            let mut units = [0; 2];
+            pending.extend_from_slice(character.encode_utf16(&mut units));
+        }
+    }
+    flush(&mut pending, &mut output);
+    output
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct SyncState {
     server: String,
     folders: BTreeMap<String, FolderState>,
+    /// Messages that were in the Maildir before the first sync. They stay local until
+    /// the user asks to upload them, so pointing Termail at an existing Maildir never
+    /// copies a whole archive to the server by surprise.
+    #[serde(default)]
+    held: BTreeSet<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct FolderState {
     validity: u32,
     messages: BTreeMap<u32, Entry>,
+    /// HIGHESTMODSEQ after the last sync, when the server supports CONDSTORE.
+    #[serde(default)]
+    modseq: u64,
 }
 
 /// What both sides agreed on after the last sync. A zero `size` marks an entry whose
@@ -415,6 +516,9 @@ struct Entry {
     id: Option<String>,
     size: u64,
     modified: u64,
+    digest: Option<String>,
+    /// Only the headers were downloaded; the body is fetched on request.
+    partial: bool,
 }
 
 #[derive(Deserialize)]
@@ -430,6 +534,10 @@ enum StoredEntry {
         size: u64,
         #[serde(default)]
         modified: u64,
+        #[serde(default)]
+        digest: Option<String>,
+        #[serde(default)]
+        partial: bool,
     },
 }
 
@@ -445,11 +553,15 @@ impl From<StoredEntry> for Entry {
                 id,
                 size,
                 modified,
+                digest,
+                partial,
             } => Self {
                 flags,
                 id,
                 size,
                 modified,
+                digest,
+                partial,
             },
         }
     }
@@ -461,6 +573,65 @@ impl Drop for Lock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
     }
+}
+
+/// Takes the account's sync lock. `wait` blocks until a running sync finishes.
+fn lock_account(root: &Path, wait: bool) -> Result<Lock, String> {
+    let directory = root.join("termail-sync");
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let file = match storage::create(&directory.join("lock")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.join("lock"))
+            .map_err(|error| error.to_string())?,
+        Err(error) => return Err(error.to_string()),
+    };
+    if wait {
+        file.lock()
+            .map_err(crate::log::fail("Unable to lock the local mailbox."))?;
+    } else {
+        file.try_lock()
+            .map_err(crate::log::fail("This account is already syncing."))?;
+    }
+    Ok(Lock(file))
+}
+
+fn state_path(root: &Path) -> PathBuf {
+    root.join("termail-sync").join("state.json")
+}
+
+/// Loads the sync state, reporting whether this is the account's first sync.
+fn load_state(root: &Path, remote: &RemoteConfig) -> Result<(SyncState, bool), String> {
+    let mut state: SyncState = match fs::read(state_path(root)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(crate::log::fail(
+            "Sync state is unreadable. Existing messages were left unchanged.",
+        ))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((
+                SyncState {
+                    server: server_key(remote),
+                    ..SyncState::default()
+                },
+                true,
+            ));
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let server = server_key(remote);
+    if !state.server.is_empty() && state.server != server {
+        return Err("This local mailbox belongs to a different IMAP account.".into());
+    }
+    state.server = server;
+    Ok((state, false))
+}
+
+fn server_key(remote: &RemoteConfig) -> String {
+    format!(
+        "{}:{}:{}",
+        remote.imap_host, remote.imap_port, remote.username
+    )
 }
 
 pub fn initialize(root: &Path) -> Result<(), String> {
@@ -476,13 +647,29 @@ pub struct Synced {
     pub summary: String,
     pub changed: bool,
     pub downloaded: usize,
+    /// Local messages from before the first sync that wait for an explicit upload.
+    pub held: usize,
 }
 
-pub fn sync(remote: &RemoteConfig, root: &Path) -> Result<Synced, String> {
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SyncOptions {
+    /// Uploads messages that were held back at the first sync.
+    pub upload_held: bool,
+}
+
+pub fn sync(remote: &RemoteConfig, root: &Path) -> Result<Synced, RemoteError> {
+    sync_with(remote, root, SyncOptions::default())
+}
+
+pub fn sync_with(
+    remote: &RemoteConfig,
+    root: &Path,
+    options: SyncOptions,
+) -> Result<Synced, RemoteError> {
     let mut session = connect(remote)?;
-    let result = sync_session(&mut session, remote, root);
+    let result = sync_session(&mut session, remote, root, options);
     let _ = session.logout();
-    result
+    result.map_err(Into::into)
 }
 
 /// Splits a Maildir filename into its unique part and its info flags.
@@ -498,6 +685,10 @@ fn separator() -> &'static str {
 fn base_name(server: &str, folder: &str, validity: u32, uid: u32) -> String {
     let hash = format!("{:x}", Sha256::digest(format!("{server}:{folder}")));
     format!("termail-imap-{}-{validity}-{uid}", &hash[..16])
+}
+
+fn content_digest(contents: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(contents))[..32].to_owned()
 }
 
 fn normalize_flags(flags: &str) -> String {
@@ -546,6 +737,19 @@ fn imap_flags(flags: &str) -> Vec<imap::types::Flag<'static>> {
             _ => Flag::Seen,
         })
         .collect()
+}
+
+fn append<T: Read + Write>(
+    session: &mut imap::Session<T>,
+    folder: &str,
+    contents: &[u8],
+    flags: Vec<imap::types::Flag<'static>>,
+) -> imap::Result<()> {
+    session
+        .append(folder, contents)
+        .flags(flags)
+        .finish()
+        .map(|_| ())
 }
 
 fn local_folder(root: &Path, path: &Path) -> Option<String> {
@@ -607,11 +811,12 @@ fn set_local_flags(path: &Path, flags: &str) -> std::io::Result<PathBuf> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| std::io::Error::other("Invalid Maildir filename."))?;
     let base = split_flags(name).0;
-    let directory = path.parent().unwrap();
-    let directory = if flags.contains('S') && directory.ends_with("new") {
-        directory.parent().unwrap().join("cur")
-    } else {
-        directory.to_path_buf()
+    let directory = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("Invalid Maildir path."))?;
+    let directory = match directory.parent() {
+        Some(folder) if flags.contains('S') && directory.ends_with("new") => folder.join("cur"),
+        _ => directory.to_path_buf(),
     };
     let after = directory.join(format!("{base}{}{flags}", separator()));
     if after != path {
@@ -630,9 +835,43 @@ fn searchable_id(id: &str) -> bool {
     !id.is_empty() && !id.chars().any(|c| c.is_control() || "\"\\".contains(c))
 }
 
+/// Quotes a value for an IMAP command, or refuses values that cannot be quoted.
+fn quoted(value: &str) -> Option<String> {
+    (!value.chars().any(|c| c.is_control()))
+        .then(|| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+}
+
+fn uid_set(uids: &[u32]) -> String {
+    uids.iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 struct Capabilities {
     moves: bool,
     uidplus: bool,
+    condstore: bool,
+}
+
+fn capabilities<T: Read + Write>(session: &mut imap::Session<T>) -> Result<Capabilities, String> {
+    let capabilities = session
+        .capabilities()
+        .map(|capabilities| Capabilities {
+            moves: capabilities.has_str("MOVE"),
+            uidplus: capabilities.has_str("UIDPLUS"),
+            condstore: capabilities.has_str("CONDSTORE") && capabilities.has_str("ENABLE"),
+        })
+        .map_err(crate::log::fail("Unable to read IMAP capabilities."))?;
+    if capabilities.condstore {
+        // Turns on HIGHESTMODSEQ in SELECT replies; a refusal only costs speed.
+        let condstore = session.run_command_and_check_ok("ENABLE CONDSTORE").is_ok();
+        return Ok(Capabilities {
+            condstore,
+            ..capabilities
+        });
+    }
+    Ok(capabilities)
 }
 
 #[derive(Default)]
@@ -642,6 +881,7 @@ struct Report {
     uploaded: usize,
     changed: usize,
     removed: usize,
+    held: usize,
     skipped_deletes: bool,
 }
 
@@ -649,74 +889,37 @@ fn sync_session<T: Read + Write>(
     session: &mut imap::Session<T>,
     remote: &RemoteConfig,
     root: &Path,
+    options: SyncOptions,
 ) -> Result<Synced, String> {
     initialize(root)?;
-    let directory = root.join("termail-sync");
-    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    let file = match storage::create(&directory.join("lock")) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(directory.join("lock"))
-            .map_err(|error| error.to_string())?,
-        Err(error) => return Err(error.to_string()),
-    };
-    file.try_lock()
-        .map_err(crate::log::fail("This account is already syncing."))?;
-    let _lock = Lock(file);
-    let state_path = directory.join("state.json");
-    let mut state: SyncState = match fs::read(&state_path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(crate::log::fail(
-            "Sync state is unreadable. Existing messages were left unchanged.",
-        ))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => SyncState::default(),
-        Err(error) => return Err(error.to_string()),
-    };
-    let server = format!(
-        "{}:{}:{}",
-        remote.imap_host, remote.imap_port, remote.username
-    );
-    if !state.server.is_empty() && state.server != server {
-        return Err("This local mailbox belongs to a different IMAP account.".into());
-    }
-    state.server = server;
-    let capabilities = session
-        .capabilities()
-        .map(|capabilities| Capabilities {
-            moves: capabilities.has_str("MOVE"),
-            uidplus: capabilities.has_str("UIDPLUS"),
-        })
-        .map_err(crate::log::fail("Unable to read IMAP capabilities."))?;
+    let _lock = lock_account(root, false)?;
+    let state_path = state_path(root);
+    let (mut state, first) = load_state(root, remote)?;
+    let capabilities = capabilities(session)?;
     let folders = discover(session, remote, true)?;
     let mut report = Report::default();
+    let context = Context {
+        root,
+        folders: &folders,
+        capabilities: &capabilities,
+        state_path: &state_path,
+        batch_size: remote.batch_size,
+        max_bytes: remote.max_download_bytes,
+        hold_new: first,
+        upload_held: options.upload_held,
+    };
 
     // Push and pull changes on known messages first, so moves land before any folder
     // looks for new messages.
     for folder in &folders {
-        reconcile(
-            session,
-            &mut state,
-            folder,
-            &folders,
-            root,
-            &capabilities,
-            &mut report,
-        )?;
+        reconcile(session, &mut state, folder, &context, &mut report)?;
         save_state(&state_path, &state)?;
     }
     for folder in &folders {
-        fetch_new(
-            session,
-            &mut state,
-            &state_path,
-            folder,
-            root,
-            remote.batch_size,
-            &mut report,
-        )?;
+        fetch_new(session, &mut state, folder, &context, &mut report)?;
         save_state(&state_path, &state)?;
     }
+    report.held = state.held.len();
     let mut summary = format!("Synced · {} new messages", report.downloaded);
     if report.changed + report.removed + report.uploaded > 0 {
         summary.push_str(&format!(
@@ -725,6 +928,12 @@ fn sync_session<T: Read + Write>(
         ));
     }
     summary.push_str(&format!(" · {} older messages remaining", report.remaining));
+    if report.held > 0 {
+        summary.push_str(&format!(
+            " · {} local messages kept off the server (:upload to send them)",
+            report.held
+        ));
+    }
     if report.skipped_deletes {
         summary.push_str(" · many local messages were missing, so they will be downloaded again");
     }
@@ -732,18 +941,85 @@ fn sync_session<T: Read + Write>(
         summary,
         changed: report.downloaded + report.changed + report.removed + report.uploaded > 0,
         downloaded: report.downloaded,
+        held: report.held,
     })
+}
+
+struct Context<'a> {
+    root: &'a Path,
+    folders: &'a [Folder],
+    capabilities: &'a Capabilities,
+    state_path: &'a Path,
+    batch_size: usize,
+    max_bytes: u64,
+    hold_new: bool,
+    upload_held: bool,
+}
+
+/// The server's current flags for every message in the selected folder. With
+/// CONDSTORE only messages changed since the last sync are fetched.
+fn current_flags<T: Read + Write>(
+    session: &mut imap::Session<T>,
+    entry: &FolderState,
+    exists: u32,
+    modseq: Option<u64>,
+    condstore: bool,
+) -> Result<HashMap<u32, String>, String> {
+    let mut current = HashMap::new();
+    if exists == 0 {
+        return Ok(current);
+    }
+    let incremental = condstore
+        && entry.modseq > 0
+        && modseq.is_some()
+        && entry.messages.values().all(|value| value.size > 0);
+    if !incremental {
+        let fetched = session
+            .uid_fetch("1:*", "(UID FLAGS)")
+            .map_err(crate::log::fail("Unable to read IMAP message flags."))?;
+        for message in fetched.iter() {
+            if let Some(uid) = message.uid {
+                current.insert(uid, remote_flags(message.flags()));
+            }
+        }
+        return Ok(current);
+    }
+    let existing = session
+        .uid_search("ALL")
+        .map_err(crate::log::fail("Unable to list IMAP messages."))?;
+    for uid in existing {
+        if let Some(value) = entry.messages.get(&uid) {
+            current.insert(uid, value.flags.clone());
+        }
+    }
+    if modseq != Some(entry.modseq) {
+        let fetched = session
+            .uid_fetch(
+                "1:*",
+                format!("(UID FLAGS) (CHANGEDSINCE {})", entry.modseq),
+            )
+            .map_err(crate::log::fail("Unable to read changed IMAP flags."))?;
+        for message in fetched.iter() {
+            if let Some(uid) = message.uid
+                && current.contains_key(&uid)
+            {
+                current.insert(uid, remote_flags(message.flags()));
+            }
+        }
+    }
+    Ok(current)
 }
 
 fn reconcile<T: Read + Write>(
     session: &mut imap::Session<T>,
     state: &mut SyncState,
     folder: &Folder,
-    folders: &[Folder],
-    root: &Path,
-    capabilities: &Capabilities,
+    context: &Context<'_>,
     report: &mut Report,
 ) -> Result<(), String> {
+    let root = context.root;
+    let folders = context.folders;
+    let capabilities = context.capabilities;
     let mailbox = session
         .select(&folder.remote)
         .map_err(crate::log::fail(format!(
@@ -769,21 +1045,19 @@ fn reconcile<T: Read + Write>(
         }
         entry.messages.clear();
         entry.validity = validity;
+        entry.modseq = 0;
     }
     if entry.messages.is_empty() {
+        entry.modseq = mailbox.highest_mod_seq.unwrap_or_default();
         return Ok(());
     }
-    let mut current = HashMap::new();
-    if mailbox.exists > 0 {
-        let fetched = session
-            .uid_fetch("1:*", "(UID FLAGS)")
-            .map_err(crate::log::fail("Unable to read IMAP message flags."))?;
-        for message in fetched.iter() {
-            if let Some(uid) = message.uid {
-                current.insert(uid, remote_flags(message.flags()));
-            }
-        }
-    }
+    let current = current_flags(
+        session,
+        entry,
+        mailbox.exists,
+        mailbox.highest_mod_seq,
+        capabilities.condstore,
+    )?;
     let missing = entry
         .messages
         .iter()
@@ -849,20 +1123,28 @@ fn reconcile<T: Read + Write>(
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let local_flags = normalize_flags(split_flags(&name).1);
         let (size, modified) = file_stamp(path);
+        let mut digest = synced.digest.clone();
         if synced.size > 0 && (size != synced.size || modified != synced.modified) {
-            // The local copy was rewritten (an edited draft): replace the server copy.
+            // Copying or restoring a Maildir moves timestamps without changing a byte,
+            // so only a real content change in Drafts replaces the server copy.
             let contents = fs::read(path).map_err(|error| error.to_string())?;
-            session
-                .append_with_flags(&folder.remote, &contents, &imap_flags(&local_flags))
-                .map_err(crate::log::fail("Unable to upload an edited message."))?;
-            session
-                .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
-                .map_err(crate::log::fail("Unable to replace an edited message."))?;
-            expunge.push(*uid);
-            let _ = fs::remove_file(path);
-            report.uploaded += 1;
-            forget.push(*uid);
-            continue;
+            let now = content_digest(&contents);
+            let edited = digest.as_deref() != Some(now.as_str());
+            if edited && folder.role == Some(Role::Drafts) && !synced.partial {
+                append(session, &folder.remote, &contents, imap_flags(&local_flags))
+                    .map_err(crate::log::fail("Unable to upload an edited message."))?;
+                // Without the local file a failed delete below is retried as a local
+                // deletion, never as a second upload.
+                let _ = fs::remove_file(path);
+                forget.push(*uid);
+                report.uploaded += 1;
+                session
+                    .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+                    .map_err(crate::log::fail("Unable to replace an edited message."))?;
+                expunge.push(*uid);
+                continue;
+            }
+            digest = Some(now);
         }
         let mut merged = String::new();
         let mut add = Vec::new();
@@ -904,11 +1186,12 @@ fn reconcile<T: Read + Write>(
         }
         let path = set_local_flags(path, &merged).map_err(|error| error.to_string())?;
         let (size, modified) = file_stamp(&path);
-        let id = synced.id.clone().or_else(|| {
-            fs::read(&path)
-                .ok()
-                .and_then(|contents| message_id(&contents))
-        });
+        let mut id = synced.id.clone();
+        if id.is_none() || digest.is_none() {
+            let contents = fs::read(&path).unwrap_or_default();
+            id = id.or_else(|| message_id(&contents));
+            digest = digest.or_else(|| Some(content_digest(&contents)));
+        }
         updates.push((
             *uid,
             Entry {
@@ -916,6 +1199,8 @@ fn reconcile<T: Read + Write>(
                 id,
                 size,
                 modified,
+                digest,
+                partial: synced.partial,
             },
         ));
     }
@@ -925,6 +1210,7 @@ fn reconcile<T: Read + Write>(
     for (uid, value) in updates {
         entry.messages.insert(uid, value);
     }
+    entry.modseq = mailbox.highest_mod_seq.unwrap_or_default();
     if !expunge.is_empty() {
         expunge_messages(session, &expunge, capabilities)?;
     }
@@ -958,41 +1244,53 @@ fn move_message<T: Read + Write>(
     }
 }
 
+/// Expunges exactly `uids`. Without UIDPLUS a plain EXPUNGE would also remove messages
+/// another client marked deleted, so those are unmarked around it and marked again.
 fn expunge_messages<T: Read + Write>(
     session: &mut imap::Session<T>,
     uids: &[u32],
     capabilities: &Capabilities,
 ) -> Result<(), String> {
-    let result = if capabilities.uidplus {
-        let set = uids
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        session.uid_expunge(set).map(|_| ())
-    } else {
-        session.expunge().map(|_| ())
+    let fail = crate::log::fail("Unable to expunge deleted IMAP messages.");
+    if capabilities.uidplus {
+        return session.uid_expunge(uid_set(uids)).map(|_| ()).map_err(fail);
+    }
+    let others: Vec<u32> = match session.uid_search("DELETED") {
+        Ok(found) => found
+            .into_iter()
+            .filter(|uid| !uids.contains(uid))
+            .collect(),
+        Err(error) => return Err(fail(error)),
     };
-    result.map_err(crate::log::fail("Unable to expunge deleted IMAP messages."))
+    if !others.is_empty() {
+        session
+            .uid_store(uid_set(&others), "-FLAGS.SILENT (\\Deleted)")
+            .map_err(crate::log::fail(
+                "Unable to protect messages other apps deleted.",
+            ))?;
+    }
+    let result = session.expunge().map(|_| ()).map_err(fail);
+    if !others.is_empty() {
+        session
+            .uid_store(uid_set(&others), "+FLAGS.SILENT (\\Deleted)")
+            .map_err(crate::log::fail(
+                "Unable to restore deletion marks of other apps.",
+            ))?;
+    }
+    result
 }
 
 fn fetch_new<T: Read + Write>(
     session: &mut imap::Session<T>,
     state: &mut SyncState,
-    state_path: &Path,
     folder: &Folder,
-    root: &Path,
-    batch_size: usize,
+    context: &Context<'_>,
     report: &mut Report,
 ) -> Result<(), String> {
     if LOCAL_ONLY.contains(&folder.local.as_str()) {
         return Ok(());
     }
-    let local_root = if folder.local.is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(&folder.local)
-    };
+    let local_root = folder_root(context.root, &folder.local);
     for child in ["cur", "new", "tmp"] {
         fs::create_dir_all(local_root.join(child)).map_err(|error| error.to_string())?;
     }
@@ -1033,7 +1331,8 @@ fn fetch_new<T: Read + Write>(
         for file in files.flatten() {
             let path = file.path();
             let name = file.file_name().to_string_lossy().into_owned();
-            if !path.is_file() || known.contains(split_flags(&name).0) {
+            let base = split_flags(&name).0.to_owned();
+            if !path.is_file() || known.contains(&base) {
                 continue;
             }
             let Ok(contents) = fs::read(&path) else {
@@ -1059,11 +1358,11 @@ fn fetch_new<T: Read + Write>(
                     .find(|message| message.uid == Some(uid))
                     .map(|message| remote_flags(message.flags()))
                     .unwrap_or_default();
-                let base = base_name(&server, &folder.remote, validity, uid);
+                let target = base_name(&server, &folder.remote, validity, uid);
                 let destination =
                     local_root
                         .join("cur")
-                        .join(format!("{base}{}{}", separator(), flags));
+                        .join(format!("{target}{}{}", separator(), flags));
                 storage::rename(&path, &destination).map_err(|error| error.to_string())?;
                 let (size, modified) = file_stamp(&destination);
                 entry.messages.insert(
@@ -1073,21 +1372,24 @@ fn fetch_new<T: Read + Write>(
                         id,
                         size,
                         modified,
+                        digest: Some(content_digest(&contents)),
+                        partial: false,
                     },
                 );
+                state.held.remove(&base);
                 uids.remove(&uid);
             } else if name.starts_with("termail-imap-") {
                 // It came from the server and is no longer where sync left it; the
                 // server copy wherever it lives now is downloaded instead.
                 fs::remove_file(&path).map_err(|error| error.to_string())?;
+            } else if context.hold_new || (state.held.contains(&base) && !context.upload_held) {
+                state.held.insert(base);
             } else {
-                session
-                    .append_with_flags(&folder.remote, &contents, &imap_flags(&flags))
-                    .map_err(crate::log::fail(format!(
-                        "Unable to upload a message to {}.",
-                        folder.remote
-                    )))?;
+                append(session, &folder.remote, &contents, imap_flags(&flags)).map_err(
+                    crate::log::fail(format!("Unable to upload a message to {}.", folder.remote)),
+                )?;
                 fs::remove_file(&path).map_err(|error| error.to_string())?;
+                state.held.remove(&base);
                 report.uploaded += 1;
                 uploaded = true;
             }
@@ -1103,56 +1405,520 @@ fn fetch_new<T: Read + Write>(
         .filter(|uid| !entry.messages.contains_key(uid))
         .collect();
     pending.sort_unstable_by(|a, b| b.cmp(a));
-    report.remaining += pending.len().saturating_sub(batch_size);
-    pending.truncate(batch_size);
+    report.remaining += pending.len().saturating_sub(context.batch_size);
+    pending.truncate(context.batch_size);
     for chunk in pending.chunks(FETCH_CHUNK) {
-        let set = chunk
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
+        report.downloaded += download(
+            session,
+            &mut entry,
+            &Target {
+                server: &server,
+                folder: &folder.remote,
+                local_root: &local_root,
+                validity,
+            },
+            chunk,
+            context.max_bytes,
+        )?;
+        state
+            .folders
+            .insert(folder.remote.clone(), std::mem::take(&mut entry));
+        save_state(context.state_path, state)?;
+        entry = state.folders.remove(&folder.remote).unwrap_or_default();
+    }
+    state.folders.insert(folder.remote.clone(), entry);
+    Ok(())
+}
+
+fn folder_root(root: &Path, local: &str) -> PathBuf {
+    if local.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(local)
+    }
+}
+
+struct Target<'a> {
+    server: &'a str,
+    folder: &'a str,
+    local_root: &'a Path,
+    validity: u32,
+}
+
+/// Downloads `uids` from the selected folder. Messages above `max_bytes` arrive as
+/// headers with a short note, and their body follows on request.
+fn download<T: Read + Write>(
+    session: &mut imap::Session<T>,
+    entry: &mut FolderState,
+    target: &Target<'_>,
+    uids: &[u32],
+    max_bytes: u64,
+) -> Result<usize, String> {
+    let mut large = HashMap::new();
+    if max_bytes > 0 {
+        let sizes = session
+            .uid_fetch(uid_set(uids), "(UID RFC822.SIZE)")
+            .map_err(crate::log::fail("Unable to read IMAP message sizes."))?;
+        for message in sizes.iter() {
+            if let (Some(uid), Some(size)) = (message.uid, message.size)
+                && u64::from(size) > max_bytes
+            {
+                large.insert(uid, size);
+            }
+        }
+    }
+    let (heavy, light): (Vec<u32>, Vec<u32>) = uids.iter().partition(|uid| large.contains_key(uid));
+    let mut downloaded = 0;
+    for (set, query) in [
+        (light, "(UID FLAGS BODY.PEEK[])"),
+        (heavy, "(UID FLAGS BODY.PEEK[HEADER])"),
+    ] {
+        if set.is_empty() {
+            continue;
+        }
         let fetched = session
-            .uid_fetch(set, "(UID FLAGS BODY.PEEK[])")
+            .uid_fetch(uid_set(&set), query)
             .map_err(crate::log::fail("Unable to download IMAP message."))?;
         for message in fetched.iter() {
-            let Some(uid) = message.uid.filter(|uid| chunk.contains(uid)) else {
+            let Some(uid) = message.uid.filter(|uid| set.contains(uid)) else {
                 continue;
             };
-            let Some(body) = message.body() else {
-                continue;
+            let partial = large.get(&uid).copied();
+            let contents = match partial {
+                Some(size) => match message.header() {
+                    Some(header) => partial_message(header, size),
+                    None => continue,
+                },
+                None => match message.body() {
+                    Some(body) => body.to_vec(),
+                    None => continue,
+                },
             };
             let flags = remote_flags(message.flags());
-            let base = base_name(&server, &folder.remote, validity, uid);
-            let destination = local_root
+            let base = base_name(target.server, target.folder, target.validity, uid);
+            let destination = target
+                .local_root
                 .join("cur")
                 .join(format!("{base}{}{flags}", separator()));
             if !destination.exists() {
-                let temporary = local_root
-                    .join("tmp")
-                    .join(storage::unique_name("download"));
-                storage::write_new(&temporary, body).map_err(|error| error.to_string())?;
-                storage::rename(&temporary, &destination).map_err(|error| error.to_string())?;
-                report.downloaded += 1;
+                write_message(target.local_root, &destination, &contents)?;
+                downloaded += 1;
             }
             let (size, modified) = file_stamp(&destination);
             entry.messages.insert(
                 uid,
                 Entry {
                     flags,
-                    id: message_id(body),
+                    id: message_id(&contents),
                     size,
                     modified,
+                    digest: Some(content_digest(&contents)),
+                    partial: partial.is_some(),
                 },
             );
         }
-        state
-            .folders
-            .insert(folder.remote.clone(), std::mem::take(&mut entry));
-        save_state(state_path, state)?;
-        entry = state.folders.remove(&folder.remote).unwrap_or_default();
     }
-    state.folders.insert(folder.remote.clone(), entry);
+    Ok(downloaded)
+}
+
+fn write_message(local_root: &Path, destination: &Path, contents: &[u8]) -> Result<(), String> {
+    let temporary = local_root
+        .join("tmp")
+        .join(storage::unique_name("download"));
+    storage::write_new(&temporary, contents).map_err(|error| error.to_string())?;
+    storage::rename(&temporary, destination).map_err(|error| error.to_string())
+}
+
+/// Header of a message marking it partial.
+pub const PARTIAL_HEADER: &str = "X-Termail-Partial";
+
+/// The original headers with a plain-text note in place of a body that was not
+/// downloaded. Content headers are replaced so the note parses on its own.
+fn partial_message(header: &[u8], size: u32) -> Vec<u8> {
+    let text = String::from_utf8_lossy(header);
+    let mut output = String::new();
+    let mut skipping = false;
+    for line in text.split_inclusive('\n') {
+        if line.trim_end().is_empty() {
+            break;
+        }
+        if line.starts_with([' ', '\t']) {
+            if !skipping {
+                output.push_str(line);
+            }
+            continue;
+        }
+        let name = line
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        skipping = name == "content-type" || name == "content-transfer-encoding";
+        if !skipping {
+            output.push_str(line);
+        }
+    }
+    let kilobytes = size.div_ceil(1024);
+    output.push_str(&format!(
+        "{PARTIAL_HEADER}: {size}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nThis message is {kilobytes} KB and only its headers were downloaded.\r\nPress D to download the full message.\r\n"
+    ));
+    output.into_bytes()
+}
+
+/// Locates the folder and UID a downloaded file came from.
+fn find_entry<'a>(
+    state: &'a mut SyncState,
+    base: &str,
+) -> Option<(String, u32, u32, &'a mut Entry)> {
+    let server = state.server.clone();
+    state.folders.iter_mut().find_map(|(name, folder)| {
+        let validity = folder.validity;
+        folder.messages.iter_mut().find_map(|(uid, entry)| {
+            (base_name(&server, name, validity, *uid) == base)
+                .then(|| (name.clone(), validity, *uid, entry))
+        })
+    })
+}
+
+/// Replaces a partial message with the full one from the server.
+pub fn download_full(
+    remote: &RemoteConfig,
+    root: &Path,
+    path: &Path,
+) -> Result<PathBuf, RemoteError> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("Invalid Maildir filename.")?
+        .to_owned();
+    let base = split_flags(&name).0.to_owned();
+    let mut session = connect(remote)?;
+    let result = download_full_in(&mut session, remote, root, path, &base);
+    let _ = session.logout();
+    result.map_err(Into::into)
+}
+
+fn download_full_in<T: Read + Write>(
+    session: &mut imap::Session<T>,
+    remote: &RemoteConfig,
+    root: &Path,
+    path: &Path,
+    base: &str,
+) -> Result<PathBuf, String> {
+    {
+        let _lock = lock_account(root, true)?;
+        let (mut state, _) = load_state(root, remote)?;
+        let (folder, validity, uid, _) =
+            find_entry(&mut state, base).ok_or("This message is no longer synced.")?;
+        let mailbox = session.examine(&folder).map_err(crate::log::fail(format!(
+            "Unable to open IMAP folder {folder}."
+        )))?;
+        if mailbox.uid_validity != Some(validity) {
+            return Err("The folder changed on the server. Sync, then try again.".into());
+        }
+        let fetched = session
+            .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
+            .map_err(crate::log::fail("Unable to download IMAP message."))?;
+        let body = fetched
+            .iter()
+            .find(|message| message.uid == Some(uid))
+            .and_then(|message| message.body())
+            .ok_or("The server no longer has this message.")?
+            .to_vec();
+        let local_root = path
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("Invalid Maildir path.")?;
+        write_message(local_root, path, &body)?;
+        let (size, modified) = file_stamp(path);
+        if let Some((_, _, _, entry)) = find_entry(&mut state, base) {
+            entry.partial = false;
+            entry.size = size;
+            entry.modified = modified;
+            entry.digest = Some(content_digest(&body));
+        }
+        save_state(&state_path(root), &state)?;
+        Ok(path.to_path_buf())
+    }
+}
+
+/// A folder change made on the server and mirrored locally.
+pub enum FolderChange {
+    /// Creates a folder. `/` separates levels.
+    Create(String),
+    /// Renames the local Maildir folder to a new name.
+    Rename { local: String, name: String },
+    /// Deletes the local Maildir folder and its messages.
+    Delete(String),
+}
+
+/// The local Maildir++ folder for a display name such as `Projects/2026`.
+pub fn local_name(name: &str) -> String {
+    format!(
+        ".{}",
+        name.split('/')
+            .map(|component| crate::mailbox::safe_file_name(component.trim()).replace('.', "_"))
+            .collect::<Vec<_>>()
+            .join(".")
+    )
+}
+
+pub fn change_folder(
+    remote: &RemoteConfig,
+    root: &Path,
+    change: &FolderChange,
+) -> Result<String, RemoteError> {
+    let mut session = connect(remote)?;
+    let result = change_folder_in(&mut session, remote, root, change);
+    let _ = session.logout();
+    result.map_err(Into::into)
+}
+
+fn change_folder_in<T: Read + Write>(
+    session: &mut imap::Session<T>,
+    remote: &RemoteConfig,
+    root: &Path,
+    change: &FolderChange,
+) -> Result<String, String> {
+    {
+        let _lock = lock_account(root, true)?;
+        let (mut state, _) = load_state(root, remote)?;
+        let (folders, layout) = discover_layout(session, remote, false)?;
+        let remote_name = |name: &str| {
+            let components: Vec<String> = name
+                .split('/')
+                .map(|component| encode_utf7(component.trim()))
+                .collect();
+            format!(
+                "{}{}",
+                layout.prefix,
+                components.join(layout.delimiter.as_deref().unwrap_or("/"))
+            )
+        };
+        let existing = |local: &str| {
+            folders
+                .iter()
+                .find(|folder| folder.local == local)
+                .cloned()
+                .ok_or_else(|| "That folder is not on the server.".to_owned())
+        };
+        match change {
+            FolderChange::Create(name) => {
+                let target = remote_name(name);
+                session
+                    .create(&target)
+                    .map_err(crate::log::fail("The server refused to create the folder."))?;
+                let _ = session.subscribe(&target);
+                let local = folder_root(root, &local_name(name));
+                for child in ["cur", "new", "tmp"] {
+                    fs::create_dir_all(local.join(child)).map_err(|error| error.to_string())?;
+                }
+                Ok(format!("Created {name}"))
+            }
+            FolderChange::Rename { local, name } => {
+                let folder = existing(local)?;
+                if folder.role.is_some() {
+                    return Err("Standard folders cannot be renamed.".into());
+                }
+                let target = remote_name(name);
+                session
+                    .rename(&folder.remote, &target)
+                    .map_err(crate::log::fail("The server refused to rename the folder."))?;
+                // Children move with their parent on the server; move their files too.
+                let delimiter = layout.delimiter.clone().unwrap_or_default();
+                for moved in folders.iter().filter(|candidate| {
+                    candidate.remote == folder.remote
+                        || (!delimiter.is_empty()
+                            && candidate
+                                .remote
+                                .starts_with(&format!("{}{delimiter}", folder.remote)))
+                }) {
+                    let new_remote = format!("{target}{}", &moved.remote[folder.remote.len()..]);
+                    let new_local =
+                        format!("{}{}", local_name(name), &moved.local[folder.local.len()..]);
+                    relocate(root, &mut state, moved, &new_remote, &new_local)?;
+                }
+                save_state(&state_path(root), &state)?;
+                Ok(format!("Renamed to {name}"))
+            }
+            FolderChange::Delete(local) => {
+                let folder = existing(local)?;
+                if folder.role.is_some() {
+                    return Err("Standard folders cannot be deleted.".into());
+                }
+                session.delete(&folder.remote).map_err(crate::log::fail(
+                    "The server refused to delete the folder. Delete its subfolders first.",
+                ))?;
+                state.folders.remove(&folder.remote);
+                save_state(&state_path(root), &state)?;
+                let _ = fs::remove_dir_all(folder_root(root, &folder.local));
+                Ok("Folder deleted".into())
+            }
+        }
+    }
+}
+
+/// Moves a folder's files and sync state to a new server and local name.
+fn relocate(
+    root: &Path,
+    state: &mut SyncState,
+    folder: &Folder,
+    new_remote: &str,
+    new_local: &str,
+) -> Result<(), String> {
+    let from = folder_root(root, &folder.local);
+    let to = folder_root(root, new_local);
+    for child in ["cur", "new", "tmp"] {
+        fs::create_dir_all(to.join(child)).map_err(|error| error.to_string())?;
+    }
+    let server = state.server.clone();
+    let mut renames = HashMap::new();
+    if let Some(entry) = state.folders.get(&folder.remote) {
+        for uid in entry.messages.keys() {
+            renames.insert(
+                base_name(&server, &folder.remote, entry.validity, *uid),
+                base_name(&server, new_remote, entry.validity, *uid),
+            );
+        }
+    }
+    for child in ["cur", "new"] {
+        let Ok(files) = fs::read_dir(from.join(child)) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name().to_string_lossy().into_owned();
+            let (base, flags) = split_flags(&name);
+            let renamed = match renames.get(base) {
+                Some(new_base) if name.contains(separator()) => {
+                    format!("{new_base}{}{flags}", separator())
+                }
+                Some(new_base) => new_base.clone(),
+                None => name.clone(),
+            };
+            storage::rename(&file.path(), &to.join(child).join(renamed))
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    if let Some(entry) = state.folders.remove(&folder.remote) {
+        state.folders.insert(new_remote.to_owned(), entry);
+    }
+    let _ = fs::remove_dir_all(&from);
     Ok(())
+}
+
+/// Searches the server for messages that were never downloaded and downloads up to
+/// `limit` of the newest matches. Returns how many arrived.
+pub fn search_server(
+    remote: &RemoteConfig,
+    root: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<usize, RemoteError> {
+    let criteria = server_criteria(query).ok_or("Nothing to search for on the server.")?;
+    let mut session = connect(remote)?;
+    let result = search_server_in(&mut session, remote, root, &criteria, limit);
+    let _ = session.logout();
+    result.map_err(Into::into)
+}
+
+fn search_server_in<T: Read + Write>(
+    session: &mut imap::Session<T>,
+    remote: &RemoteConfig,
+    root: &Path,
+    criteria: &str,
+    limit: usize,
+) -> Result<usize, String> {
+    {
+        let _lock = lock_account(root, true)?;
+        let (mut state, _) = load_state(root, remote)?;
+        let folders = discover(session, remote, false)?;
+        let server = state.server.clone();
+        let mut found = 0;
+        for folder in &folders {
+            if found >= limit
+                || LOCAL_ONLY.contains(&folder.local.as_str())
+                || matches!(folder.role, Some(Role::Trash | Role::Junk))
+            {
+                continue;
+            }
+            let mailbox = session
+                .examine(&folder.remote)
+                .map_err(crate::log::fail(format!(
+                    "Unable to open IMAP folder {}.",
+                    folder.remote
+                )))?;
+            let Some(validity) = mailbox.uid_validity else {
+                continue;
+            };
+            let mut entry = state.folders.remove(&folder.remote).unwrap_or_default();
+            if entry.validity != validity {
+                // Not synced yet or reset; a normal sync handles this folder first.
+                state.folders.insert(folder.remote.clone(), entry);
+                continue;
+            }
+            let mut matches: Vec<u32> = session
+                .uid_search(criteria)
+                .map_err(crate::log::fail("The server could not run this search."))?
+                .into_iter()
+                .filter(|uid| !entry.messages.contains_key(uid))
+                .collect();
+            matches.sort_unstable_by(|a, b| b.cmp(a));
+            matches.truncate(limit - found);
+            let local_root = folder_root(root, &folder.local);
+            for chunk in matches.chunks(FETCH_CHUNK) {
+                found += download(
+                    session,
+                    &mut entry,
+                    &Target {
+                        server: &server,
+                        folder: &folder.remote,
+                        local_root: &local_root,
+                        validity,
+                    },
+                    chunk,
+                    remote.max_download_bytes,
+                )?;
+            }
+            state.folders.insert(folder.remote.clone(), entry);
+            save_state(&state_path(root), &state)?;
+        }
+        Ok(found)
+    }
+}
+
+/// Translates a Termail search into IMAP SEARCH criteria. Filters that only make sense
+/// locally (folders, read state) are left out.
+fn server_criteria(query: &str) -> Option<String> {
+    let mut criteria = Vec::new();
+    for term in crate::mail::search_terms(query) {
+        let (negate, term) = match term.strip_prefix('-') {
+            Some(rest) if !rest.is_empty() => (true, rest.to_owned()),
+            _ => (false, term),
+        };
+        let criterion = match term.split_once(':') {
+            Some(("from", value)) => quoted(value).map(|value| format!("FROM {value}")),
+            Some(("to", value)) => quoted(value).map(|value| format!("TO {value}")),
+            Some(("subject", value)) => quoted(value).map(|value| format!("SUBJECT {value}")),
+            Some(("body", value)) => quoted(value).map(|value| format!("BODY {value}")),
+            Some(("before", value)) => imap_date(value).map(|date| format!("BEFORE {date}")),
+            Some(("after", value)) => imap_date(value).map(|date| format!("SINCE {date}")),
+            Some(("is" | "in" | "folder" | "has", _)) => None,
+            _ => quoted(&term).map(|value| format!("TEXT {value}")),
+        };
+        if let Some(criterion) = criterion {
+            criteria.push(if negate {
+                format!("NOT {criterion}")
+            } else {
+                criterion
+            });
+        }
+    }
+    (!criteria.is_empty()).then(|| criteria.join(" "))
+}
+
+fn imap_date(value: &str) -> Option<String> {
+    let date = crate::mail::parse_date(value)?;
+    Some(date.format("%-d-%b-%Y").to_string())
 }
 
 fn save_state(path: &Path, state: &SyncState) -> Result<(), String> {
@@ -1172,8 +1938,8 @@ pub fn copy_sent(
     contents: &[u8],
     allow_append: bool,
 ) -> Result<(), CopyError> {
-    let mut session = connect(remote).map_err(|message| CopyError {
-        message,
+    let mut session = connect(remote).map_err(|error| CopyError {
+        message: error.message,
         uncertain: false,
     })?;
     let result = copy_sent_session(&mut session, remote, contents, allow_append);
@@ -1234,13 +2000,11 @@ fn copy_sent_session<T: Read + Write>(
     if !allow_append {
         return Err(CopyError { message: "Sent copy is unconfirmed. SMTP delivery will not be repeated; check the remote Sent folder.".into(), uncertain: true });
     }
-    session
-        .append_with_flags(&sent, contents, &[imap::types::Flag::Seen])
-        .map_err(|_| CopyError {
-            message: "Unable to confirm the remote Sent copy. SMTP delivery will not be repeated."
-                .into(),
-            uncertain: true,
-        })
+    append(session, &sent, contents, vec![imap::types::Flag::Seen]).map_err(|_| CopyError {
+        message: "Unable to confirm the remote Sent copy. SMTP delivery will not be repeated."
+            .into(),
+        uncertain: true,
+    })
 }
 
 /// Checks that the account's Inbox can be opened and its folders listed.
@@ -1254,51 +2018,50 @@ pub fn verify_folders(session: &mut Session, remote: &RemoteConfig) -> Result<()
         ))
 }
 
-/// Blocks until the server reports a change in the Inbox, the timeout passes, or
-/// `stop` is set. Returns `Ok(true)` when the mailbox changed.
+/// Blocks until the server reports a change in `folder`, the timeout passes, or
+/// `stop` is set. Returns `Ok(true)` when the folder changed.
 pub fn wait_for_change(
     remote: &RemoteConfig,
+    folder: &str,
     timeout: std::time::Duration,
     stop: &std::sync::atomic::AtomicBool,
-) -> Result<bool, String> {
+) -> Result<bool, RemoteError> {
     let mut session = connect(remote)?;
-    let result = watch_session(&mut session, remote, timeout, stop);
+    let result = watch_session(&mut session, folder, timeout, stop);
     let _ = session.logout();
     result
 }
 
 fn watch_session(
     session: &mut Session,
-    remote: &RemoteConfig,
+    folder: &str,
     timeout: std::time::Duration,
     stop: &std::sync::atomic::AtomicBool,
-) -> Result<bool, String> {
+) -> Result<bool, RemoteError> {
     let supported = session
         .capabilities()
         .map(|capabilities| capabilities.has_str("IDLE"))
         .unwrap_or(false);
     if !supported {
-        return Err("IDLE is not supported.".into());
+        return Err(RemoteError::unsupported("IDLE is not supported."));
     }
     session
-        .select(&remote.inbox)
-        .map_err(crate::log::fail("Unable to open the Inbox."))?;
+        .select(folder)
+        .map_err(crate::log::fail(format!("Unable to open {folder}.")))?;
     let started = std::time::Instant::now();
-    let mut changed = false;
     while !stop.load(std::sync::atomic::Ordering::Relaxed) && started.elapsed() < timeout {
-        let idle = session
+        match session
             .idle()
-            .map_err(crate::log::fail("Unable to start IDLE."))?;
-        match idle.wait_with_timeout(std::time::Duration::from_secs(60)) {
-            Ok(imap::extensions::idle::WaitOutcome::MailboxChanged) => {
-                changed = true;
-                break;
-            }
+            .timeout(std::time::Duration::from_secs(60))
+            .keepalive(false)
+            .wait_while(imap::extensions::idle::stop_on_any)
+        {
+            Ok(imap::extensions::idle::WaitOutcome::MailboxChanged) => return Ok(true),
             Ok(imap::extensions::idle::WaitOutcome::TimedOut) => {}
             Err(_) => return Err("The IDLE connection was interrupted.".into()),
         }
     }
-    Ok(changed)
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -1346,7 +2109,7 @@ mod tests {
 
     fn run(remote: &RemoteConfig, tls: &native_tls::TlsConnector, cache: &Cache) -> String {
         let mut session = connect_with_tls(remote, "fake-password", tls).unwrap();
-        let result = sync_session(&mut session, remote, &cache.0).unwrap();
+        let result = sync_session(&mut session, remote, &cache.0, SyncOptions::default()).unwrap();
         session.logout().unwrap();
         result.summary
     }
@@ -1591,7 +2354,7 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert!(error.contains("TLS"));
+        assert!(error.message.contains("TLS"));
         worker.join().unwrap();
     }
 
@@ -1615,8 +2378,8 @@ mod tests {
         let error = connect_with_tls(&remote, "fake-password", &tls)
             .err()
             .unwrap();
-        assert!(error.contains("login failed"));
-        assert!(!error.contains("fake-password"));
+        assert!(error.message.contains("login failed"));
+        assert!(!error.message.contains("fake-password"));
         worker.join().unwrap();
     }
 

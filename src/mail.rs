@@ -300,6 +300,19 @@ impl Mail {
             Some(("is", "read")) => !self.unread,
             Some(("is", "starred" | "flagged")) => self.starred,
             Some(("has", "attachment" | "attachments")) => self.attachment_count > 0,
+            Some((filter @ ("before" | "after" | "on"), value)) => {
+                let Some(date) = parse_date(value) else {
+                    return false;
+                };
+                let Some(day) = self.timestamp.and_then(local_day) else {
+                    return false;
+                };
+                match filter {
+                    "before" => day < date,
+                    "after" => day >= date,
+                    _ => day == date,
+                }
+            }
             _ => {
                 contains(&self.subject, term)
                     || contains(&self.from, term)
@@ -334,6 +347,41 @@ pub fn long_date(timestamp: i64) -> String {
         .single()
         .map(|date| date.format("%a %-d %b %Y %H:%M").to_string())
         .unwrap_or_default()
+}
+
+fn local_day(timestamp: i64) -> Option<chrono::NaiveDate> {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .map(|date| date.date_naive())
+}
+
+/// Reads a search date: `2026-03-14`, `2026-03`, `today`, `yesterday`, or an age such as
+/// `7d`, `2w`, `3m` or `1y`.
+pub fn parse_date(value: &str) -> Option<chrono::NaiveDate> {
+    use chrono::{Days, Local, Months, NaiveDate};
+    let today = Local::now().date_naive();
+    match value {
+        "today" => return Some(today),
+        "yesterday" => return today.checked_sub_days(Days::new(1)),
+        _ => {}
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        return Some(date);
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(&format!("{value}-01"), "%Y-%m-%d") {
+        return Some(date);
+    }
+    let unit = value.chars().last()?;
+    let amount: u32 = value[..value.len() - unit.len_utf8()].parse().ok()?;
+    match unit {
+        'd' => today.checked_sub_days(Days::new(amount.into())),
+        'w' => today.checked_sub_days(Days::new(u64::from(amount) * 7)),
+        'm' => today.checked_sub_months(Months::new(amount)),
+        'y' => today.checked_sub_months(Months::new(amount.checked_mul(12)?)),
+        _ => None,
+    }
 }
 
 /// Splits a search query into lowercased terms, keeping quoted phrases together.

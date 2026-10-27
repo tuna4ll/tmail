@@ -68,6 +68,18 @@ pub struct RemoteConfig {
     pub password_command: Vec<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub keyring: bool,
+    /// Seconds a secret from `password_command` or an OAuth2 refresh stays cached.
+    #[serde(skip_serializing_if = "is_default_cache")]
+    pub password_cache_secs: u64,
+    /// Refreshes XOAUTH2 access tokens from a stored refresh token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth2: Option<OAuth2Config>,
+    /// IMAP folders watched with IDLE; empty watches the Inbox.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub watch: Vec<String>,
+    /// Messages larger than this many bytes download headers first; zero downloads all.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub max_download_bytes: u64,
     pub inbox: String,
     pub sent: String,
     pub sync_interval_secs: u64,
@@ -91,6 +103,10 @@ impl Default for RemoteConfig {
             password_env: String::new(),
             password_command: Vec::new(),
             keyring: false,
+            password_cache_secs: DEFAULT_CACHE_SECS,
+            oauth2: None,
+            watch: Vec::new(),
+            max_download_bytes: 0,
             inbox: "INBOX".into(),
             sent: String::new(),
             sync_interval_secs: 60,
@@ -101,7 +117,174 @@ impl Default for RemoteConfig {
     }
 }
 
+const DEFAULT_CACHE_SECS: u64 = 300;
+
+fn is_default_cache(value: &u64) -> bool {
+    *value == DEFAULT_CACHE_SECS
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// OAuth2 endpoints and client used to turn a refresh token into access tokens.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OAuth2Config {
+    /// `gmail` or `outlook` fill in the endpoints and scope.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    pub client_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub client_secret: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub auth_url: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub token_url: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub scope: String,
+}
+
+impl OAuth2Config {
+    fn preset(&self) -> (&'static str, &'static str, &'static str) {
+        match self.provider.to_ascii_lowercase().as_str() {
+            "gmail" | "google" => (
+                "https://accounts.google.com/o/oauth2/v2/auth",
+                "https://oauth2.googleapis.com/token",
+                "https://mail.google.com/",
+            ),
+            "outlook" | "microsoft" | "office365" => (
+                "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+                "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                "https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access",
+            ),
+            _ => ("", "", ""),
+        }
+    }
+
+    pub fn auth_url(&self) -> String {
+        pick(&self.auth_url, self.preset().0)
+    }
+
+    pub fn token_url(&self) -> String {
+        pick(&self.token_url, self.preset().1)
+    }
+
+    pub fn scope(&self) -> String {
+        pick(&self.scope, self.preset().2)
+    }
+}
+
+fn pick(value: &str, fallback: &str) -> String {
+    if value.is_empty() {
+        fallback.into()
+    } else {
+        value.into()
+    }
+}
+
+/// Why talking to the server failed, so callers can react without reading messages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorKind {
+    /// Credentials are missing or were rejected.
+    Auth,
+    /// The server lacks a capability the operation needs.
+    Unsupported,
+    Other,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteError {
+    pub kind: ErrorKind,
+    pub message: String,
+}
+
+impl RemoteError {
+    pub fn auth(message: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::Auth,
+            message: message.into(),
+        }
+    }
+
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::Unsupported,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<String> for RemoteError {
+    fn from(message: String) -> Self {
+        Self {
+            kind: ErrorKind::Other,
+            message,
+        }
+    }
+}
+
+impl From<&str> for RemoteError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+impl From<RemoteError> for String {
+    fn from(error: RemoteError) -> Self {
+        error.message
+    }
+}
+
+impl std::fmt::Display for RemoteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+type Cached = (zeroize::Zeroizing<String>, std::time::Instant);
+
+/// Secrets from commands and token refreshes, so periodic syncs do not rerun them.
+fn secret_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Cached>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Cached>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
 impl RemoteConfig {
+    fn cache_key(&self, kind: &str) -> String {
+        format!("{kind}:{}@{}", self.username, self.imap_host)
+    }
+
+    fn cached(&self, kind: &str) -> Option<String> {
+        let cache = secret_cache().lock().ok()?;
+        let (value, expires) = cache.get(&self.cache_key(kind))?;
+        (std::time::Instant::now() < *expires).then(|| value.to_string())
+    }
+
+    fn remember(&self, kind: &str, value: &str, lifetime: Duration) {
+        if lifetime.is_zero() {
+            return;
+        }
+        if let Ok(mut cache) = secret_cache().lock() {
+            cache.insert(
+                self.cache_key(kind),
+                (
+                    zeroize::Zeroizing::new(value.to_owned()),
+                    std::time::Instant::now() + lifetime,
+                ),
+            );
+        }
+    }
+
+    /// Drops cached secrets after the server rejected them.
+    pub fn forget_cached(&self) {
+        if let Ok(mut cache) = secret_cache().lock() {
+            cache
+                .retain(|key, _| !key.ends_with(&format!(":{}@{}", self.username, self.imap_host)));
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         for host in [&self.imap_host, &self.smtp_host] {
             if host.is_empty()
@@ -142,6 +325,23 @@ impl RemoteConfig {
         if self.sync_interval_secs != 0 && self.sync_interval_secs < 30 {
             return Err("sync_interval_secs must be zero or at least 30.".into());
         }
+        if self
+            .watch
+            .iter()
+            .any(|name| name.is_empty() || name.chars().any(char::is_control))
+        {
+            return Err("Set valid IMAP folder names in watch.".into());
+        }
+        if let Some(oauth) = &self.oauth2 {
+            if self.auth != Auth::Xoauth2 {
+                return Err("oauth2 settings need auth = \"xoauth2\".".into());
+            }
+            if oauth.client_id.is_empty() || oauth.token_url().is_empty() {
+                return Err(
+                    "Set oauth2 client_id and provider (gmail, outlook) or token_url.".into(),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -157,7 +357,26 @@ impl RemoteConfig {
                 && std::env::var_os(&self.password_env).is_some_and(|value| !value.is_empty()))
     }
 
+    /// The secret sent at sign-in: the password, or an access token for XOAUTH2.
     pub fn password(&self) -> Result<String, String> {
+        let Some(oauth) = &self.oauth2 else {
+            return self.stored_secret();
+        };
+        if let Some(token) = self.cached("access") {
+            return Ok(token);
+        }
+        let refresh = self.stored_secret()?;
+        let (token, lifetime) = refresh_access_token(oauth, &refresh)?;
+        self.remember(
+            "access",
+            &token,
+            lifetime.saturating_sub(Duration::from_secs(60)),
+        );
+        Ok(token)
+    }
+
+    /// The secret the account stores: a password, access token or OAuth2 refresh token.
+    pub fn stored_secret(&self) -> Result<String, String> {
         if let Some(password) = &self.session_password
             && !password.0.is_empty()
         {
@@ -171,7 +390,16 @@ impl RemoteConfig {
             return Ok(value);
         }
         if !self.password_command.is_empty() {
-            return run_password_command(&self.password_command);
+            if let Some(value) = self.cached("command") {
+                return Ok(value);
+            }
+            let value = run_password_command(&self.password_command)?;
+            self.remember(
+                "command",
+                &value,
+                Duration::from_secs(self.password_cache_secs),
+            );
+            return Ok(value);
         }
         if self.keyring {
             return keyring_entry(self)?
@@ -204,6 +432,61 @@ impl RemoteConfig {
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(self.timeout_secs)
     }
+}
+
+/// Exchanges a refresh token for an access token and its lifetime.
+fn refresh_access_token(oauth: &OAuth2Config, refresh: &str) -> Result<(String, Duration), String> {
+    let mut form = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh),
+        ("client_id", oauth.client_id.as_str()),
+    ];
+    if !oauth.client_secret.is_empty() {
+        form.push(("client_secret", oauth.client_secret.as_str()));
+    }
+    let response = token_request(&oauth.token_url(), &form)?;
+    let token = response["access_token"]
+        .as_str()
+        .filter(|token| !token.is_empty())
+        .ok_or("The OAuth2 server returned no access token. Run termail oauth again.")?
+        .to_owned();
+    let lifetime = response["expires_in"].as_u64().unwrap_or(3600);
+    Ok((token, Duration::from_secs(lifetime)))
+}
+
+pub(crate) fn token_request(url: &str, form: &[(&str, &str)]) -> Result<serde_json::Value, String> {
+    if !url.starts_with("https://") && !url.starts_with("http://127.0.0.1") {
+        return Err("The OAuth2 token_url must use https.".into());
+    }
+    let agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .build(),
+        )
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build()
+        .new_agent();
+    let mut response = agent
+        .post(url)
+        .send_form(form.iter().copied())
+        .map_err(crate::log::fail("Unable to reach the OAuth2 server."))?;
+    let status = response.status();
+    let body: serde_json::Value = response.body_mut().read_json().map_err(crate::log::fail(
+        "The OAuth2 server sent an unreadable reply.",
+    ))?;
+    if !status.is_success() {
+        let reason = body["error_description"]
+            .as_str()
+            .or(body["error"].as_str())
+            .unwrap_or("request refused");
+        crate::log::write("oauth2", format_args!("{status} {reason}"));
+        return Err(format!(
+            "OAuth2 sign-in failed ({reason}). Run termail oauth again."
+        ));
+    }
+    Ok(body)
 }
 
 fn keyring_entry(remote: &RemoteConfig) -> Result<keyring::Entry, String> {
@@ -339,6 +622,7 @@ pub(crate) mod tests {
         assert!(
             crate::imap_client::sync(&remote, std::path::Path::new("unused-test-maildir"))
                 .unwrap_err()
+                .message
                 .contains(&remote.password_env)
         );
     }

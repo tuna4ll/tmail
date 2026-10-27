@@ -15,7 +15,8 @@ futures = "0.3.32"
 email_address = "0.2.9"
 mail-builder = "0.4.4"
 mail-parser = "0.11.9"
-imap = "2.4.1"
+imap = { version = "=3.0.0-alpha.15", default-features = false, features = ["native-tls"] }
+imap-proto = "0.16"
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "native-tls"] }
 native-tls = "0.2.14"
 mime_guess = "2.0.5"
@@ -34,7 +35,7 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 html2text = { version = "0.17", features = ["css"] }
-ureq = { version = "3", default-features = false, features = ["native-tls"] }
+ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
 unicode-width = "0.2"
 
 [dev-dependencies]
