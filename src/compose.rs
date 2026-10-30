@@ -200,11 +200,6 @@ impl App {
     }
 
     pub(crate) fn finish_composer(&mut self, mut state: ComposeState, send: bool) {
-        if send && self.sending {
-            state.error = Some("Wait for the current send to finish.".into());
-            self.overlay = Some(Overlay::Compose(state));
-            return;
-        }
         let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let contents = if send {
             state.composer.message(&base)

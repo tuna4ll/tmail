@@ -324,25 +324,36 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Records the mailbox as it is after the app changed it, so the change does not
+    /// look like one made by another program.
     pub(crate) fn refresh_fingerprint(&mut self) {
-        if let Ok(fingerprint) = self.source.fingerprint() {
-            self.mailbox_fingerprint = fingerprint;
-        }
+        self.scan_mailbox(true);
     }
 
+    /// Looks for changes made outside the app. The scan walks every folder, so it runs
+    /// off the UI thread.
     pub(crate) fn check_mailbox_changes(&mut self) {
-        if !matches!(
-            self.mailbox_state,
-            MailboxState::Ready | MailboxState::Empty
-        ) {
+        if self.fingerprint_busy
+            || !matches!(
+                self.mailbox_state,
+                MailboxState::Ready | MailboxState::Empty
+            )
+        {
             return;
         }
-        if let Ok(fingerprint) = self.source.fingerprint()
-            && fingerprint != self.mailbox_fingerprint
-        {
-            self.notice = Some("Mailbox changed · refreshing".into());
-            self.reload();
-        }
+        self.scan_mailbox(false);
+    }
+
+    fn scan_mailbox(&mut self, baseline: bool) {
+        self.fingerprint_generation += 1;
+        self.fingerprint_busy = true;
+        let generation = self.fingerprint_generation;
+        let source = self.source.clone();
+        self.spawn_task(move || Task::Fingerprint {
+            generation,
+            value: source.fingerprint().ok(),
+            baseline,
+        });
     }
 }
 

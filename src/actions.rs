@@ -37,8 +37,13 @@ impl App {
         label: &str,
         mut change: impl FnMut(&MailboxSource, &mut Mail) -> Result<Option<MaildirChange>, LoadError>,
     ) {
-        if self.sending {
-            self.notice = Some("Wait for the current send before changing messages.".into());
+        if targets.iter().any(|index| {
+            self.mails[*index]
+                .source_path
+                .as_ref()
+                .is_some_and(|path| self.sending.contains(path))
+        }) {
+            self.notice = Some("Wait for this message to finish sending.".into());
             return;
         }
         if targets.is_empty() {
@@ -122,7 +127,7 @@ impl App {
     }
 
     pub(crate) fn undo_last(&mut self) {
-        if self.sending {
+        if !self.sending.is_empty() && self.active_folder == "Outbox" {
             self.notice = Some("Wait for the current send before changing messages.".into());
             return;
         }
@@ -265,6 +270,7 @@ impl App {
             selected,
             items,
             moving: false,
+            deleting: false,
         });
     }
 
@@ -291,6 +297,7 @@ impl App {
             selected: 0,
             items,
             moving: true,
+            deleting: false,
         });
     }
 
@@ -303,6 +310,146 @@ impl App {
             mail.mailbox = Some(folder.to_owned());
             Ok(change)
         });
+    }
+
+    /// The Maildir of the account on screen and its server, for folder changes and
+    /// server searches. The all-accounts view has no single account.
+    pub(crate) fn current_account_store(
+        &self,
+    ) -> Result<(PathBuf, Option<remote::RemoteConfig>), String> {
+        let MailboxSource::Maildir(root) = &self.source else {
+            return Err("Switch to a single account first (press p).".into());
+        };
+        let remote = self
+            .remote_accounts()
+            .into_iter()
+            .find(|(_, _, candidate)| candidate == root)
+            .map(|(_, remote, _)| remote)
+            .filter(remote::RemoteConfig::has_credentials);
+        Ok((root.clone(), remote))
+    }
+
+    /// Creates, renames or deletes a folder, on the server too when the account syncs.
+    pub(crate) fn change_folder(&mut self, change: imap_client::FolderChange) {
+        let (root, remote) = match self.current_account_store() {
+            Ok(store) => store,
+            Err(error) => {
+                self.notice = Some(error);
+                return;
+            }
+        };
+        if let imap_client::FolderChange::Rename { local, .. }
+        | imap_client::FolderChange::Delete(local) = &change
+            && self.active_folder == local.trim_start_matches('.')
+        {
+            self.active_folder = "INBOX".into();
+            self.reader = None;
+        }
+        self.notice = Some("Updating folders…".into());
+        self.spawn_task(move || {
+            let result = match &remote {
+                Some(remote) => imap_client::change_folder(remote, &root, &change)
+                    .map_err(|error| error.message),
+                None => mailbox::change_local_folder(&root, &change),
+            };
+            Task::Done {
+                message: result.unwrap_or_else(|error| format!("Folder unchanged · {error}")),
+                reload: true,
+            }
+        });
+    }
+
+    /// Searches the server for older messages that were never downloaded.
+    pub(crate) fn search_server(&mut self) {
+        let query = self.query.trim().to_owned();
+        if query.is_empty() {
+            self.notice = Some("Type a search first.".into());
+            return;
+        }
+        let (root, remote) = match self.current_account_store() {
+            Ok((root, Some(remote))) => (root, remote),
+            Ok(_) => {
+                self.notice = Some("This account has no server to search.".into());
+                return;
+            }
+            Err(error) => {
+                self.notice = Some(error);
+                return;
+            }
+        };
+        self.notice = Some("Searching the server…".into());
+        self.spawn_task(move || {
+            let message = match imap_client::search_server(&remote, &root, &query, 50) {
+                Ok(0) => "No older matches on the server".to_owned(),
+                Ok(count) => format!("Downloaded {count} older matches from the server"),
+                Err(error) => format!("Server search failed · {error}"),
+            };
+            Task::Done {
+                message,
+                reload: true,
+            }
+        });
+    }
+
+    /// Downloads the body of a message that arrived as headers only.
+    pub(crate) fn download_full_message(&mut self) {
+        let Some(mail) = self
+            .reader
+            .as_ref()
+            .and_then(|reader| self.mails.iter().find(|mail| mail.id == reader.mail_id()))
+            .cloned()
+        else {
+            return;
+        };
+        if !mail.partial {
+            self.notice = Some("This message is already complete.".into());
+            return;
+        }
+        let Some(path) = mail.source_path.clone() else {
+            return;
+        };
+        let account = self
+            .remote_accounts()
+            .into_iter()
+            .find(|(_, _, root)| path.starts_with(root));
+        let Some((_, remote, root)) = account else {
+            self.notice = Some("This message has no server to download from.".into());
+            return;
+        };
+        self.notice = Some("Downloading the full message…".into());
+        self.spawn_task(move || Task::Downloaded {
+            mail_id: mail.id,
+            result: imap_client::download_full(&remote, &root, &path)
+                .map(|_| ())
+                .map_err(|error| format!("Download failed · {error}")),
+        });
+    }
+
+    /// Uploads local messages that were held back at the account's first sync.
+    pub(crate) fn upload_held(&mut self) {
+        let accounts: Vec<_> = self
+            .remote_accounts()
+            .into_iter()
+            .filter(|(_, remote, root)| self.shows_maildir(root) && remote.has_credentials())
+            .collect();
+        if accounts.is_empty() {
+            self.notice = Some("This account has no server to upload to.".into());
+            return;
+        }
+        self.notice = Some("Uploading local messages…".into());
+        for (_, remote, root) in accounts {
+            self.spawn_task(move || {
+                let options = imap_client::SyncOptions { upload_held: true };
+                let message = match imap_client::sync_with(&remote, &root, options) {
+                    Ok(synced) => synced.summary,
+                    Err(error) => format!("Upload failed · {error}"),
+                };
+                Task::Done {
+                    message,
+                    reload: true,
+                }
+            });
+        }
     }
 
     /// Half-block pictures are ordinary cells that redraw cleanly; graphics protocols
@@ -336,10 +483,6 @@ impl App {
     }
 
     pub(crate) fn mark_folder_read(&mut self) {
-        if self.sending {
-            self.notice = Some("Wait for the current send before changing messages.".into());
-            return;
-        }
         let indices: Vec<usize> = self
             .mails
             .iter()

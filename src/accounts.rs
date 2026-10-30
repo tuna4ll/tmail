@@ -28,7 +28,7 @@ impl App {
     }
 
     pub(crate) fn open_account_setup(&mut self, mode: account_setup::Mode) {
-        if self.sending {
+        if !self.sending.is_empty() {
             self.notice =
                 Some("Wait for sending to finish before changing account settings.".into());
             return;
@@ -251,7 +251,7 @@ impl App {
     }
 
     pub(crate) fn remove_account(&mut self, index: usize) {
-        if self.sending {
+        if !self.sending.is_empty() {
             self.notice = Some("Wait for sending to finish before removing an account.".into());
             return;
         }

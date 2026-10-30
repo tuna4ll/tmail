@@ -4,10 +4,6 @@ use super::*;
 
 impl App {
     pub(crate) fn retry_outbox(&mut self) {
-        if self.sending {
-            self.notice = Some("A message is still being sent.".into());
-            return;
-        }
         let Some(mail_id) = self.active_mail_id() else {
             return;
         };
@@ -15,6 +11,20 @@ impl App {
             return;
         };
         let mail = self.mails[index].clone();
+        if self.is_sending(&mail) {
+            self.notice = Some("This message is still being sent.".into());
+            return;
+        }
+        self.deliver_mail(mail);
+    }
+
+    fn is_sending(&self, mail: &Mail) -> bool {
+        mail.source_path
+            .as_ref()
+            .is_some_and(|path| self.sending.contains(path))
+    }
+
+    fn deliver_mail(&mut self, mail: Mail) {
         let (source, command, account) = match self.delivery_account(&mail) {
             Ok(account) => account,
             Err(error) => {
@@ -31,16 +41,47 @@ impl App {
         });
     }
 
-    pub(crate) fn review_delivery(&mut self) {
-        if self.sending {
+    /// Retries Outbox messages that failed temporarily once their backoff has passed.
+    pub(crate) fn retry_due_deliveries(&mut self) {
+        if self.last_retry_check.elapsed() < Duration::from_secs(30) {
             return;
         }
+        self.last_retry_check = std::time::Instant::now();
+        let due: Vec<Mail> = self
+            .mails
+            .iter()
+            .filter(|mail| mail_folder(mail) == "Outbox" && !self.is_sending(mail))
+            .filter(|mail| {
+                let root = match (&self.source, mail.account.as_deref()) {
+                    (MailboxSource::Maildir(root), _) => Some(root.clone()),
+                    (MailboxSource::Unified(accounts), Some(id)) => accounts
+                        .iter()
+                        .find(|(account, _)| account == id)
+                        .map(|(_, root)| root.clone()),
+                    _ => None,
+                };
+                match (root, &mail.source_path) {
+                    (Some(root), Some(path)) => outbox::retry_due(&root, path),
+                    _ => false,
+                }
+            })
+            .cloned()
+            .collect();
+        for mail in due {
+            self.deliver_mail(mail);
+        }
+    }
+
+    pub(crate) fn review_delivery(&mut self) {
         let Some(id) = self.active_mail_id() else {
             return;
         };
         let Some(mail) = self.mails.iter().find(|mail| mail.id == id).cloned() else {
             return;
         };
+        if self.is_sending(&mail) {
+            return;
+        }
         match self.delivery_account(&mail) {
             Ok((source, command, account)) => {
                 self.overlay = Some(Overlay::DeliveryReview {
@@ -190,7 +231,7 @@ impl App {
                 if !self.watchers.contains_key(&id) && remote.sync_interval_secs > 0 {
                     self.watch_account(id.clone(), remote);
                 }
-                if visible && (synced.changed || manual) {
+                if visible && (synced.changed || manual || synced.held > 0) {
                     self.notice = Some(synced.summary);
                     self.reload();
                 } else if !visible && synced.downloaded > 0 {
@@ -300,16 +341,25 @@ impl App {
             return;
         }
         delivery.remote = config.remote;
-        self.sending = true;
-        self.notice = Some("Sending message…".into());
+        let path = delivery.mail.source_path.clone();
+        if let Some(path) = &path {
+            self.sending.insert(path.clone());
+        }
+        self.notice = Some(if self.sending.len() > 1 {
+            format!("Sending {} messages…", self.sending.len())
+        } else {
+            "Sending message…".into()
+        });
         let sender = self.delivery_tx.clone();
         tokio::spawn(async move {
-            let _ = sender.send(delivery.run().await);
+            let _ = sender.send((path, delivery.run().await));
         });
     }
 
-    pub(crate) fn finish_delivery(&mut self, notice: String) {
-        self.sending = false;
+    pub(crate) fn finish_delivery(&mut self, path: Option<PathBuf>, notice: String) {
+        if let Some(path) = path {
+            self.sending.remove(&path);
+        }
         self.notice = Some(notice);
         self.reload();
     }

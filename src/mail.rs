@@ -42,6 +42,59 @@ pub struct Mail {
     pub mailbox: Option<String>,
     #[serde(skip)]
     pub delivery_status: Option<String>,
+    /// Only the headers were downloaded; the body can be fetched on request.
+    #[serde(default)]
+    pub partial: bool,
+    /// How the sender lets recipients leave a mailing list.
+    #[serde(default)]
+    pub unsubscribe: Option<Unsubscribe>,
+}
+
+/// The `List-Unsubscribe` choices of a message (RFC 2369 and RFC 8058).
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Unsubscribe {
+    pub links: Vec<String>,
+    /// The sender accepts a single HTTPS POST without a confirmation page.
+    pub one_click: bool,
+}
+
+impl Unsubscribe {
+    pub fn parse(header: &str, post: Option<&str>) -> Option<Self> {
+        let links: Vec<String> = header
+            .split(',')
+            .filter_map(|part| {
+                let link = part.trim().strip_prefix('<')?.strip_suffix('>')?.trim();
+                let lower = link.to_ascii_lowercase();
+                (lower.starts_with("https://")
+                    || lower.starts_with("http://")
+                    || lower.starts_with("mailto:"))
+                .then(|| link.to_owned())
+            })
+            .collect();
+        if links.is_empty() {
+            return None;
+        }
+        let one_click = post.is_some_and(|value| {
+            value
+                .replace(char::is_whitespace, "")
+                .eq_ignore_ascii_case("List-Unsubscribe=One-Click")
+        });
+        Some(Self { links, one_click })
+    }
+
+    pub fn https(&self) -> Option<&str> {
+        self.links
+            .iter()
+            .find(|link| link.to_ascii_lowercase().starts_with("https://"))
+            .map(String::as_str)
+    }
+
+    pub fn mailto(&self) -> Option<&str> {
+        self.links
+            .iter()
+            .find(|link| link.to_ascii_lowercase().starts_with("mailto:"))
+            .map(String::as_str)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -242,6 +295,8 @@ impl Mail {
             source_path: None,
             mailbox: None,
             delivery_status: None,
+            partial: false,
+            unsubscribe: None,
         }
     }
 

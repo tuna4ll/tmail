@@ -172,6 +172,31 @@ impl Journal {
     }
 }
 
+/// Temporary failures are retried this many times before waiting for the user.
+pub const AUTOMATIC_RETRIES: u32 = 6;
+
+/// Whether a temporarily failed message is due for another automatic attempt. The wait
+/// doubles from one minute up to an hour.
+pub fn retry_due(root: &Path, message: &Path) -> bool {
+    let Ok(path) = status_path(root, message) else {
+        return false;
+    };
+    let Ok(Some(record)) = fs::read_to_string(path).map(|value| read_record(&value).ok().flatten())
+    else {
+        return false;
+    };
+    if record.state != State::Failed(FailureKind::Temporary) || record.attempts >= AUTOMATIC_RETRIES
+    {
+        return false;
+    }
+    let wait = (60u64 << record.attempts.saturating_sub(1).min(6)).min(3600);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.saturating_sub(record.updated) >= wait
+}
+
 pub fn describe(root: &Path, message: &Path) -> String {
     let result = status_path(root, message).and_then(|path| match fs::read_to_string(path) {
         Ok(value) if value == "sending" => {
@@ -188,6 +213,11 @@ pub fn describe(root: &Path, message: &Path) -> String {
                     State::Sent => "Sent · retry to save the Sent copy",
                     State::CopyingSent => "Sent · remote copy unconfirmed · retry to check",
                     State::CopiedSent => "Sent · remote copy saved · retry to finish locally",
+                    State::Failed(FailureKind::Temporary)
+                        if record.attempts < AUTOMATIC_RETRIES =>
+                    {
+                        "Temporary failure · retrying automatically"
+                    }
                     State::Failed(FailureKind::Temporary) => "Temporary failure · press x to retry",
                     State::Failed(FailureKind::Configuration) => {
                         "Setup error · fix sender settings before retrying"

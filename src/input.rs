@@ -104,6 +104,10 @@ impl App {
         if self.searching {
             match key.code {
                 KeyCode::Enter => self.searching = false,
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.searching = false;
+                    self.search_server();
+                }
                 KeyCode::Esc => {
                     self.searching = false;
                     self.query.clear();
@@ -201,6 +205,10 @@ impl App {
             }
             KeyCode::Char('O') if self.reader.is_some() => {
                 self.open_in_browser();
+                return;
+            }
+            KeyCode::Char('D') if self.reader.is_some() => {
+                self.download_full_message();
                 return;
             }
             _ => {}
@@ -441,8 +449,42 @@ impl App {
                 selected,
                 items,
                 moving,
+                deleting,
             } => match key.code {
                 KeyCode::Esc => {}
+                KeyCode::Char('n') if !*moving => {
+                    self.overlay = Some(Overlay::Prompt {
+                        kind: PromptKind::NewFolder,
+                        input: String::new(),
+                    });
+                }
+                KeyCode::Char('e') if !*moving => match items.get(*selected) {
+                    Some(folder) if !is_standard_folder(&folder.name) => {
+                        self.overlay = Some(Overlay::Prompt {
+                            input: folder.name.replace('.', "/"),
+                            kind: PromptKind::RenameFolder(folder.name.clone()),
+                        });
+                    }
+                    _ => {
+                        self.notice = Some("Standard folders cannot be renamed.".into());
+                        self.overlay = Some(overlay);
+                    }
+                },
+                KeyCode::Char('x') if !*moving => match items.get(*selected) {
+                    Some(folder) if is_standard_folder(&folder.name) => {
+                        self.notice = Some("Standard folders cannot be deleted.".into());
+                        self.overlay = Some(overlay);
+                    }
+                    Some(folder) if *deleting => {
+                        let local = format!(".{}", folder.name);
+                        self.change_folder(imap_client::FolderChange::Delete(local));
+                    }
+                    Some(_) => {
+                        *deleting = true;
+                        self.overlay = Some(overlay);
+                    }
+                    None => self.overlay = Some(overlay),
+                },
                 KeyCode::Enter => {
                     if let Some(folder) = items.get(*selected) {
                         if *moving {
@@ -456,6 +498,32 @@ impl App {
                     }
                 }
                 _ => self.overlay = Some(overlay),
+            },
+            Overlay::Prompt { kind, input } => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => {
+                    let name = input.trim().trim_matches('/').to_owned();
+                    if name.is_empty() || name.split('/').any(|part| part.trim().is_empty()) {
+                        self.notice = Some("Enter a folder name.".into());
+                        self.overlay = Some(overlay);
+                    } else if is_standard_folder(&name) {
+                        self.notice = Some("That name is taken by a standard folder.".into());
+                        self.overlay = Some(overlay);
+                    } else {
+                        let change = match kind {
+                            PromptKind::NewFolder => imap_client::FolderChange::Create(name),
+                            PromptKind::RenameFolder(folder) => imap_client::FolderChange::Rename {
+                                local: format!(".{folder}"),
+                                name,
+                            },
+                        };
+                        self.change_folder(change);
+                    }
+                }
+                _ => {
+                    edit_text(input, key);
+                    self.overlay = Some(overlay);
+                }
             },
             Overlay::Links { selected, items } => match key.code {
                 KeyCode::Esc => {}
@@ -543,6 +611,14 @@ impl App {
             "login" => self.open_account_setup(account_setup::Mode::Login),
             "reload" => self.reload(),
             "sync" => self.start_sync(),
+            "upload" => self.upload_held(),
+            "search server" => self.search_server(),
+            "folder new" => {
+                self.overlay = Some(Overlay::Prompt {
+                    kind: PromptKind::NewFolder,
+                    input: String::new(),
+                });
+            }
             "mark read" => self.mark_folder_read(),
             "filter all" => {
                 self.filter = InboxFilter::All;
@@ -627,6 +703,15 @@ pub(crate) fn delete_word(value: &mut String) {
         .find(|(_, character)| character.is_whitespace() || ",;".contains(*character))
         .map_or(0, |(index, character)| index + character.len_utf8());
     value.truncate(start);
+}
+
+/// Folders every account has; they map to server roles and cannot be changed.
+pub(crate) fn is_standard_folder(name: &str) -> bool {
+    [
+        "INBOX", "Drafts", "Sent", "Archive", "Trash", "Outbox", "Junk",
+    ]
+    .iter()
+    .any(|standard| standard.eq_ignore_ascii_case(name))
 }
 
 pub(crate) fn action_key(key: KeyEvent, expected: char) -> bool {

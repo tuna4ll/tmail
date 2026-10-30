@@ -7,11 +7,7 @@ use std::{
 };
 
 use directories::ProjectDirs;
-use mail_parser::{
-    Address, MessageParser, MimeHeaders,
-    decoders::html::html_to_text,
-    mailbox::maildir::{Flag, FolderIterator},
-};
+use mail_parser::{Address, MessageParser, MimeHeaders, decoders::html::html_to_text};
 use serde::{Deserialize, Serialize};
 
 use crate::mail::{Attachment, Mail, demo_mails};
@@ -43,12 +39,102 @@ pub struct MaildirChange {
     after: PathBuf,
 }
 
+/// A parsed message, keyed by the unique part of its file name so flag changes and
+/// moves between folders reuse it. Size and modification time detect rewrites.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CachedMessage {
-    internal_date: u64,
-    length: usize,
-    digest: u64,
+    modified: u128,
+    length: u64,
     mail: Mail,
+}
+
+/// A message file found while scanning, before it is read.
+struct Entry {
+    path: PathBuf,
+    base: String,
+    unread: bool,
+    starred: bool,
+    modified: u128,
+    seconds: u64,
+    length: u64,
+}
+
+/// The Maildir++ folders under `root`: the Inbox itself and every `.Name` folder.
+fn maildir_folders(root: &Path) -> io::Result<Vec<(String, PathBuf)>> {
+    fn walk(
+        directory: &Path,
+        names: &mut Vec<String>,
+        found: &mut Vec<(String, PathBuf)>,
+    ) -> io::Result<()> {
+        let mut entries: Vec<_> = fs::read_dir(directory)?.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(name) = name.strip_prefix('.') else {
+                continue;
+            };
+            if name.is_empty() || !path.is_dir() {
+                continue;
+            }
+            names.push(name.to_owned());
+            if path.join("cur").is_dir() && path.join("new").is_dir() {
+                found.push((names.join("."), path.clone()));
+            }
+            walk(&path, names, found)?;
+            names.pop();
+        }
+        Ok(())
+    }
+    let mut found = Vec::new();
+    if root.join("cur").is_dir() {
+        found.push(("INBOX".to_owned(), root.to_path_buf()));
+    }
+    walk(root, &mut Vec::new(), &mut found)?;
+    Ok(found)
+}
+
+fn scan_folder(folder: &Path) -> io::Result<Vec<Entry>> {
+    let mut entries = Vec::new();
+    for child in ["cur", "new"] {
+        let directory = match fs::read_dir(folder.join(child)) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in directory.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .unwrap_or_default();
+            let (base, flags, _) = crate::storage::maildir_info(&name);
+            entries.push(Entry {
+                path: entry.path(),
+                base: base.to_owned(),
+                unread: !flags.contains('S'),
+                starred: flags.contains('F'),
+                modified: modified.as_nanos(),
+                seconds: modified.as_secs(),
+                length: metadata.len(),
+            });
+        }
+    }
+    Ok(entries)
 }
 
 impl MailboxSource {
@@ -323,7 +409,7 @@ impl From<io::Error> for LoadError {
     }
 }
 
-fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
+fn load_maildir(path: &Path) -> Result<LoadReport, LoadError> {
     let mut mails = Vec::new();
     let mut folders = Vec::new();
     let mut skipped = crate::outbox::recover(path);
@@ -331,28 +417,35 @@ fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
     let cache = load_cache(path).unwrap_or_default();
     let mut next_cache = BTreeMap::new();
 
-    for folder in FolderIterator::new(path, Some("."))? {
-        let folder = folder?;
-        let mailbox = folder.name().unwrap_or("INBOX").to_owned();
+    let mut dirty = false;
+    for (mailbox, folder) in maildir_folders(path)? {
         folders.push(mailbox.clone());
-        for message in folder {
+        for entry in scan_folder(&folder)? {
             attempted += 1;
-            let message = message?;
-            let cache_key = message.path().to_string_lossy().into_owned();
-            if let Some(cached) = cache.get(&cache_key)
-                && cached.internal_date == message.internal_date()
-                && cached.length == message.contents().len()
-                && cached.digest == content_digest(message.contents())
+            if let Some(cached) = cache.get(&entry.base)
+                && cached.modified == entry.modified
+                && cached.length == entry.length
             {
-                mails.push(cached.mail.clone());
-                next_cache.insert(cache_key, cached.clone());
+                // Flags and location come from the file name, so renames reuse the parse.
+                let mut mail = cached.mail.clone();
+                mail.unread = entry.unread;
+                mail.starred = entry.starred;
+                mail.source_path = Some(entry.path.clone());
+                mail.mailbox = Some(mailbox.clone());
+                next_cache.insert(entry.base, cached.clone());
+                mails.push(mail);
                 continue;
             }
-            let Some(parsed) = MessageParser::default().parse(message.contents()) else {
-                skipped.push(message.path().display().to_string());
+            dirty = true;
+            let Ok(contents) = fs::read(&entry.path) else {
+                skipped.push(entry.path.display().to_string());
                 continue;
             };
-            let fallback_id = message.path().display().to_string();
+            let Some(parsed) = MessageParser::default().parse(&contents) else {
+                skipped.push(entry.path.display().to_string());
+                continue;
+            };
+            let fallback_id = entry.path.display().to_string();
             let id = parsed.message_id().map(clean_id).unwrap_or(fallback_id);
             let from = parsed
                 .from()
@@ -365,7 +458,7 @@ fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
             let timestamp = parsed
                 .date()
                 .map(|date| date.to_timestamp())
-                .or_else(|| Some(message.internal_date() as i64));
+                .or(Some(entry.seconds as i64));
             let reply_to = parsed.in_reply_to().as_text().map(clean_id);
             let references = parsed
                 .references()
@@ -375,8 +468,8 @@ fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
                 .map(|value| clean_id(value))
                 .collect();
             let reply_address = parsed.reply_to().map(format_addresses).unwrap_or_default();
-            let unread = !message.flags().contains(&Flag::Seen);
-            let starred = message.flags().contains(&Flag::Flagged);
+            let unread = entry.unread;
+            let starred = entry.starred;
             let html = parsed.html_body_count() > 0;
             let html_body = parsed.body_html(0);
             let body = parsed
@@ -426,16 +519,24 @@ fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
                 links,
                 html,
                 account: None,
-                source_path: Some(message.path().to_path_buf()),
+                source_path: Some(entry.path.clone()),
                 mailbox: Some(mailbox.clone()),
                 delivery_status: None,
+                partial: parsed
+                    .header_raw(crate::imap_client::PARTIAL_HEADER)
+                    .is_some(),
+                unsubscribe: parsed.header_raw("List-Unsubscribe").and_then(|value| {
+                    crate::mail::Unsubscribe::parse(
+                        &value.replace(['\r', '\n'], ""),
+                        parsed.header_raw("List-Unsubscribe-Post"),
+                    )
+                }),
             };
             next_cache.insert(
-                cache_key,
+                entry.base,
                 CachedMessage {
-                    internal_date: message.internal_date(),
-                    length: message.contents().len(),
-                    digest: content_digest(message.contents()),
+                    modified: entry.modified,
+                    length: entry.length,
                     mail: mail.clone(),
                 },
             );
@@ -451,7 +552,9 @@ fn load_maildir(path: &PathBuf) -> Result<LoadReport, LoadError> {
             mail.delivery_status = Some(crate::outbox::describe(path, source));
         }
     }
-    let _ = save_cache(path, &next_cache);
+    if dirty || next_cache.len() != cache.len() {
+        let _ = save_cache(path, &next_cache);
+    }
     Ok(LoadReport {
         mails,
         folders,
@@ -495,6 +598,53 @@ fn load_unified(accounts: &[(String, PathBuf)]) -> Result<LoadReport, LoadError>
 /// Caches older than this belong to Maildirs that are no longer opened.
 const CACHE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60 * 60 * 24 * 30);
 
+/// Creates, renames or deletes a folder of a Maildir that does not sync.
+pub fn change_local_folder(
+    root: &Path,
+    change: &crate::imap_client::FolderChange,
+) -> Result<String, String> {
+    use crate::imap_client::{FolderChange, local_name};
+    let children = |local: &str| -> Vec<String> {
+        fs::read_dir(root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .filter(|name| name == local || name.starts_with(&format!("{local}.")))
+            .collect()
+    };
+    match change {
+        FolderChange::Create(name) => {
+            let folder = root.join(local_name(name));
+            if folder.exists() {
+                return Err("That folder already exists.".into());
+            }
+            for child in ["cur", "new", "tmp"] {
+                fs::create_dir_all(folder.join(child)).map_err(|error| error.to_string())?;
+            }
+            Ok(format!("Created {name}"))
+        }
+        FolderChange::Rename { local, name } => {
+            let target = local_name(name);
+            if root.join(&target).exists() {
+                return Err("That folder already exists.".into());
+            }
+            for folder in children(local) {
+                let renamed = format!("{target}{}", &folder[local.len()..]);
+                fs::rename(root.join(&folder), root.join(renamed))
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(format!("Renamed to {name}"))
+        }
+        FolderChange::Delete(local) => {
+            for folder in children(local) {
+                fs::remove_dir_all(root.join(folder)).map_err(|error| error.to_string())?;
+            }
+            Ok("Folder deleted".into())
+        }
+    }
+}
+
 fn cache_dir() -> Option<PathBuf> {
     if cfg!(test) {
         return Some(std::env::temp_dir().join("termail-test-cache"));
@@ -505,7 +655,7 @@ fn cache_dir() -> Option<PathBuf> {
 fn cache_path(maildir: &Path) -> Option<PathBuf> {
     let mut hasher = DefaultHasher::new();
     maildir.hash(&mut hasher);
-    cache_dir().map(|dir| dir.join(format!("maildir-v5-{:016x}.json", hasher.finish())))
+    cache_dir().map(|dir| dir.join(format!("maildir-v6-{:016x}.json", hasher.finish())))
 }
 
 /// Removes caches nobody has opened for a month.

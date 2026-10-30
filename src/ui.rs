@@ -223,7 +223,12 @@ impl App {
         } else if let Some(notice) = &self.notice {
             action_line(notice, self.undo.is_some())
         } else if self.searching {
-            status_line(&[("type", "search"), ("enter", "apply"), ("esc", "clear")])
+            status_line(&[
+                ("type", "search"),
+                ("enter", "apply"),
+                ("ctrl+r", "search server"),
+                ("esc", "clear"),
+            ])
         } else if self.reader.is_some() {
             status_line(&[
                 ("j/k", "scroll"),
@@ -289,10 +294,23 @@ impl App {
             Overlay::Folders { moving: true, .. } => {
                 &[("j/k", "select"), ("enter", "move here"), ("esc", "cancel")]
             }
-            Overlay::Links { .. } => &[("j/k", "select"), ("enter", "open"), ("y", "copy")],
-            Overlay::Folders { .. } | Overlay::Accounts { .. } => {
-                &[("j/k", "select"), ("enter", "open"), ("esc", "cancel")]
+            Overlay::Folders { deleting: true, .. } => {
+                &[("x", "delete folder and its mail"), ("esc", "cancel")]
             }
+            Overlay::Folders { .. } => &[
+                ("enter", "open"),
+                ("n", "new"),
+                ("e", "rename"),
+                ("x", "delete"),
+                ("esc", "close"),
+            ],
+            Overlay::Prompt { .. } => &[
+                ("type", "name · / for subfolders"),
+                ("enter", "save"),
+                ("esc", "cancel"),
+            ],
+            Overlay::Links { .. } => &[("j/k", "select"), ("enter", "open"), ("y", "copy")],
+            Overlay::Accounts { .. } => &[("j/k", "select"), ("enter", "open"), ("esc", "cancel")],
             Overlay::Attachments { .. } => &[("j/k", "select"), ("s", "save"), ("o", "open")],
             Overlay::Compose(_) => &[
                 ("tab", "next field or accept ⇥"),
@@ -473,7 +491,7 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
         ),
         Overlay::DeliveryReview { .. } => (72, 12),
         Overlay::Help { .. } => (66, 23),
-        Overlay::Command(_) => (64, 3),
+        Overlay::Command(_) | Overlay::Prompt { .. } => (64, 3),
         Overlay::DraftReady { summary, .. } => (68, 11 + summary.warnings.len() as u16),
         Overlay::ComposeClose(_) => (58, 7),
         Overlay::Folders { items, .. } => (50, (items.len() as u16 + 2).min(18)),
@@ -598,10 +616,29 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                 area,
             );
         }
+        Overlay::Prompt { kind, input } => {
+            let title = match kind {
+                PromptKind::NewFolder => " new folder ".to_owned(),
+                PromptKind::RenameFolder(name) => format!(" rename {name} "),
+            };
+            frame.render_widget(
+                Paragraph::new(format!("{input}_"))
+                    .style(theme::text())
+                    .block(
+                        Block::bordered()
+                            .border_style(theme::border(true))
+                            .title_style(theme::title(true))
+                            .title(title)
+                            .bg(theme::SURFACE),
+                    ),
+                area,
+            );
+        }
         Overlay::Folders {
             selected,
             items,
             moving,
+            deleting,
         } => {
             let rows: Vec<ListItem> = items
                 .iter()
@@ -620,7 +657,13 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                     Block::bordered()
                         .border_style(theme::border(true))
                         .title_style(theme::title(true))
-                        .title(if *moving { " move to " } else { " folders " })
+                        .title(if *moving {
+                            " move to "
+                        } else if *deleting {
+                            " press x again to delete the folder and its mail "
+                        } else {
+                            " folders · n new · e rename · x delete "
+                        })
                         .bg(theme::SURFACE),
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
