@@ -7,6 +7,8 @@ pub(crate) struct CliOptions {
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) doctor: bool,
     pub(crate) log: Option<PathBuf>,
+    /// `oauth [ACCOUNT]`: sign in with OAuth2 and store the refresh token.
+    pub(crate) oauth: Option<Option<String>>,
 }
 
 pub(crate) fn parse_options(
@@ -17,6 +19,7 @@ pub(crate) fn parse_options(
     let mut config_path = None;
     let mut doctor = false;
     let mut log = None;
+    let mut oauth = None;
 
     while let Some(argument) = args.next() {
         match argument.to_str() {
@@ -40,6 +43,10 @@ pub(crate) fn parse_options(
             }
             Some("--demo") => source = Some(MailboxSource::Demo),
             Some("doctor") => doctor = true,
+            Some("oauth") => oauth = Some(None),
+            Some(value) if oauth == Some(None) && !value.starts_with('-') => {
+                oauth = Some(Some(value.to_owned()));
+            }
             Some("--help" | "-h") => return Ok(None),
             Some(value) => return Err(color_eyre::eyre::eyre!("unknown option: {value}")),
             None => return Err(color_eyre::eyre::eyre!("option is not valid utf-8")),
@@ -51,17 +58,21 @@ pub(crate) fn parse_options(
         config_path,
         doctor,
         log,
+        oauth,
     }))
 }
 
 pub(crate) fn print_help() {
-    println!("termail [doctor] [--config PATH] [--log PATH] [--demo | --maildir PATH]");
+    println!(
+        "termail [doctor | oauth [ACCOUNT]] [--config PATH] [--log PATH] [--demo | --maildir PATH]"
+    );
     println!();
     println!("  --demo          open the built-in mailbox");
     println!("  --maildir PATH  open a Maildir mailbox");
     println!("  --config PATH   load a config file");
     println!("  --log PATH      append connection errors to a file (or set TERMAIL_LOG)");
     println!("  doctor          check account, Maildir, editor, and sender setup");
+    println!("  oauth [ACCOUNT] sign in through the provider's page and keep the refresh token");
 }
 
 pub(crate) fn expand_path(value: &str) -> PathBuf {

@@ -1,16 +1,19 @@
 mod account_setup;
 mod complete;
 mod config;
+mod crypto;
 mod delivery;
 mod doctor;
 mod draft;
 #[cfg(test)]
 mod fake_imap;
 mod imap_client;
+mod keymap;
 mod log;
 mod mail;
 mod mailbox;
 mod message;
+mod oauth;
 mod outbox;
 mod remote;
 mod sender;
@@ -84,6 +87,15 @@ async fn main() -> color_eyre::Result<()> {
     log::init(options.log.clone())?;
     mailbox::prune_caches();
     let config = Config::load(options.config_path.as_deref())?;
+    theme::init(&config.theme).map_err(color_eyre::eyre::Error::msg)?;
+    keymap::Keymap::from_config(&config.keys).map_err(color_eyre::eyre::Error::msg)?;
+    if let Some(account) = &options.oauth {
+        if let Err(error) = oauth::run(&config, account.as_deref()) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if options.doctor {
         if !doctor::run(&config) {
             std::process::exit(1);
@@ -194,10 +206,26 @@ pub struct App {
     notice: Option<String>,
     mailbox_fingerprint: u64,
     pending_editor: Option<ComposeState>,
+    /// Work that needs the terminal, such as a passphrase prompt.
+    pending_terminal: Option<TerminalJob>,
+    keymap: keymap::Keymap,
+    /// Decrypted or verified content by message, kept only in memory.
+    opened: std::collections::HashMap<String, Result<(Vec<u8>, String), String>>,
     overlay: Option<Overlay>,
     config: Config,
     active_folder: String,
     account_label: String,
+}
+
+/// Work that runs with the terminal restored, so programs such as pinentry can use it.
+enum TerminalJob {
+    /// Signs or encrypts a message, then queues it.
+    Protect {
+        state: Box<ComposeState>,
+        contents: Vec<u8>,
+    },
+    /// Decrypts a message for the reader.
+    Open(String),
 }
 
 /// Results of blocking work done off the UI thread.
@@ -210,6 +238,11 @@ enum Task {
     },
     /// Shows a message and optionally reloads the mailbox.
     Done { message: String, reload: bool },
+    /// A signed message was checked.
+    Opened {
+        mail_id: String,
+        result: Result<(Vec<u8>, String), String>,
+    },
     /// A partial message finished downloading.
     Downloaded {
         mail_id: String,
@@ -271,6 +304,10 @@ enum Overlay {
         moving: bool,
         /// The highlighted folder is deleted when x is pressed again.
         deleting: bool,
+    },
+    /// Confirms leaving a mailing list.
+    Unsubscribe {
+        unsubscribe: mail::Unsubscribe,
     },
     /// Asks for one line of text, such as a folder name.
     Prompt {
@@ -341,12 +378,16 @@ struct ComposeState {
     account: Option<usize>,
     /// The focused field's value with its last entry completed; tab accepts it.
     suggestion: Option<String>,
+    /// Signing and encryption applied when the message is sent.
+    protection: crypto::Protection,
 }
 
 impl ComposeState {
-    const FIELD_COUNT: usize = 7;
+    const FIELD_COUNT: usize = 8;
     const FORMAT_FIELD: usize = 4;
-    const BODY_FIELD: usize = 6;
+    const SECURITY_FIELD: usize = 5;
+    const FILES_FIELD: usize = 6;
+    const BODY_FIELD: usize = 7;
 
     fn value_mut(&mut self) -> Option<&mut String> {
         match self.field {
@@ -354,7 +395,7 @@ impl ComposeState {
             1 => Some(&mut self.composer.cc),
             2 => Some(&mut self.composer.bcc),
             3 => Some(&mut self.composer.subject),
-            5 => Some(&mut self.composer.attachments),
+            Self::FILES_FIELD => Some(&mut self.composer.attachments),
             _ => None,
         }
     }
@@ -475,6 +516,9 @@ impl App {
             notice: None,
             mailbox_fingerprint: 0,
             pending_editor: None,
+            pending_terminal: None,
+            keymap: keymap::Keymap::from_config(&config.keys).unwrap_or_default(),
+            opened: Default::default(),
             overlay: None,
             config,
             active_folder: "INBOX".into(),
@@ -554,6 +598,9 @@ impl App {
             if let Some(state) = self.pending_editor.take() {
                 terminal = self.edit_composer_body(state)?;
             }
+            if let Some(job) = self.pending_terminal.take() {
+                terminal = self.run_terminal_job(job)?;
+            }
         }
 
         Ok(())
@@ -599,6 +646,7 @@ impl App {
                     self.reload();
                 }
             }
+            Task::Opened { mail_id, result } => self.show_opened(mail_id, result),
             Task::Downloaded { mail_id, result } => match result {
                 Ok(()) => {
                     self.notice = Some("Full message downloaded".into());
@@ -966,6 +1014,7 @@ mod tests {
                 error: None,
                 account: None,
                 suggestion: None,
+                protection: crate::crypto::Protection::default(),
             },
             false,
         );
@@ -1270,6 +1319,7 @@ mod tests {
             error: None,
             account: None,
             suggestion: None,
+            protection: crate::crypto::Protection::default(),
         }));
 
         assert!(screen.contains("From"));

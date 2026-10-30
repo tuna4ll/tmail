@@ -82,6 +82,7 @@ impl App {
                             error: None,
                             account,
                             suggestion: None,
+                            protection: crypto::Protection::default(),
                         }))
                     }
                     Err(error) => self.notice = Some(format!("Unable to open draft: {error}")),
@@ -98,7 +99,54 @@ impl App {
             self.selected = index;
             self.reader = Some(Reader::new(mail_id.into()));
             self.mark_seen(mail_id);
+            self.open_protected(mail_id);
         }
+    }
+
+    /// Decrypts or verifies a protected message for the reader. Decryption may ask for
+    /// a passphrase, so it borrows the terminal; checking a signature runs in the
+    /// background.
+    pub(crate) fn open_protected(&mut self, mail_id: &str) {
+        if let Some(result) = self.opened.get(mail_id).cloned() {
+            self.show_opened(mail_id.to_owned(), result);
+            return;
+        }
+        let Some(mail) = self.mails.iter().find(|mail| mail.id == mail_id) else {
+            return;
+        };
+        let (Some(kind), Some(path)) = (mail.security, mail.source_path.clone()) else {
+            return;
+        };
+        if kind.needs_secret() {
+            self.pending_terminal = Some(TerminalJob::Open(mail_id.to_owned()));
+            return;
+        }
+        let crypto = self.config.crypto.clone();
+        let mail_id = mail_id.to_owned();
+        self.spawn_task(move || Task::Opened {
+            result: fs::read(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|contents| crypto::open(&contents, kind, &crypto))
+                .map(|opened| (opened.content, opened.status)),
+            mail_id,
+        });
+    }
+
+    pub(crate) fn show_opened(
+        &mut self,
+        mail_id: String,
+        result: Result<(Vec<u8>, String), String>,
+    ) {
+        if let Some(reader) = &mut self.reader
+            && reader.mail_id() == mail_id
+        {
+            match &result {
+                Ok((content, status)) => reader.set_opened(content.clone(), status.clone()),
+                Err(error) => reader.set_security(format!("⚠ {error}")),
+            }
+            self.clear_screen = true;
+        }
+        self.opened.insert(mail_id, result);
     }
 
     /// Opening a message marks it read, like other mail clients do.

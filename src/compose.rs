@@ -26,8 +26,24 @@ impl App {
         };
         let (_, config) = self.compose_context(account);
         // Unified views prefix message IDs with the account; replies need the real ones.
+        let opened = mail.and_then(|mail| match self.opened.get(&mail.id) {
+            Some(Ok((content, _))) => mail_parser::MessageParser::default()
+                .parse(content)
+                .and_then(|message| message.body_text(0).map(|text| text.into_owned())),
+            _ => None,
+        });
+        let encrypted = mail.is_some_and(|mail| {
+            matches!(
+                mail.security,
+                Some(crypto::Kind::PgpEncrypted | crypto::Kind::SmimeEncrypted)
+            )
+        });
         let original = mail.map(|mail| {
             let mut mail = mail.clone();
+            // Quote the decrypted text, never the ciphertext.
+            if let Some(text) = &opened {
+                mail.body = text.clone();
+            }
             if let Some(prefix) = mail.account.as_ref().map(|account| format!("{account}:")) {
                 let strip = |value: &str| value.strip_prefix(&prefix).unwrap_or(value).to_owned();
                 mail.id = strip(&mail.id);
@@ -54,6 +70,19 @@ impl App {
                     error: None,
                     account,
                     suggestion: None,
+                    protection: {
+                        let mut protection = crypto::Protection::from_config(&config.crypto);
+                        if encrypted {
+                            // Answers to encrypted mail stay encrypted.
+                            protection.encrypt = true;
+                            protection.standard =
+                                match original.as_ref().and_then(|mail| mail.security) {
+                                    Some(crypto::Kind::SmimeEncrypted) => crypto::Standard::Smime,
+                                    _ => crypto::Standard::OpenPgp,
+                                };
+                        }
+                        protection
+                    },
                 };
                 if reply && !forward {
                     self.pending_editor = Some(state);
@@ -131,6 +160,14 @@ impl App {
                 state.composer.format.toggle();
                 self.overlay = Some(Overlay::Compose(state));
             }
+            KeyCode::Left if state.field == ComposeState::SECURITY_FIELD => {
+                state.protection.previous();
+                self.overlay = Some(Overlay::Compose(state));
+            }
+            KeyCode::Right | KeyCode::Char(' ') if state.field == ComposeState::SECURITY_FIELD => {
+                state.protection.next();
+                self.overlay = Some(Overlay::Compose(state));
+            }
             KeyCode::Enter if state.field == ComposeState::BODY_FIELD => {
                 self.pending_editor = Some(state);
             }
@@ -160,7 +197,7 @@ impl App {
             0..=2 => state
                 .value_mut()
                 .and_then(|value| complete::address(value, &self.contacts)),
-            5 => {
+            ComposeState::FILES_FIELD => {
                 let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 complete::path(&state.composer.attachments, &base)
             }
@@ -184,6 +221,47 @@ impl App {
             ));
         }
         self.overlay = Some(Overlay::Compose(state));
+        Ok(terminal)
+    }
+
+    /// Runs a job that may prompt in the terminal, with the UI suspended around it.
+    pub(crate) fn run_terminal_job(
+        &mut self,
+        job: TerminalJob,
+    ) -> color_eyre::Result<DefaultTerminal> {
+        execute!(stdout(), DisableMouseCapture, DisableBracketedPaste)?;
+        ratatui::restore();
+        let crypto = self.config.crypto.clone();
+        let result = match &job {
+            TerminalJob::Protect { state, contents } => {
+                crypto::protect(contents, state.protection, &crypto)
+                    .map(|message| (message, String::new()))
+            }
+            TerminalJob::Open(mail_id) => self
+                .mails
+                .iter()
+                .find(|mail| &mail.id == mail_id)
+                .and_then(|mail| Some((mail.source_path.clone()?, mail.security?)))
+                .ok_or_else(|| "The message is no longer available.".to_owned())
+                .and_then(|(path, kind)| {
+                    let contents = fs::read(path).map_err(|error| error.to_string())?;
+                    crypto::open(&contents, kind, &crypto)
+                        .map(|opened| (opened.content, opened.status))
+                }),
+        };
+        let terminal = ratatui::init();
+        execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+        self.clear_screen = true;
+        match job {
+            TerminalJob::Protect { mut state, .. } => match result {
+                Ok((message, _)) => self.complete_composer(*state, true, message),
+                Err(error) => {
+                    state.error = Some(format!("{error} Nothing was sent."));
+                    self.overlay = Some(Overlay::Compose(*state));
+                }
+            },
+            TerminalJob::Open(mail_id) => self.show_opened(mail_id, result),
+        }
         Ok(terminal)
     }
 
@@ -214,6 +292,24 @@ impl App {
                 return;
             }
         };
+        if send && state.protection.is_active() {
+            // Signing may ask for a passphrase, so it runs with the terminal restored.
+            self.pending_terminal = Some(TerminalJob::Protect {
+                state: Box::new(state),
+                contents,
+            });
+            return;
+        }
+        self.complete_composer(state, send, contents);
+    }
+
+    /// Queues a finished message for delivery or saves it as a draft.
+    pub(crate) fn complete_composer(
+        &mut self,
+        mut state: ComposeState,
+        send: bool,
+        contents: Vec<u8>,
+    ) {
         let (source, config) = self.compose_context(state.account);
         if send {
             let delivery = match delivery::Delivery::queue(

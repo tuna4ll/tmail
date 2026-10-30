@@ -48,6 +48,9 @@ pub struct Mail {
     /// How the sender lets recipients leave a mailing list.
     #[serde(default)]
     pub unsubscribe: Option<Unsubscribe>,
+    /// How the message is signed or encrypted.
+    #[serde(default)]
+    pub security: Option<crate::crypto::Kind>,
 }
 
 /// The `List-Unsubscribe` choices of a message (RFC 2369 and RFC 8058).
@@ -297,6 +300,7 @@ impl Mail {
             delivery_status: None,
             partial: false,
             unsubscribe: None,
+            security: None,
         }
     }
 

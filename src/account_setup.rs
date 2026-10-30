@@ -187,7 +187,7 @@ impl Form {
             .title(title)
             .border_style(theme::border(true))
             .title_style(theme::title(true))
-            .style(theme::text().bg(theme::SURFACE));
+            .style(theme::text().bg(theme::surface()));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let rows = Layout::vertical([

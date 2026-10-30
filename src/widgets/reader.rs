@@ -20,6 +20,10 @@ pub struct Reader {
     /// Laid-out rows and the width they were laid out for.
     rows: Option<(u16, Vec<Row>)>,
     drew_images: bool,
+    /// Decrypted or verified content that replaces the file's.
+    opened: Option<Vec<u8>>,
+    /// The signature or encryption state, once known.
+    security: Option<String>,
 }
 
 impl Reader {
@@ -31,7 +35,22 @@ impl Reader {
             body: None,
             rows: None,
             drew_images: false,
+            opened: None,
+            security: None,
         }
+    }
+
+    /// Shows decrypted or verified content in place of the stored message.
+    pub fn set_opened(&mut self, content: Vec<u8>, status: String) {
+        self.opened = Some(content);
+        self.security = Some(status);
+        self.body = None;
+        self.rows = None;
+    }
+
+    pub fn set_security(&mut self, status: String) {
+        self.security = Some(status);
+        self.rows = None;
     }
 
     pub fn mail_id(&self) -> &str {
@@ -54,7 +73,9 @@ impl Reader {
 
     /// The message body with its pictures, read from the message file on first use.
     pub fn body(&mut self, mail: &Mail) -> &mut Body {
-        self.body.get_or_insert_with(|| Body::load(mail))
+        let opened = self.opened.as_deref();
+        self.body
+            .get_or_insert_with(|| Body::load_from(mail, opened))
     }
 
     /// Lays the message out again, after pictures arrive.
@@ -90,7 +111,7 @@ impl Reader {
             .border_style(theme::border(true))
             .title_style(theme::title(true))
             .title(" message ")
-            .bg(theme::SURFACE);
+            .bg(theme::surface());
         let inner = block.inner(area);
         if clear {
             frame.render_widget(Clear, area);
@@ -162,7 +183,51 @@ impl Reader {
     fn layout(&mut self, mail: &Mail, width: u16, picker: Option<&Picker>) -> Vec<Row> {
         let body = self.body(mail);
         let blocked = body.has_blocked();
-        let mut rows: Vec<Row> = header_lines(mail, blocked)
+        let mut lines = header_lines(mail, blocked);
+        if let Some(kind) = mail.security {
+            let status = self.security.clone().unwrap_or_else(|| {
+                if kind.needs_secret() {
+                    "encrypted · opening…".into()
+                } else {
+                    "signed · checking…".into()
+                }
+            });
+            let color = if status.contains("BAD") || status.starts_with('⚠') {
+                theme::error_color()
+            } else if status.starts_with("signed by") && !status.contains("not verified")
+                || status.contains("· signed by") && !status.contains("not verified")
+            {
+                theme::success_color()
+            } else {
+                theme::accent()
+            };
+            let position = lines.len().min(5);
+            lines.insert(
+                position,
+                Line::from(vec![
+                    Span::styled(format!("{:<8}", "security"), theme::muted()),
+                    Span::styled(
+                        status,
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+            );
+        }
+        if mail.partial {
+            lines.push(header_line(
+                "size",
+                "headers only · D to download the rest",
+                true,
+            ));
+        }
+        if mail.unsubscribe.is_some() {
+            lines.push(header_line(
+                "list",
+                "mailing list · U to unsubscribe",
+                false,
+            ));
+        }
+        let mut rows: Vec<Row> = lines
             .into_iter()
             .flat_map(|line| wrap(line, width))
             .map(Row::Line)
@@ -246,7 +311,7 @@ fn size_label(bytes: usize) -> String {
 fn header_line(label: &str, value: &str, bold: bool) -> Line<'static> {
     let style = if bold {
         Style::default()
-            .fg(theme::TEXT)
+            .fg(theme::text_color())
             .add_modifier(Modifier::BOLD)
     } else {
         theme::text()

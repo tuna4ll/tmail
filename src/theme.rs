@@ -1,32 +1,163 @@
+use std::sync::OnceLock;
+
 use rataflow::{Palette, Theme};
 use ratatui::style::{Color, Modifier, Style};
+use serde::Deserialize;
 
-pub const CANVAS: Color = Color::Indexed(234);
-pub const SURFACE: Color = Color::Indexed(236);
-pub const MUTED: Color = Color::Indexed(245);
-pub const SUBTLE: Color = Color::Indexed(238);
-pub const ACCENT: Color = Color::Indexed(81);
-pub const TEXT: Color = Color::Indexed(252);
+/// Colors from the `[theme]` table: a `preset` (`dark`, `light` or `contrast`) and
+/// any colors to override, as names (`red`), indexes (`81`) or hex (`#5fd7ff`).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThemeConfig {
+    pub preset: Option<String>,
+    pub canvas: Option<String>,
+    pub surface: Option<String>,
+    pub muted: Option<String>,
+    pub subtle: Option<String>,
+    pub accent: Option<String>,
+    pub text: Option<String>,
+    pub success: Option<String>,
+    pub error: Option<String>,
+}
 
-pub const fn flow() -> Theme {
-    Theme::Custom(Palette {
-        canvas_bg: CANVAS,
-        surface: SURFACE,
-        muted: MUTED,
-        subtle: SUBTLE,
-        accent: ACCENT,
-        text: TEXT,
+#[derive(Clone, Copy, Debug)]
+pub struct Colors {
+    pub canvas: Color,
+    pub surface: Color,
+    pub muted: Color,
+    pub subtle: Color,
+    pub accent: Color,
+    pub text: Color,
+    pub success: Color,
+    pub error: Color,
+}
+
+impl Colors {
+    const DARK: Self = Self {
+        canvas: Color::Indexed(234),
+        surface: Color::Indexed(236),
+        muted: Color::Indexed(245),
+        subtle: Color::Indexed(238),
+        accent: Color::Indexed(81),
+        text: Color::Indexed(252),
         success: Color::Indexed(78),
         error: Color::Indexed(203),
+    };
+
+    const LIGHT: Self = Self {
+        canvas: Color::Indexed(255),
+        surface: Color::Indexed(254),
+        muted: Color::Indexed(243),
+        subtle: Color::Indexed(250),
+        accent: Color::Indexed(25),
+        text: Color::Indexed(235),
+        success: Color::Indexed(28),
+        error: Color::Indexed(160),
+    };
+
+    const CONTRAST: Self = Self {
+        canvas: Color::Black,
+        surface: Color::Indexed(234),
+        muted: Color::Indexed(250),
+        subtle: Color::Indexed(240),
+        accent: Color::Indexed(226),
+        text: Color::White,
+        success: Color::Indexed(46),
+        error: Color::Indexed(196),
+    };
+
+    pub fn from_config(config: &ThemeConfig) -> Result<Self, String> {
+        let mut colors = match config.preset.as_deref().unwrap_or("dark") {
+            "dark" => Self::DARK,
+            "light" => Self::LIGHT,
+            "contrast" | "high-contrast" => Self::CONTRAST,
+            other => {
+                return Err(format!(
+                    "Unknown theme preset {other}. Use dark, light or contrast."
+                ));
+            }
+        };
+        for (value, slot) in [
+            (&config.canvas, &mut colors.canvas),
+            (&config.surface, &mut colors.surface),
+            (&config.muted, &mut colors.muted),
+            (&config.subtle, &mut colors.subtle),
+            (&config.accent, &mut colors.accent),
+            (&config.text, &mut colors.text),
+            (&config.success, &mut colors.success),
+            (&config.error, &mut colors.error),
+        ] {
+            if let Some(value) = value {
+                *slot = value
+                    .parse()
+                    .map_err(|_| format!("Invalid theme color {value}."))?;
+            }
+        }
+        Ok(colors)
+    }
+}
+
+static COLORS: OnceLock<Colors> = OnceLock::new();
+
+/// Sets the colors once at startup; later calls keep the first palette.
+pub fn init(config: &ThemeConfig) -> Result<(), String> {
+    let colors = Colors::from_config(config)?;
+    let _ = COLORS.set(colors);
+    Ok(())
+}
+
+fn colors() -> &'static Colors {
+    COLORS.get_or_init(|| Colors::DARK)
+}
+
+pub fn surface() -> Color {
+    colors().surface
+}
+
+pub fn muted_color() -> Color {
+    colors().muted
+}
+
+pub fn subtle() -> Color {
+    colors().subtle
+}
+
+pub fn accent() -> Color {
+    colors().accent
+}
+
+pub fn text_color() -> Color {
+    colors().text
+}
+
+pub fn error_color() -> Color {
+    colors().error
+}
+
+pub fn success_color() -> Color {
+    colors().success
+}
+
+pub fn flow() -> Theme {
+    let colors = colors();
+    Theme::Custom(Palette {
+        canvas_bg: colors.canvas,
+        surface: colors.surface,
+        muted: colors.muted,
+        subtle: colors.subtle,
+        accent: colors.accent,
+        text: colors.text,
+        success: colors.success,
+        error: colors.error,
     })
 }
 
 pub fn border(active: bool) -> Style {
-    Style::default().fg(if active { ACCENT } else { SUBTLE })
+    Style::default().fg(if active { accent() } else { subtle() })
 }
 
 pub fn title(active: bool) -> Style {
-    let style = Style::default().fg(if active { ACCENT } else { MUTED });
+    let style = Style::default().fg(if active { accent() } else { muted_color() });
     if active {
         style.add_modifier(Modifier::BOLD)
     } else {
@@ -35,23 +166,23 @@ pub fn title(active: bool) -> Style {
 }
 
 pub fn text() -> Style {
-    Style::default().fg(TEXT)
+    Style::default().fg(text_color())
 }
 
 pub fn muted() -> Style {
-    Style::default().fg(MUTED)
+    Style::default().fg(muted_color())
 }
 
 pub fn selection() -> Style {
     Style::default()
-        .fg(TEXT)
-        .bg(SUBTLE)
+        .fg(text_color())
+        .bg(subtle())
         .add_modifier(Modifier::BOLD)
 }
 
 pub fn keycap() -> Style {
     Style::default()
-        .fg(TEXT)
-        .bg(SUBTLE)
+        .fg(text_color())
+        .bg(subtle())
         .add_modifier(Modifier::BOLD)
 }

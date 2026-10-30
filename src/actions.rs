@@ -2,6 +2,44 @@
 
 use super::*;
 
+/// The address, subject and body of a `mailto:` link.
+pub(crate) fn parse_mailto(link: &str) -> (String, String, String) {
+    let rest = link.get(7..).unwrap_or_default();
+    let (address, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let mut subject = String::new();
+    let mut body = String::new();
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let value = percent_decode(value);
+        match name.to_ascii_lowercase().as_str() {
+            "subject" => subject = value,
+            "body" => body = value,
+            _ => {}
+        }
+    }
+    (percent_decode(address), subject, body)
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let Some(byte) = value
+                .get(index + 1..index + 3)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+        {
+            output.push(byte);
+            index += 3;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
 impl App {
     /// The messages an action applies to: the open or highlighted message, or the whole
     /// conversation when it is chosen in the list. `folder_only` keeps just the
@@ -448,6 +486,65 @@ impl App {
                     message,
                     reload: true,
                 }
+            });
+        }
+    }
+
+    /// Asks before leaving the mailing list of the open message.
+    pub(crate) fn ask_unsubscribe(&mut self) {
+        let Some(mail) = self
+            .reader
+            .as_ref()
+            .and_then(|reader| self.mails.iter().find(|mail| mail.id == reader.mail_id()))
+        else {
+            return;
+        };
+        match &mail.unsubscribe {
+            Some(unsubscribe) => {
+                self.overlay = Some(Overlay::Unsubscribe {
+                    unsubscribe: unsubscribe.clone(),
+                });
+            }
+            None => self.notice = Some("This message is not from a mailing list.".into()),
+        }
+    }
+
+    /// Leaves the list: one-click HTTPS when offered, else an email, else the web page.
+    pub(crate) fn unsubscribe(&mut self, unsubscribe: mail::Unsubscribe) {
+        if unsubscribe.one_click
+            && let Some(url) = unsubscribe.https().map(str::to_owned)
+        {
+            self.notice = Some("Unsubscribing…".into());
+            self.spawn_task(move || Task::Done {
+                message: match widgets::rich::post_one_click(&url) {
+                    Ok(()) => "Unsubscribed · the sender confirmed the request".into(),
+                    Err(error) => format!("Unsubscribe failed · {error}"),
+                },
+                reload: false,
+            });
+            return;
+        }
+        if let Some(mailto) = unsubscribe.mailto().map(str::to_owned) {
+            self.start_draft(draft::Start::New);
+            if let Some(Overlay::Compose(state)) = &mut self.overlay {
+                let (to, subject, body) = parse_mailto(&mailto);
+                state.composer.to = to;
+                state.composer.subject = if subject.is_empty() {
+                    "unsubscribe".into()
+                } else {
+                    subject
+                };
+                if !body.is_empty() {
+                    let _ = fs::write(&state.composer.body_path, body);
+                }
+                self.notice = Some("Review the unsubscribe email, then press ctrl+s.".into());
+            }
+            return;
+        }
+        if let Some(link) = unsubscribe.links.first() {
+            self.notice = Some(match opener::open(link) {
+                Ok(()) => "Opened the unsubscribe page in the browser.".into(),
+                Err(error) => format!("Unable to open the unsubscribe page: {error}"),
             });
         }
     }

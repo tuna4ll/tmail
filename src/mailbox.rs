@@ -525,6 +525,7 @@ fn load_maildir(path: &Path) -> Result<LoadReport, LoadError> {
                 partial: parsed
                     .header_raw(crate::imap_client::PARTIAL_HEADER)
                     .is_some(),
+                security: crate::crypto::Kind::detect(&parsed),
                 unsubscribe: parsed.header_raw("List-Unsubscribe").and_then(|value| {
                     crate::mail::Unsubscribe::parse(
                         &value.replace(['\r', '\n'], ""),

@@ -2,6 +2,62 @@
 
 use super::*;
 
+/// Shows a desktop notification through the system's notifier, falling back to the
+/// terminal's own notification escape codes.
+pub(crate) fn notify(title: &str, body: &str) {
+    let clean = |value: &str| {
+        value
+            .chars()
+            .filter(|character| !character.is_control() && !"\\\";".contains(*character))
+            .collect::<String>()
+    };
+    let (title, body) = (clean(title), clean(body));
+    let command = if cfg!(target_os = "macos") {
+        Command::new("osascript")
+            .arg("-e")
+            .arg(format!(
+                "display notification \"{body}\" with title \"{title}\""
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    } else if cfg!(windows) {
+        Err(std::io::Error::other("no notifier"))
+    } else {
+        Command::new("notify-send")
+            .args([
+                "--app-name",
+                "termail",
+                "--icon",
+                "mail-unread",
+                &title,
+                &body,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+    match command {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(_) => {
+            use std::io::Write;
+            let mut output = stdout();
+            // OSC 777 (urxvt, foot, Ghostty, WezTerm) and OSC 9 (iTerm2, kitty, Windows Terminal).
+            let _ = write!(
+                output,
+                "\x1b]777;notify;{title};{body}\x07\x1b]9;{title}: {body}\x07"
+            );
+            let _ = output.flush();
+        }
+    }
+}
+
 impl App {
     pub(crate) fn retry_outbox(&mut self) {
         let Some(mail_id) = self.active_mail_id() else {
@@ -230,6 +286,22 @@ impl App {
             Ok(synced) => {
                 if !self.watchers.contains_key(&id) && remote.sync_interval_secs > 0 {
                     self.watch_account(id.clone(), remote);
+                }
+                if synced.downloaded > 0 && self.config.notifications != Some(false) {
+                    let label = self
+                        .config
+                        .accounts
+                        .iter()
+                        .find(|account| account.id == id)
+                        .map_or_else(|| self.account_label.clone(), config::Account::label);
+                    notify(
+                        "termail",
+                        &format!(
+                            "{} new message{} in {label}",
+                            synced.downloaded,
+                            if synced.downloaded == 1 { "" } else { "s" }
+                        ),
+                    );
                 }
                 if visible && (synced.changed || manual || synced.held > 0) {
                     self.notice = Some(synced.summary);

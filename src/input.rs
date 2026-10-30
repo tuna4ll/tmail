@@ -125,6 +125,7 @@ impl App {
         if key.code == KeyCode::Esc && self.notice.take().is_some() {
             return;
         }
+        let key = self.keymap.translate(key);
 
         match key.code {
             KeyCode::Char('?') => {
@@ -209,6 +210,10 @@ impl App {
             }
             KeyCode::Char('D') if self.reader.is_some() => {
                 self.download_full_message();
+                return;
+            }
+            KeyCode::Char('U') if self.reader.is_some() => {
+                self.ask_unsubscribe();
                 return;
             }
             _ => {}
@@ -499,6 +504,14 @@ impl App {
                 }
                 _ => self.overlay = Some(overlay),
             },
+            Overlay::Unsubscribe { unsubscribe } => {
+                if action_key(key, 'y') || key.code == KeyCode::Enter {
+                    let unsubscribe = unsubscribe.clone();
+                    self.unsubscribe(unsubscribe);
+                } else if key.code != KeyCode::Esc && !action_key(key, 'n') {
+                    self.overlay = Some(overlay);
+                }
+            }
             Overlay::Prompt { kind, input } => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Enter => {

@@ -113,18 +113,28 @@ pub struct Body {
 
 impl Body {
     /// Reads the message file for its HTML and pictures, falling back to the cached text.
-    pub fn load(mail: &Mail) -> Self {
+    /// Like `load`, reading `content` instead of the file when given, such as a
+    /// decrypted message.
+    pub fn load_from(mail: &Mail, content: Option<&[u8]>) -> Self {
         let mut body = Self {
             text: mail.body.clone(),
             ..Self::default()
         };
-        let Some(contents) = mail
-            .source_path
-            .as_deref()
-            .and_then(|path: &Path| std::fs::read(path).ok())
-        else {
+        let Some(contents) = content.map(<[u8]>::to_vec).or_else(|| {
+            mail.source_path
+                .as_deref()
+                .and_then(|path: &Path| std::fs::read(path).ok())
+        }) else {
             return body;
         };
+        if content.is_some()
+            && let Some(message) = MessageParser::default().parse(&contents)
+        {
+            body.text = message
+                .body_text(0)
+                .map(|text| text.into_owned())
+                .unwrap_or_default();
+        }
         let Some(message) = MessageParser::default().parse(&contents) else {
             return body;
         };
@@ -391,6 +401,27 @@ pub fn base64(bytes: &[u8]) -> String {
     output
 }
 
+/// Sends an RFC 8058 one-click unsubscribe request.
+pub fn post_one_click(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("one-click unsubscribe needs an https link".into());
+    }
+    let agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .build(),
+        )
+        .timeout_global(Some(std::time::Duration::from_secs(20)))
+        .build()
+        .new_agent();
+    agent
+        .post(url)
+        .send_form([("List-Unsubscribe", "One-Click")])
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 /// Fetches a remote picture with a short timeout and a size cap.
 pub fn fetch(url: &str) -> Option<Vec<u8>> {
     if !url.starts_with("https://") && !url.starts_with("http://") {
@@ -608,7 +639,7 @@ fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
-/// The reader's background, as the RGB value of `theme::SURFACE`.
+/// The reader's background, as the RGB value of `theme::surface()`.
 const SURFACE_RGB: (u8, u8, u8) = (48, 48, 48);
 
 fn style_for(tags: &[RichAnnotation]) -> Style {
@@ -621,10 +652,10 @@ fn style_for(tags: &[RichAnnotation]) -> Style {
             RichAnnotation::Emphasis => style = style.add_modifier(Modifier::ITALIC),
             RichAnnotation::Strikeout => style = style.add_modifier(Modifier::CROSSED_OUT),
             RichAnnotation::Code | RichAnnotation::Preformat(_) => {
-                style = style.fg(theme::ACCENT);
+                style = style.fg(theme::accent());
             }
             RichAnnotation::Link(_) => {
-                style = style.fg(theme::ACCENT).add_modifier(Modifier::UNDERLINED);
+                style = style.fg(theme::accent()).add_modifier(Modifier::UNDERLINED);
             }
             RichAnnotation::Colour(colour) => foreground = Some(rgb(colour)),
             RichAnnotation::BgColour(colour) => background = Some(rgb(colour)),
@@ -749,7 +780,7 @@ mod tests {
         assert!(style("bold").add_modifier.contains(Modifier::BOLD));
         assert!(style("it").add_modifier.contains(Modifier::ITALIC));
         assert!(style("link").add_modifier.contains(Modifier::UNDERLINED));
-        assert_eq!(style("dark").fg, Some(theme::TEXT));
+        assert_eq!(style("dark").fg, Some(theme::text_color()));
         assert_eq!(style("red").fg, Some(Color::Rgb(255, 85, 85)));
     }
 

@@ -19,6 +19,12 @@ pub struct Config {
     pub remote: Option<crate::remote::RemoteConfig>,
     pub default_account: Option<String>,
     pub accounts: Vec<Account>,
+    /// Desktop notifications for new mail; on unless set to false.
+    pub notifications: Option<bool>,
+    pub theme: crate::theme::ThemeConfig,
+    /// Custom keys by action name, such as `archive = "e"`.
+    pub keys: std::collections::BTreeMap<String, String>,
+    pub crypto: crate::crypto::CryptoConfig,
     #[serde(skip)]
     pub(crate) active_account: Option<String>,
     #[serde(skip)]

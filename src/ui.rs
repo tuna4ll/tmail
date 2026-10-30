@@ -304,6 +304,7 @@ impl App {
                 ("x", "delete"),
                 ("esc", "close"),
             ],
+            Overlay::Unsubscribe { .. } => &[("y", "unsubscribe"), ("esc", "keep")],
             Overlay::Prompt { .. } => &[
                 ("type", "name · / for subfolders"),
                 ("enter", "save"),
@@ -353,7 +354,9 @@ pub(crate) fn draw_mailbox_state(
                 1,
             );
             frame.render_widget(
-                FluxSpinner::new(spinner_tick).width(6).color(theme::ACCENT),
+                FluxSpinner::new(spinner_tick)
+                    .width(6)
+                    .color(theme::accent()),
                 spinner_area,
             );
             frame.render_widget(
@@ -492,13 +495,14 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
         Overlay::DeliveryReview { .. } => (72, 12),
         Overlay::Help { .. } => (66, 23),
         Overlay::Command(_) | Overlay::Prompt { .. } => (64, 3),
+        Overlay::Unsubscribe { .. } => (64, 9),
         Overlay::DraftReady { summary, .. } => (68, 11 + summary.warnings.len() as u16),
         Overlay::ComposeClose(_) => (58, 7),
         Overlay::Folders { items, .. } => (50, (items.len() as u16 + 2).min(18)),
         Overlay::Links { items, .. } => (72, (items.len() as u16 + 2).min(16)),
         Overlay::Attachments { items, .. } => (64, (items.len() as u16 + 2).min(16)),
         Overlay::Accounts { items, .. } => (64, (items.len() as u16 + 2).min(16)),
-        Overlay::Compose(_) => (78, 20),
+        Overlay::Compose(_) => (78, 21),
     };
     let screen = frame.area();
     let area = Rect::new(
@@ -532,7 +536,7 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                             .border_style(theme::border(true))
                             .title_style(theme::title(true))
                             .title(" help · esc to close ")
-                            .bg(theme::SURFACE),
+                            .bg(theme::surface()),
                     )
                     .scroll((*scroll, 0))
                     .wrap(Wrap { trim: false }),
@@ -548,7 +552,7 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                             .border_style(theme::border(true))
                             .title_style(theme::title(true))
                             .title(" command ")
-                            .bg(theme::SURFACE),
+                            .bg(theme::surface()),
                     ),
                 area,
             );
@@ -592,7 +596,7 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                             .border_style(theme::border(true))
                             .title_style(theme::title(true))
                             .title(" choose an action ")
-                            .bg(theme::SURFACE),
+                            .bg(theme::surface()),
                     )
                     .wrap(Wrap { trim: true }),
                 area,
@@ -610,9 +614,34 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                         .border_style(theme::border(true))
                         .title_style(theme::title(true))
                         .title(" unsaved message ")
-                        .bg(theme::SURFACE),
+                        .bg(theme::surface()),
                 )
                 .wrap(Wrap { trim: true }),
+                area,
+            );
+        }
+        Overlay::Unsubscribe { unsubscribe, .. } => {
+            let method = if unsubscribe.one_click && unsubscribe.https().is_some() {
+                "Termail sends a one-click request to the sender. No page opens."
+            } else if unsubscribe.mailto().is_some() {
+                "Termail prepares an unsubscribe email for you to review and send."
+            } else {
+                "The sender's unsubscribe page opens in the browser."
+            };
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Leave this mailing list?\n\n{method}\n\n y  Unsubscribe     esc  Keep"
+                ))
+                .style(theme::text())
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true })
+                .block(
+                    Block::bordered()
+                        .border_style(theme::border(true))
+                        .title_style(theme::title(true))
+                        .title(" unsubscribe ")
+                        .bg(theme::surface()),
+                ),
                 area,
             );
         }
@@ -629,7 +658,7 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                             .border_style(theme::border(true))
                             .title_style(theme::title(true))
                             .title(title)
-                            .bg(theme::SURFACE),
+                            .bg(theme::surface()),
                     ),
                 area,
             );
@@ -664,7 +693,7 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                         } else {
                             " folders · n new · e rename · x delete "
                         })
-                        .bg(theme::SURFACE),
+                        .bg(theme::surface()),
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
             frame.render_stateful_widget(list, area, &mut state);
@@ -684,7 +713,7 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                         .border_style(theme::border(true))
                         .title_style(theme::title(true))
                         .title(" links · enter to open · y to copy ")
-                        .bg(theme::SURFACE),
+                        .bg(theme::surface()),
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
             frame.render_stateful_widget(list, area, &mut state);
@@ -712,7 +741,7 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                         .border_style(theme::border(true))
                         .title_style(theme::title(true))
                         .title(" attachments · s save · o open ")
-                        .bg(theme::SURFACE),
+                        .bg(theme::surface()),
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
             frame.render_stateful_widget(list, area, &mut state);
@@ -739,7 +768,7 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                         } else {
                             " accounts · a add · e edit · l sign in · x remove "
                         })
-                        .bg(theme::SURFACE),
+                        .bg(theme::surface()),
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
             frame.render_stateful_widget(list, area, &mut state);
@@ -753,13 +782,13 @@ pub(crate) fn draw_compose(frame: &mut Frame, area: Rect, state: &ComposeState) 
         .border_style(theme::border(true))
         .title_style(theme::title(true))
         .title(" compose ")
-        .bg(theme::SURFACE);
+        .bg(theme::surface());
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
     let rows = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(8),
+        Constraint::Length(9),
         Constraint::Length(4),
         Constraint::Length(2),
         Constraint::Min(1),
@@ -775,13 +804,17 @@ pub(crate) fn draw_compose(frame: &mut Frame, area: Rect, state: &ComposeState) 
         ("Bcc", state.composer.bcc.clone()),
         ("Subject", state.composer.subject.clone()),
         ("Format", format!("< {} >", state.composer.format.label())),
+        ("Security", format!("< {} >", state.protection.label())),
         ("Files", state.composer.attachments.clone()),
     ];
     let items: Vec<ListItem> = values
         .iter()
         .enumerate()
         .map(|(index, (label, value))| {
-            let cursor = if index == state.field && index != ComposeState::FORMAT_FIELD {
+            let cursor = if index == state.field
+                && index != ComposeState::FORMAT_FIELD
+                && index != ComposeState::SECURITY_FIELD
+            {
                 "_"
             } else {
                 ""

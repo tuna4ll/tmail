@@ -262,7 +262,11 @@ fn conversation_flow(
 }
 
 fn reply_style(active: bool) -> EdgeStyle {
-    let style = Style::default().fg(if active { theme::ACCENT } else { theme::MUTED });
+    let style = Style::default().fg(if active {
+        theme::accent()
+    } else {
+        theme::muted_color()
+    });
     let style = if active {
         style.add_modifier(Modifier::BOLD)
     } else {
