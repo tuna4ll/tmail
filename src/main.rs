@@ -19,6 +19,7 @@ mod outbox;
 mod remote;
 mod sender;
 mod storage;
+mod terminal;
 mod theme;
 mod widgets;
 
@@ -52,13 +53,9 @@ use std::{
     time::Duration,
 };
 
-use crossterm::{
-    event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
-    },
-    execute,
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use directories::BaseDirs;
 use futures::StreamExt;
@@ -82,6 +79,7 @@ const READER_WIDTH: u16 = 44;
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
+    terminal::install();
     let Some(options) = parse_options(std::env::args_os().skip(1))? else {
         print_help();
         return Ok(());
@@ -124,9 +122,7 @@ async fn main() -> color_eyre::Result<()> {
         }
     }
 
-    let terminal = ratatui::init();
-
-    execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+    let terminal = terminal::enter()?;
 
     let mut app = App::new(source, config);
     // Ask the terminal which graphics protocol it speaks; half blocks work everywhere.
@@ -137,9 +133,7 @@ async fn main() -> color_eyre::Result<()> {
     app.prepare_accounts(needs_setup, explicit_source);
     let result = app.run(terminal).await;
 
-    execute!(stdout(), DisableMouseCapture, DisableBracketedPaste)?;
-
-    ratatui::restore();
+    terminal::leave()?;
 
     result?;
     // Sync and IDLE workers hold blocking sockets; their state is saved atomically, so

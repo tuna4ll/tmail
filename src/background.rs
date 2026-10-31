@@ -356,34 +356,45 @@ impl App {
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
         let sender = self.watch_tx.clone();
-        std::thread::spawn(move || {
-            let mut backoff = 30;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                match imap_client::wait_for_change(
-                    &remote,
-                    &folder,
-                    Duration::from_secs(25 * 60),
-                    &stop,
-                ) {
-                    Ok(changed) => {
-                        backoff = 30;
-                        if changed && sender.send(id.clone()).is_err() {
-                            return;
-                        }
-                    }
-                    Err(error) if error.kind == remote::ErrorKind::Unsupported => return,
-                    Err(_) => {
-                        for _ in 0..backoff {
-                            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let spawned = std::thread::Builder::new()
+            .name(format!("termail-idle-{folder}"))
+            .spawn(move || {
+                let mut backoff = 30;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // The IMAP library panics on some unexpected IDLE replies; treat that
+                    // like a dropped connection instead of losing the watcher.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        imap_client::wait_for_change(
+                            &remote,
+                            &folder,
+                            Duration::from_secs(25 * 60),
+                            &stop,
+                        )
+                    }))
+                    .unwrap_or_else(|_| Err("The IDLE connection failed.".into()));
+                    match outcome {
+                        Ok(changed) => {
+                            backoff = 30;
+                            if changed && sender.send(id.clone()).is_err() {
                                 return;
                             }
-                            std::thread::sleep(Duration::from_secs(1));
                         }
-                        backoff = (backoff * 2).min(15 * 60);
+                        Err(error) if error.kind == remote::ErrorKind::Unsupported => return,
+                        Err(_) => {
+                            for _ in 0..backoff {
+                                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return;
+                                }
+                                std::thread::sleep(Duration::from_secs(1));
+                            }
+                            backoff = (backoff * 2).min(15 * 60);
+                        }
                     }
                 }
-            }
-        });
+            });
+        if spawned.is_err() {
+            crate::log::write("idle", "unable to start a watcher thread");
+        }
     }
 
     pub(crate) fn stop_watchers(&mut self) {

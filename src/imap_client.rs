@@ -2114,6 +2114,88 @@ mod tests {
         result.summary
     }
 
+    #[test]
+    fn copied_or_restored_files_are_not_uploaded_again() {
+        let state = standard();
+        state
+            .lock()
+            .unwrap()
+            .deliver("INBOX", &mail("one@example.test", "one"), &["\\Seen"]);
+        let (remote, tls) = start(&state);
+        let cache = Cache::new();
+        run(&remote, &tls, &cache);
+        // Copying a Maildir without keeping times touches every file.
+        for name in cache.files("") {
+            let path = cache.0.join("cur").join(name);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+                .unwrap();
+        }
+        run(&remote, &tls, &cache);
+        let state = state.lock().unwrap();
+        assert_eq!(state.folders["INBOX"].messages.len(), 1);
+        assert!(
+            !state
+                .commands
+                .iter()
+                .any(|command| command.starts_with("APPEND"))
+        );
+    }
+
+    #[test]
+    fn expunge_without_uidplus_keeps_messages_others_deleted() {
+        let state = standard();
+        state.lock().unwrap().capabilities = "IMAP4rev1 IDLE".into();
+        state
+            .lock()
+            .unwrap()
+            .deliver("INBOX", &mail("mine@example.test", "mine"), &[]);
+        let (remote, tls) = start(&state);
+        let cache = Cache::new();
+        run(&remote, &tls, &cache);
+        state.lock().unwrap().deliver(
+            "INBOX",
+            &mail("theirs@example.test", "theirs"),
+            &["\\Deleted"],
+        );
+        fs::remove_file(cache.0.join("cur").join(&cache.files("")[0])).unwrap();
+        run(&remote, &tls, &cache);
+        let state = state.lock().unwrap();
+        let inbox = &state.folders["INBOX"].messages;
+        assert_eq!(inbox.len(), 1, "the other client's message must survive");
+        assert!(inbox[0].flags.iter().any(|flag| flag == "\\Deleted"));
+        assert_eq!(state.folders["INBOX.Trash"].messages.len(), 1);
+    }
+
+    #[test]
+    fn first_sync_keeps_existing_local_mail_off_the_server() {
+        let state = standard();
+        let (remote, tls) = start(&state);
+        let cache = Cache::new();
+        initialize(&cache.0).unwrap();
+        fs::write(
+            cache.0.join("cur").join(format!("1.old{}S", separator())),
+            mail("old@example.test", "old"),
+        )
+        .unwrap();
+        assert!(run(&remote, &tls, &cache).contains("kept off the server"));
+        run(&remote, &tls, &cache);
+        assert!(state.lock().unwrap().folders["INBOX"].messages.is_empty());
+        let mut session = connect_with_tls(&remote, "fake-password", &tls).unwrap();
+        let synced = sync_session(
+            &mut session,
+            &remote,
+            &cache.0,
+            SyncOptions { upload_held: true },
+        )
+        .unwrap();
+        assert_eq!(synced.held, 0);
+        assert_eq!(state.lock().unwrap().folders["INBOX"].messages.len(), 1);
+    }
+
     fn standard() -> fake_imap::Shared {
         State::new(&[
             ("INBOX", "\\HasChildren"),

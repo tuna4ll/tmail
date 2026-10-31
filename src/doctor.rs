@@ -26,10 +26,11 @@ pub fn run(config: &Config) -> bool {
 }
 
 pub fn checks(config: &Config) -> Vec<Check> {
+    let mut checks = shared_checks(config);
     if config.accounts.len() < 2 {
-        return account_checks(config);
+        checks.extend(account_checks(config));
+        return checks;
     }
-    let mut checks = Vec::new();
     for index in 0..config.accounts.len() {
         let mut account = config.clone();
         account.activate(index);
@@ -40,6 +41,43 @@ pub fn checks(config: &Config) -> Vec<Check> {
         }));
     }
     checks
+}
+
+/// Settings shared by every account: signing and encryption programs.
+fn shared_checks(config: &Config) -> Vec<Check> {
+    let crypto = &config.crypto;
+    let mut programs = Vec::new();
+    if crypto.sign || crypto.encrypt || crypto.gpg.is_some() {
+        programs.push(crypto.gpg.clone().unwrap_or_else(|| "gpg".into()));
+    }
+    if crypto.smime || crypto.gpgsm.is_some() {
+        programs.push(crypto.gpgsm.clone().unwrap_or_else(|| "gpgsm".into()));
+    }
+    programs
+        .into_iter()
+        .map(|program| {
+            let version = std::process::Command::new(&program)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .next()
+                        .map(str::to_owned)
+                });
+            Check {
+                ok: version.is_some(),
+                label: "crypto",
+                detail: version.unwrap_or_else(|| {
+                    format!("{program} was not found. Install GnuPG or set [crypto].")
+                }),
+            }
+        })
+        .collect()
 }
 
 fn account_checks(config: &Config) -> Vec<Check> {
@@ -108,7 +146,14 @@ fn account_checks(config: &Config) -> Vec<Check> {
                 label: "sender",
                 detail: format!("{servers} · password asked at sign-in"),
             },
-            Ok(()) => match remote.password() {
+            // The stored secret, not a fresh OAuth2 token: doctor stays offline.
+            Ok(()) => match remote.stored_secret().map_err(|error| {
+                if remote.oauth2.is_some() {
+                    format!("{error} Run termail oauth to sign in.")
+                } else {
+                    error
+                }
+            }) {
                 Ok(_) => Check {
                     ok: true,
                     label: "sender",

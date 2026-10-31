@@ -257,9 +257,13 @@ fn session<S: Read + Write>(mut stream: BufReader<S>, state: &Shared) -> std::io
                     .iter()
                     .position(|arg| arg.eq_ignore_ascii_case("HEADER"))
                     .map(|index| args[index + 2].to_lowercase());
+                let deleted = args.iter().any(|arg| arg.eq_ignore_ascii_case("DELETED"));
                 let uids: Vec<String> = folder
                     .messages
                     .iter()
+                    .filter(|message| {
+                        !deleted || message.flags.iter().any(|flag| flag == "\\Deleted")
+                    })
                     .filter(|message| {
                         header.as_ref().is_none_or(|value| {
                             String::from_utf8_lossy(&message.body)

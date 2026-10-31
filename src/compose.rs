@@ -221,11 +221,9 @@ impl App {
         &mut self,
         mut state: ComposeState,
     ) -> color_eyre::Result<DefaultTerminal> {
-        execute!(stdout(), DisableMouseCapture, DisableBracketedPaste)?;
-        ratatui::restore();
+        terminal::leave()?;
         let result = self.run_editor(&state.composer.body_path);
-        let terminal = ratatui::init();
-        execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+        let terminal = terminal::enter()?;
 
         if let Err(error) = result {
             state.error = Some(format!(
@@ -241,8 +239,7 @@ impl App {
         &mut self,
         job: TerminalJob,
     ) -> color_eyre::Result<DefaultTerminal> {
-        execute!(stdout(), DisableMouseCapture, DisableBracketedPaste)?;
-        ratatui::restore();
+        terminal::leave()?;
         let crypto = self.config.crypto.clone();
         let result = match &job {
             TerminalJob::Protect { state, contents } => {
@@ -261,8 +258,7 @@ impl App {
                         .map(|opened| (opened.content, opened.status))
                 }),
         };
-        let terminal = ratatui::init();
-        execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+        let terminal = terminal::enter()?;
         self.clear_screen = true;
         match job {
             TerminalJob::Protect { mut state, .. } => match result {
