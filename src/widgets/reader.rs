@@ -1,7 +1,10 @@
 use crate::{
     mail::Mail,
     theme,
-    widgets::rich::{Body, Row, wrap},
+    widgets::{
+        html::{LinkArea, Placed},
+        rich::{Body, wrap},
+    },
 };
 use ratatui::{
     Frame,
@@ -19,13 +22,29 @@ pub enum Target {
     Attachment(usize),
 }
 
+/// The message laid out for one width: header and body rows, pictures and links.
+#[derive(Default)]
+struct Laid {
+    /// Columns the rows take, at least the window's.
+    width: u16,
+    lines: Vec<Line<'static>>,
+    images: Vec<Placed>,
+    links: Vec<LinkArea>,
+}
+
 pub struct Reader {
     mail_id: String,
     scroll: u16,
     max_scroll: u16,
     body: Option<Body>,
     /// Laid-out rows and the width they were laid out for.
-    rows: Option<(u16, Vec<Row>)>,
+    rows: Option<(u16, Laid)>,
+    /// Layouts for other widths, so going back to a size is instant.
+    cache: Vec<(u16, Laid)>,
+    /// While the window is being resized, the last layout is shown until this time.
+    defer_until: Option<std::time::Instant>,
+    hscroll: u16,
+    max_hscroll: u16,
     drew_images: bool,
     /// Decrypted or verified content that replaces the file's.
     opened: Option<Vec<u8>>,
@@ -46,6 +65,10 @@ impl Reader {
             max_scroll: 0,
             body: None,
             rows: None,
+            cache: Vec::new(),
+            defer_until: None,
+            hscroll: 0,
+            max_hscroll: 0,
             drew_images: false,
             opened: None,
             security: None,
@@ -70,6 +93,15 @@ impl Reader {
             return None;
         }
         let index = usize::from(self.scroll) + usize::from(row - self.text_area.y);
+        let column = column - self.text_area.x + self.hscroll;
+        if let Some((_, laid)) = &self.rows
+            && let Some(link) = laid
+                .links
+                .iter()
+                .find(|link| link.y == index && column >= link.start && column < link.end)
+        {
+            return Some(Target::Link(link.url.clone()));
+        }
         self.targets
             .iter()
             .find(|(target_row, _)| *target_row == index)
@@ -81,12 +113,12 @@ impl Reader {
         self.opened = Some(content);
         self.security = Some(status);
         self.body = None;
-        self.rows = None;
+        self.forget_layouts();
     }
 
     pub fn set_security(&mut self, status: String) {
         self.security = Some(status);
-        self.rows = None;
+        self.forget_layouts();
     }
 
     pub fn mail_id(&self) -> &str {
@@ -116,11 +148,73 @@ impl Reader {
 
     /// Lays the message out again, after pictures arrive.
     pub fn invalidate(&mut self) {
-        self.rows = None;
+        self.forget_layouts();
     }
 
+    fn forget_layouts(&mut self) {
+        self.rows = None;
+        self.cache.clear();
+    }
+
+    /// Keeps showing the current layout while the window changes size, and lays it
+    /// out again once it has been still for a moment.
+    pub fn defer_layout(&mut self) {
+        self.defer_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
+    }
+
+    pub fn scroll_left(&mut self, amount: u16) {
+        self.hscroll = self.hscroll.saturating_sub(amount);
+    }
+
+    pub fn scroll_right(&mut self, amount: u16) {
+        self.hscroll = self.hscroll.saturating_add(amount).min(self.max_hscroll);
+    }
+
+    /// Whether the body is wider than the window.
+    pub fn scrolls_sideways(&self) -> bool {
+        self.max_hscroll > 0
+    }
+
+    /// Scrolls so that `row` of the scroll bar's `height` rows is in view.
+    pub fn scroll_to_fraction(&mut self, row: u16, height: u16) {
+        let height = height.max(1);
+        let target = u32::from(self.max_scroll) * u32::from(row.min(height - 1))
+            / u32::from((height - 1).max(1));
+        self.scroll = target as u16;
+    }
+
+    /// The column of the vertical scroll bar and the rows it covers, when shown.
+    pub fn scrollbar(&self) -> Option<(u16, u16, u16)> {
+        (self.max_scroll > 0 && self.frame_area.height > 2).then(|| {
+            (
+                self.frame_area.right().saturating_sub(1),
+                self.frame_area.y + 1,
+                self.frame_area.height - 2,
+            )
+        })
+    }
+
+    /// Switches HTML between its own colours and the reader's. Returns whether the
+    /// message's own colours are now shown.
+    pub fn toggle_colors(&mut self, mail: &Mail) -> bool {
+        let body = self.body(mail);
+        body.original_colors = !body.original_colors;
+        let original = body.original_colors;
+        self.forget_layouts();
+        original
+    }
+
+    pub fn is_html(&mut self, mail: &Mail) -> bool {
+        self.body(mail).is_html()
+    }
+
+    /// The outer frame drawn last, for moving and resizing the window with the mouse.
+    pub fn frame_area(&self) -> Rect {
+        self.frame_area
+    }
+
+    /// Draws the reader as a window at `area`.
     pub fn draw(&mut self, frame: &mut Frame, area: Rect, mail: &Mail, picker: Option<&Picker>) {
-        let area = reader_area(area);
         self.render(frame, area, mail, picker, true);
     }
 
@@ -142,12 +236,23 @@ impl Reader {
         picker: Option<&Picker>,
         clear: bool,
     ) {
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme::border(true))
             .title_style(theme::title(true))
-            .title(" message ")
             .bg(theme::surface());
+        if clear {
+            // A window shows what it holds and how to handle it.
+            let room = usize::from(area.width.saturating_sub(40)).max(8);
+            let subject: String = mail.subject.chars().take(room).collect();
+            block = block.title(format!(" {subject} ")).title_top(
+                Line::from(" f full · +/- size · t colours ")
+                    .style(theme::muted())
+                    .right_aligned(),
+            );
+        } else {
+            block = block.title(" message ");
+        }
         let inner = block.inner(area);
         self.frame_area = area;
         self.text_area = inner;
@@ -156,46 +261,93 @@ impl Reader {
         }
         frame.render_widget(block, area);
         let width = inner.width;
-        if self
-            .rows
-            .as_ref()
-            .is_none_or(|(laid_out, _)| *laid_out != width)
-        {
-            let rows = self.layout(mail, width, picker);
-            self.rows = Some((width, rows));
+        let deferring = self.rows.is_some()
+            && self
+                .defer_until
+                .is_some_and(|until| std::time::Instant::now() < until);
+        if !deferring {
+            self.defer_until = None;
         }
-        let Some((_, rows)) = &self.rows else {
+        if !deferring
+            && self
+                .rows
+                .as_ref()
+                .is_none_or(|(laid_out, _)| *laid_out != width)
+        {
+            let cached = self
+                .cache
+                .iter()
+                .position(|(laid_out, _)| *laid_out == width);
+            let laid = match cached {
+                Some(index) => self.cache.remove(index).1,
+                None => self.layout(mail, width, picker),
+            };
+            if let Some(previous) = self.rows.replace((width, laid)) {
+                self.cache.insert(0, previous);
+                self.cache.truncate(4);
+            }
+        }
+        let Some((_, laid)) = &self.rows else {
             return;
         };
         let viewport = usize::from(inner.height);
-        self.max_scroll = rows.len().saturating_sub(viewport) as u16;
+        self.max_scroll = laid.lines.len().saturating_sub(viewport) as u16;
         self.scroll = self.scroll.min(self.max_scroll);
+        self.max_hscroll = laid.width.saturating_sub(width);
+        self.hscroll = self.hscroll.min(self.max_hscroll);
         let scroll = usize::from(self.scroll);
-        let mut drew_images = false;
-        for (offset, row) in rows.iter().enumerate().skip(scroll).take(viewport) {
+        let shift = usize::from(self.hscroll);
+        for (offset, line) in laid.lines.iter().enumerate().skip(scroll).take(viewport) {
             let y = inner.y + (offset - scroll) as u16;
-            let line_area = Rect::new(inner.x, y, width, 1);
-            match row {
-                Row::Line(line) => frame
-                    .render_widget(Paragraph::new(line.clone()).style(theme::text()), line_area),
-                Row::Image { slot, height } => {
-                    let fits = offset - scroll + usize::from(*height) <= viewport;
-                    match self.body.as_ref().and_then(|body| body.protocol(*slot)) {
-                        Some(protocol) if fits => {
-                            frame.render_widget(
-                                Image::new(protocol),
-                                Rect::new(inner.x, y, width, *height),
-                            );
-                            drew_images = true;
-                        }
-                        _ => frame.render_widget(cut_image(), line_area),
-                    }
+            let line = if shift > 0 {
+                crop(line, shift)
+            } else {
+                line.clone()
+            };
+            frame.render_widget(
+                Paragraph::new(line).style(theme::text()),
+                Rect::new(inner.x, y, width, 1),
+            );
+        }
+        let mut drew_images = false;
+        for image in &laid.images {
+            let top = image.y;
+            let bottom = image.y + usize::from(image.height);
+            if bottom <= scroll || top >= scroll + viewport {
+                continue;
+            }
+            // Pictures move with sideways scrolling and are only drawn whole.
+            let Some(left) = image.x.checked_sub(self.hscroll) else {
+                continue;
+            };
+            if left >= width {
+                continue;
+            }
+            let x = inner.x + left;
+            let w = image.width.min(width - left);
+            let whole = w == image.width;
+            if top >= scroll && bottom <= scroll + viewport && whole {
+                if let Some(protocol) = self
+                    .body
+                    .as_ref()
+                    .and_then(|body| body.protocol(image.slot))
+                {
+                    frame.render_widget(
+                        Image::new(protocol),
+                        Rect::new(x, inner.y + (top - scroll) as u16, w, image.height),
+                    );
+                    drew_images = true;
                 }
-                // Part of a picture that is scrolled half out of view.
-                Row::Covered { start } if *start < scroll => {
-                    frame.render_widget(cut_image(), line_area);
+            } else {
+                // Part of a picture scrolled out of view: shade what is left of it.
+                let first = top.max(scroll);
+                let last = bottom.min(scroll + viewport);
+                for row in first..last {
+                    frame.render_widget(
+                        cut_image(usize::from(w)),
+                        Rect::new(x, inner.y + (row - scroll) as u16, w, 1),
+                    );
                 }
-                Row::Covered { .. } => {}
             }
         }
         self.drew_images = drew_images;
@@ -204,7 +356,7 @@ impl Reader {
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
                 .end_symbol(None);
-            let mut state = ScrollbarState::new(rows.len())
+            let mut state = ScrollbarState::new(laid.lines.len())
                 .position(scroll)
                 .viewport_content_length(viewport);
             frame.render_stateful_widget(
@@ -216,9 +368,32 @@ impl Reader {
                 &mut state,
             );
         }
+        if self.max_hscroll > 0 {
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
+                .begin_symbol(Some("◀"))
+                .end_symbol(Some("▶"));
+            let mut state = ScrollbarState::new(usize::from(self.max_hscroll) + usize::from(width))
+                .position(shift)
+                .viewport_content_length(usize::from(width));
+            frame.render_stateful_widget(
+                scrollbar,
+                area.inner(Margin {
+                    vertical: 0,
+                    horizontal: 1,
+                }),
+                &mut state,
+            );
+        }
+        if clear && area.width > 2 && area.height > 2 {
+            // The corner handle that resizes the window.
+            frame.render_widget(
+                Paragraph::new("◢").style(theme::title(true)),
+                Rect::new(area.right() - 1, area.bottom() - 1, 1, 1),
+            );
+        }
     }
 
-    fn layout(&mut self, mail: &Mail, width: u16, picker: Option<&Picker>) -> Vec<Row> {
+    fn layout(&mut self, mail: &Mail, width: u16, picker: Option<&Picker>) -> Laid {
         let body = self.body(mail);
         let blocked = body.has_blocked();
         let mut lines = header_lines(mail, blocked);
@@ -267,46 +442,92 @@ impl Reader {
         }
         let first_file = lines.len() - mail.attachments.len();
         let mut targets = Vec::new();
-        let mut rows: Vec<Row> = Vec::new();
+        let mut laid = Laid::default();
         for (index, line) in lines.into_iter().enumerate() {
-            let start = rows.len();
-            rows.extend(wrap(line, width).into_iter().map(Row::Line));
+            let start = laid.lines.len();
+            laid.lines.extend(wrap(line, width));
             if index >= first_file {
-                for row in start..rows.len() {
+                for row in start..laid.lines.len() {
                     targets.push((row, Target::Attachment(index - first_file)));
                 }
             }
         }
-        rows.push(Row::Line(Line::default()));
-        rows.extend(self.body(mail).rows(width, picker));
-        if !mail.links.is_empty() {
-            rows.push(Row::Line(Line::default()));
-            rows.push(Row::Line(Line::styled("links", theme::muted())));
+        laid.lines.push(Line::default());
+        let top = laid.lines.len();
+        let body = self.body(mail);
+        let html = body.is_html();
+        let page = body.layout(width, picker);
+        laid.width = page.width.max(width);
+        laid.lines.extend(page.lines);
+        laid.images = page
+            .images
+            .into_iter()
+            .map(|image| Placed {
+                y: image.y + top,
+                ..image
+            })
+            .collect();
+        laid.links = page
+            .links
+            .into_iter()
+            .map(|link| LinkArea {
+                y: link.y + top,
+                ..link
+            })
+            .collect();
+        // Plain-text mail lists its links below; HTML links are clickable in place.
+        if !mail.links.is_empty() && !html {
+            laid.lines.push(Line::default());
+            laid.lines.push(Line::styled("links", theme::muted()));
             for (index, link) in mail.links.iter().enumerate() {
-                let start = rows.len();
-                rows.extend(
-                    wrap(
-                        Line::styled(
-                            format!("  {}. {link}", index + 1),
-                            theme::text().add_modifier(Modifier::UNDERLINED),
-                        ),
-                        width,
-                    )
-                    .into_iter()
-                    .map(Row::Line),
-                );
-                for row in start..rows.len() {
+                let start = laid.lines.len();
+                laid.lines.extend(wrap(
+                    Line::styled(
+                        format!("  {}. {link}", index + 1),
+                        theme::text().add_modifier(Modifier::UNDERLINED),
+                    ),
+                    width,
+                ));
+                for row in start..laid.lines.len() {
                     targets.push((row, Target::Link(link.clone())));
                 }
             }
         }
         self.targets = targets;
-        rows
+        laid
     }
 }
 
-fn cut_image() -> Paragraph<'static> {
-    Paragraph::new("░".repeat(4)).style(theme::muted())
+/// The part of a line from column `start` on.
+fn crop(line: &Line<'static>, start: usize) -> Line<'static> {
+    let mut skipped = 0;
+    let mut spans = Vec::new();
+    for span in &line.spans {
+        if skipped >= start {
+            spans.push(span.clone());
+            continue;
+        }
+        let mut kept = String::new();
+        for character in span.content.chars() {
+            if skipped >= start {
+                kept.push(character);
+            } else {
+                skipped += unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+                // A wide character cut in half leaves a space behind.
+                if skipped > start {
+                    kept.push(' ');
+                }
+            }
+        }
+        if !kept.is_empty() {
+            spans.push(Span::styled(kept, span.style));
+        }
+    }
+    Line::from(spans).style(line.style)
+}
+
+fn cut_image(width: usize) -> Paragraph<'static> {
+    Paragraph::new("░".repeat(width.max(1))).style(theme::muted())
 }
 
 fn header_lines(mail: &Mail, blocked: bool) -> Vec<Line<'static>> {
@@ -378,22 +599,6 @@ fn header_line(label: &str, value: &str, bold: bool) -> Line<'static> {
     ])
 }
 
-fn reader_area(area: Rect) -> Rect {
-    // Wide enough for the 600-pixel layouts most HTML mail is designed for.
-    let width = area
-        .width
-        .saturating_sub(4)
-        .min(crate::settings::with(|ui| ui.reader_max_width));
-    let height = area.height.saturating_sub(4);
-
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use crate::mail::{Attachment, demo_mails};
@@ -462,6 +667,5 @@ mod tests {
 
         assert!(screen.contains("html"));
         assert!(screen.contains("report.pdf"));
-        assert!(screen.contains("https://example.com/report"));
     }
 }

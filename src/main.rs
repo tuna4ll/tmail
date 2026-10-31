@@ -88,7 +88,7 @@ async fn main() -> color_eyre::Result<()> {
     theme::init(&config.theme).map_err(color_eyre::eyre::Error::msg)?;
     settings::init(config.ui.clone()).map_err(color_eyre::eyre::Error::msg)?;
     settings::init_compose(config.compose.clone()).map_err(color_eyre::eyre::Error::msg)?;
-    settings::init_reader(config.reader.clone());
+    settings::init_reader(config.reader.clone()).map_err(color_eyre::eyre::Error::msg)?;
     keymap::Keymap::from_config(&config.keys).map_err(color_eyre::eyre::Error::msg)?;
     if let Some(account) = &options.oauth {
         if let Err(error) = oauth::run(&config, account.as_deref()) {
@@ -222,7 +222,11 @@ pub struct App {
     workspace_area: Option<Rect>,
     reader_area: Option<Rect>,
     reader_docked: bool,
+    /// The reader window after the user moved or resized it.
+    popup: Option<Rect>,
+    popup_maximized: bool,
     screen_width: u16,
+    screen_height: u16,
     /// q was pressed once with ui.confirm_quit on.
     confirm_quit: bool,
     script: Option<script::Engine>,
@@ -576,7 +580,10 @@ impl App {
             workspace_area: None,
             reader_area: None,
             reader_docked: false,
+            popup: None,
+            popup_maximized: false,
             screen_width: 0,
+            screen_height: 0,
             confirm_quit: false,
             script: None,
             script_folder: String::new(),
@@ -597,7 +604,7 @@ impl App {
 
         while self.running {
             if std::mem::take(&mut self.clear_screen) {
-                terminal.clear()?;
+                terminal::clear(&mut terminal)?;
             }
             terminal.draw(|frame| self.draw(frame))?;
             tokio::select! {
@@ -657,11 +664,18 @@ impl App {
                     }
                 }
             }
-            if let Some(state) = self.pending_editor.take() {
-                terminal = self.edit_composer_body(state)?;
-            }
-            if let Some(job) = self.pending_terminal.take() {
-                terminal = self.run_terminal_job(job)?;
+            if self.pending_editor.is_some() || self.pending_terminal.is_some() {
+                // The event reader keeps reading the terminal in the background; stop it
+                // so the editor or a passphrase prompt gets every key, and start a new one
+                // afterwards.
+                drop(event_stream);
+                if let Some(state) = self.pending_editor.take() {
+                    terminal = self.edit_composer_body(state)?;
+                }
+                if let Some(job) = self.pending_terminal.take() {
+                    terminal = self.run_terminal_job(job)?;
+                }
+                event_stream = EventStream::new();
             }
         }
 
@@ -1310,11 +1324,18 @@ mod tests {
         assert_eq!(command, vec!["work-sender"]);
     }
 
-    #[test]
-    fn docks_readers_only_when_they_fit() {
-        assert!(reader_is_docked(120, true));
-        assert!(!reader_is_docked(100, true));
-        assert!(!reader_is_docked(120, false));
+    #[tokio::test]
+    async fn reader_opens_as_a_window_unless_docking_is_chosen() {
+        assert!(!reader_is_docked(160, true));
+        let popup = super::App::new(MailboxSource::Demo, Default::default())
+            .popup_rect(ratatui::layout::Rect::new(0, 0, 100, 40));
+        assert_eq!((popup.width, popup.height), (84, 36));
+        assert_eq!((popup.x, popup.y), (8, 2));
+        let tiny = super::ui::clamp_rect(
+            ratatui::layout::Rect::new(90, 30, 5, 2),
+            ratatui::layout::Rect::new(0, 0, 100, 40),
+        );
+        assert_eq!(tiny, ratatui::layout::Rect::new(70, 30, 30, 8));
     }
 
     #[test]

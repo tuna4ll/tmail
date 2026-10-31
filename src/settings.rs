@@ -16,7 +16,7 @@ pub struct UiConfig {
     pub split_min_width: u16,
     /// From this width the reader docks beside the map instead of covering it.
     pub dock_min_width: u16,
-    /// The widest the floating reader gets.
+    /// The widest the reader window opens, in columns; 0 for no limit.
     pub reader_max_width: u16,
     /// Date formats (strftime) for today, this year, older mail and message headers.
     pub time_format: String,
@@ -57,7 +57,7 @@ impl Default for UiConfig {
             reader_width: 44,
             split_min_width: 78,
             dock_min_width: 112,
-            reader_max_width: 100,
+            reader_max_width: 0,
             time_format: "%H:%M".into(),
             day_format: "%-d %b".into(),
             date_format: "%-d %b %Y".into(),
@@ -142,16 +142,51 @@ impl Default for ComposeConfig {
 }
 
 /// The `[reader]` table.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReaderConfig {
+    /// `original` draws HTML mail in its own colours, `theme` in the reader's.
+    pub html_colors: String,
+    /// Opens messages in a window over the list (`popup`) or beside it (`docked`).
+    pub layout: String,
+    /// The window's size in percent of the screen.
+    pub popup_width: u16,
+    pub popup_height: u16,
     /// Loads remote images without asking.
     pub remote_images: bool,
     /// Loads remote images from these senders: whole addresses or `@domain`.
     pub remote_images_from: Vec<String>,
 }
 
+impl Default for ReaderConfig {
+    fn default() -> Self {
+        Self {
+            html_colors: "original".into(),
+            layout: "popup".into(),
+            popup_width: 84,
+            popup_height: 90,
+            remote_images: false,
+            remote_images_from: Vec::new(),
+        }
+    }
+}
+
 impl ReaderConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !["original", "theme"].contains(&self.html_colors.as_str()) {
+            return Err("reader.html_colors must be \"original\" or \"theme\".".into());
+        }
+        if !["popup", "docked"].contains(&self.layout.as_str()) {
+            return Err("reader.layout must be \"popup\" or \"docked\".".into());
+        }
+        if !(20..=100).contains(&self.popup_width) || !(20..=100).contains(&self.popup_height) {
+            return Err(
+                "reader.popup_width and popup_height are percentages from 20 to 100.".into(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn trusts(&self, address: &str) -> bool {
         let address = address.to_lowercase();
         self.remote_images
@@ -180,10 +215,12 @@ pub fn init_compose(config: ComposeConfig) -> Result<(), String> {
     Ok(())
 }
 
-pub fn init_reader(config: ReaderConfig) {
+pub fn init_reader(config: ReaderConfig) -> Result<(), String> {
+    config.validate()?;
     if let Ok(mut reader) = READER.write() {
         *reader = Some(config);
     }
+    Ok(())
 }
 
 pub fn compose() -> ComposeConfig {
@@ -244,10 +281,7 @@ pub fn set(name: &str, value: serde_json::Value) -> Result<(), String> {
     }
     match name.split_once('.') {
         Some(("compose", field)) => init_compose(replace(compose(), "compose", field, value)?),
-        Some(("reader", field)) => {
-            init_reader(replace(reader(), "reader", field, value)?);
-            Ok(())
-        }
+        Some(("reader", field)) => init_reader(replace(reader(), "reader", field, value)?),
         Some(("ui", field)) => init(replace(get(), "ui", field, value)?),
         Some((table, _)) => Err(format!(
             "Scripts can set ui, compose and reader settings, not {table}."

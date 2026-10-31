@@ -197,6 +197,10 @@ impl App {
             self.overlay = Some(Overlay::AccountSetup(form));
             return;
         }
+        let Some(root) = self.config.maildir.clone() else {
+            self.notice = Some("The account has no Maildir. Edit it with p, then e.".into());
+            return;
+        };
         self.onboarding = false;
         self.last_sync.clear();
         self.stop_watchers();
@@ -205,7 +209,7 @@ impl App {
         self.filter = InboxFilter::All;
         self.undo = None;
         self.reader = None;
-        self.source = MailboxSource::Maildir(self.config.maildir.clone().unwrap());
+        self.source = MailboxSource::Maildir(root);
         self.account_label = self.config.current_account().label();
         self.notice = Some("Account connected".into());
         self.reload();

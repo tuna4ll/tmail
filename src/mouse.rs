@@ -13,6 +13,24 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 pub(crate) enum Divider {
     Inbox,
     Reader,
+    /// Moving the reader window, holding it this far from its corner.
+    Window {
+        dx: u16,
+        dy: u16,
+    },
+    /// Dragging the reader's scroll bar.
+    Scrollbar,
+    /// Holding the page and moving it, from this cell.
+    Pan {
+        column: u16,
+        row: u16,
+    },
+    /// Resizing the reader window by its left, right or bottom edge.
+    Size {
+        left: bool,
+        right: bool,
+        bottom: bool,
+    },
 }
 
 /// Where the open overlay was drawn, for mouse hits.
@@ -98,18 +116,23 @@ impl App {
         if self.handle_divider(mouse) {
             return;
         }
+        if self.handle_window(mouse, double) {
+            return;
+        }
 
         if let Some(reader) = &mut self.reader {
             let docked = self.reader_docked;
             if reader.contains(column, row) {
                 let target = reader.target_at(column, row);
+                let lines = settings::with(|ui| ui.scroll_lines);
+                let sideways = mouse.modifiers.contains(KeyModifiers::SHIFT);
                 match mouse.kind {
-                    MouseEventKind::ScrollDown => {
-                        reader.scroll_down(settings::with(|ui| ui.scroll_lines))
-                    }
-                    MouseEventKind::ScrollUp => {
-                        reader.scroll_up(settings::with(|ui| ui.scroll_lines))
-                    }
+                    MouseEventKind::ScrollDown if sideways => reader.scroll_right(lines * 3),
+                    MouseEventKind::ScrollUp if sideways => reader.scroll_left(lines * 3),
+                    MouseEventKind::ScrollRight => reader.scroll_right(lines * 3),
+                    MouseEventKind::ScrollLeft => reader.scroll_left(lines * 3),
+                    MouseEventKind::ScrollDown => reader.scroll_down(lines),
+                    MouseEventKind::ScrollUp => reader.scroll_up(lines),
                     MouseEventKind::Down(MouseButton::Left) => match target {
                         Some(widgets::reader::Target::Link(link)) => {
                             self.notice = Some(match opener::open(&link) {
@@ -188,6 +211,149 @@ impl App {
         }
     }
 
+    /// Moves the reader window by its title bar and resizes it by its right and bottom
+    /// edges. A double click on the title maximises it.
+    fn handle_window(&mut self, mouse: MouseEvent, double: bool) -> bool {
+        let Some(reader) = &self.reader else {
+            return false;
+        };
+        let area = reader.frame_area();
+        let scrollbar = reader.scrollbar();
+        let (column, row) = (mouse.column, mouse.row);
+        let docked = self.reader_docked;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !inside(area, column, row) {
+                    return false;
+                }
+                let corner = column + 1 == area.right() && row + 1 == area.bottom();
+                if let Some((x, top, height)) = scrollbar
+                    && column == x
+                    && row >= top
+                    && row < top + height
+                    && !corner
+                {
+                    self.dragging = Some(Divider::Scrollbar);
+                    if let Some(reader) = &mut self.reader {
+                        reader.scroll_to_fraction(row - top, height);
+                    }
+                    return true;
+                }
+                if !docked {
+                    let left = column == area.x && row > area.y;
+                    let right = column + 1 == area.right();
+                    let bottom = row + 1 == area.bottom();
+                    if left || right || bottom {
+                        self.dragging = Some(Divider::Size {
+                            left,
+                            right: right && !left,
+                            bottom,
+                        });
+                        return true;
+                    }
+                    if row == area.y {
+                        if double {
+                            self.toggle_popup_maximized();
+                        } else {
+                            self.dragging = Some(Divider::Window {
+                                dx: column - area.x,
+                                dy: row - area.y,
+                            });
+                        }
+                        return true;
+                    }
+                }
+                // Pressing on the text, away from links and files, grabs the page.
+                if row > area.y && reader.target_at(column, row).is_none() {
+                    self.dragging = Some(Divider::Pan { column, row });
+                    return true;
+                }
+                false
+            }
+            MouseEventKind::Drag(MouseButton::Left) => match self.dragging {
+                Some(Divider::Window { dx, dy }) => {
+                    let x = column.saturating_sub(dx);
+                    let y = row.saturating_sub(dy);
+                    self.place_popup(Rect::new(x, y, area.width, area.height));
+                    true
+                }
+                Some(Divider::Size {
+                    left,
+                    right,
+                    bottom,
+                }) => {
+                    let (x, width) = if left {
+                        let x = column.min(area.right().saturating_sub(ui::MIN_POPUP.0));
+                        (x, area.right() - x)
+                    } else if right {
+                        (area.x, (column + 1).saturating_sub(area.x))
+                    } else {
+                        (area.x, area.width)
+                    };
+                    let height = if bottom {
+                        (row + 1).saturating_sub(area.y)
+                    } else {
+                        area.height
+                    };
+                    self.place_popup(Rect::new(x, area.y, width, height));
+                    if let Some(reader) = &mut self.reader {
+                        reader.defer_layout();
+                    }
+                    true
+                }
+                Some(Divider::Scrollbar) => {
+                    if let (Some((_, top, height)), Some(reader)) = (scrollbar, &mut self.reader) {
+                        reader.scroll_to_fraction(row.saturating_sub(top), height);
+                    }
+                    true
+                }
+                Some(Divider::Pan {
+                    column: from_column,
+                    row: from_row,
+                }) => {
+                    if let Some(reader) = &mut self.reader {
+                        if row > from_row {
+                            reader.scroll_up(row - from_row);
+                        } else {
+                            reader.scroll_down(from_row - row);
+                        }
+                        if column > from_column {
+                            reader.scroll_left(column - from_column);
+                        } else {
+                            reader.scroll_right(from_column - column);
+                        }
+                    }
+                    self.dragging = Some(Divider::Pan { column, row });
+                    if self.graphics_shown() {
+                        self.clear_screen = true;
+                    }
+                    true
+                }
+                _ => false,
+            },
+            MouseEventKind::Up(MouseButton::Left)
+                if matches!(
+                    self.dragging,
+                    Some(
+                        Divider::Window { .. }
+                            | Divider::Size { .. }
+                            | Divider::Scrollbar
+                            | Divider::Pan { .. }
+                    )
+                ) =>
+            {
+                let moved = matches!(
+                    self.dragging,
+                    Some(Divider::Window { .. } | Divider::Size { .. })
+                );
+                self.dragging = None;
+                self.clear_screen |= moved || self.graphics_shown();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Starts, continues or ends dragging a pane border.
     fn handle_divider(&mut self, mouse: MouseEvent) -> bool {
         match mouse.kind {
@@ -211,7 +377,10 @@ impl App {
                 false
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                let Some(divider) = self.dragging else {
+                let Some(divider) = self
+                    .dragging
+                    .filter(|divider| matches!(divider, Divider::Inbox | Divider::Reader))
+                else {
                     return false;
                 };
                 let width = self.screen_width;
@@ -227,11 +396,17 @@ impl App {
                             .saturating_sub(mouse.column)
                             .clamp(30, (width / 2).max(30));
                     }
+                    _ => {}
                 }
                 self.clear_screen = self.graphics_shown();
                 true
             }
-            MouseEventKind::Up(MouseButton::Left) => self.dragging.take().is_some(),
+            MouseEventKind::Up(MouseButton::Left)
+                if matches!(self.dragging, Some(Divider::Inbox | Divider::Reader)) =>
+            {
+                self.dragging = None;
+                true
+            }
             _ => false,
         }
     }

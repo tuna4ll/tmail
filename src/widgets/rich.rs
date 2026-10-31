@@ -3,12 +3,11 @@
 
 use std::path::Path;
 
-use html2text::render::RichAnnotation;
 use image::DynamicImage;
 use mail_parser::{MessageParser, MimeHeaders};
 use ratatui::{
     layout::Size,
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
 };
 use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
@@ -20,8 +19,8 @@ use crate::{mail::Mail, theme};
 const MAX_IMAGE_ROWS: u16 = 24;
 /// Images this small or smaller are tracking pixels.
 const PIXEL: u32 = 2;
-const MARK_START: char = '\u{E000}';
-const MARK_END: char = '\u{E001}';
+const MARK_START: char = super::html::IMAGE_START;
+const MARK_END: char = super::html::IMAGE_END;
 /// Pictures beyond these limits are shown by their alt text instead of decoded.
 const MAX_DIMENSION: u32 = 8192;
 const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
@@ -42,6 +41,9 @@ pub struct Slot {
     pub alt: String,
     pub picture: Picture,
     protocol: Option<(Size, Protocol)>,
+    /// The size the HTML asks for, in pixels.
+    width_px: Option<u32>,
+    height_px: Option<u32>,
 }
 
 impl Slot {
@@ -50,6 +52,8 @@ impl Slot {
             alt,
             picture,
             protocol: None,
+            width_px: None,
+            height_px: None,
         }
     }
 
@@ -89,17 +93,14 @@ impl Slot {
     }
 }
 
-pub enum Row {
-    Line(Line<'static>),
-    /// The first row of a picture that is `height` rows tall.
-    Image {
-        slot: usize,
-        height: u16,
-    },
-    /// A row covered by the picture that starts at `start`.
-    Covered {
-        start: usize,
-    },
+/// A laid-out message body: text rows, and pictures and links placed on them.
+#[derive(Default)]
+pub struct Layout {
+    /// The width the rows take; wider than the window when the body scrolls sideways.
+    pub width: u16,
+    pub lines: Vec<Line<'static>>,
+    pub images: Vec<super::html::Placed>,
+    pub links: Vec<super::html::LinkArea>,
 }
 
 #[derive(Default)]
@@ -109,15 +110,20 @@ pub struct Body {
     pub slots: Vec<Slot>,
     /// Pictures attached to the message rather than placed in its HTML.
     trailing: Vec<usize>,
+    /// Draws HTML in the message's own colours instead of the reader's.
+    pub original_colors: bool,
+    /// The parsed HTML, kept so a new width does not parse it again.
+    document: Option<super::html::Document>,
 }
 
 impl Body {
-    /// Reads the message file for its HTML and pictures, falling back to the cached text.
-    /// Like `load`, reading `content` instead of the file when given, such as a
-    /// decrypted message.
+    /// Reads the message file for its HTML and pictures, falling back to the cached
+    /// text, or reads `content` instead of the file when given, such as a decrypted
+    /// message.
     pub fn load_from(mail: &Mail, content: Option<&[u8]>) -> Self {
         let mut body = Self {
             text: mail.body.clone(),
+            original_colors: crate::settings::reader().html_colors != "theme",
             ..Self::default()
         };
         let Some(contents) = content.map(<[u8]>::to_vec).or_else(|| {
@@ -189,130 +195,81 @@ impl Body {
             slot.picture = bytes.map_or(Picture::Failed, Picture::Bytes);
             slot.protocol = None;
         }
+        if let Some(document) = &self.document {
+            document.forget_measures();
+        }
     }
 
-    pub fn rows(&mut self, width: u16, picker: Option<&Picker>) -> Vec<Row> {
-        let mut rows = Vec::new();
-        let html = self.html.clone();
-        let rendered = html.as_deref().and_then(|html| {
-            html2text::config::rich()
-                .use_doc_css()
-                .no_table_borders()
-                .allow_width_overflow()
-                .link_footnotes(false)
-                .lines_from_read(html.as_bytes(), usize::from(width.max(8)))
-                .ok()
-        });
-        match rendered {
-            Some(lines) => {
-                for line in lines {
-                    let mut spans: Vec<Span<'static>> = line
-                        .tagged_strings()
-                        .map(|tagged| Span::styled(tagged.s.clone(), style_for(&tagged.tag)))
-                        .collect();
-                    heading(&mut spans);
-                    self.push_marked(Line::from(spans), width, picker, &mut rows);
+    pub fn is_html(&self) -> bool {
+        self.html.is_some()
+    }
+
+    /// Lays the body out `width` columns wide.
+    pub fn layout(&mut self, width: u16, picker: Option<&Picker>) -> Layout {
+        let mut layout = Layout::default();
+        if let Some(html) = &self.html {
+            let document = self
+                .document
+                .get_or_insert_with(|| super::html::Document::parse(html));
+            let options = super::html::Options {
+                original: self.original_colors,
+                surface: rgb_of(theme::surface()),
+                text: rgb_of(theme::text_color()),
+                link: rgb_of(theme::accent()),
+            };
+            let slots = &mut self.slots;
+            let mut size = |slot: usize, room: u16| -> Result<(u16, u16), Option<String>> {
+                let slot = slots.get_mut(slot).ok_or(None)?;
+                fit(slot, room, picker)
+            };
+            match crate::terminal::guarded(|| {
+                super::html::render_document(document, width, options, &mut size)
+            }) {
+                Some(page) => {
+                    layout.width = page.width;
+                    layout.lines = page.lines;
+                    layout.images = page.images;
+                    layout.links = page.links;
                 }
-            }
-            None => {
-                for line in self.text.lines() {
-                    for line in wrap(Line::from(line.to_owned()), width) {
-                        rows.push(Row::Line(line));
+                // The layout engine gave up on this message; its text still reads fine.
+                None => {
+                    for line in self.text.lines() {
+                        layout
+                            .lines
+                            .extend(wrap(Line::from(line.to_owned()), width));
                     }
                 }
             }
+        } else {
+            for line in self.text.lines() {
+                layout
+                    .lines
+                    .extend(wrap(Line::from(line.to_owned()), width));
+            }
         }
+        layout.width = layout.width.max(width);
         for index in self.trailing.clone() {
-            rows.push(Row::Line(Line::default()));
-            self.push_image(index, width, picker, &mut rows);
-        }
-        rows
-    }
-
-    /// Splits a line at picture markers, putting each picture on its own rows.
-    fn push_marked(
-        &mut self,
-        line: Line<'static>,
-        width: u16,
-        picker: Option<&Picker>,
-        rows: &mut Vec<Row>,
-    ) {
-        let mut current: Vec<Span<'static>> = Vec::new();
-        let mut pictures = Vec::new();
-        for span in line.spans {
-            let mut rest = span.content.as_ref();
-            while let Some(start) = rest.find(MARK_START) {
-                let Some(end) = rest[start..].find(MARK_END) else {
-                    break;
-                };
-                if start > 0 {
-                    current.push(Span::styled(rest[..start].to_owned(), span.style));
+            layout.lines.push(Line::default());
+            let Some(slot) = self.slots.get_mut(index) else {
+                continue;
+            };
+            match fit(slot, width, picker) {
+                Ok((columns, rows)) => {
+                    let y = layout.lines.len();
+                    layout.images.push(super::html::Placed {
+                        slot: index,
+                        x: 0,
+                        y,
+                        width: columns,
+                        height: rows,
+                    });
+                    layout.lines.extend((0..rows).map(|_| Line::default()));
                 }
-                if let Ok(index) = rest[start + MARK_START.len_utf8()..start + end].parse() {
-                    pictures.push(index);
-                }
-                rest = &rest[start + end + MARK_END.len_utf8()..];
-            }
-            if !rest.is_empty() {
-                current.push(Span::styled(rest.to_owned(), span.style));
+                Err(Some(label)) => layout.lines.push(Line::styled(label, theme::muted())),
+                Err(None) => {}
             }
         }
-        let text = Line::from(current);
-        if pictures.is_empty()
-            || text
-                .spans
-                .iter()
-                .any(|span| !span.content.trim().is_empty())
-        {
-            for line in wrap(text, width) {
-                rows.push(Row::Line(line));
-            }
-        }
-        for index in pictures {
-            self.push_image(index, width, picker, rows);
-        }
-    }
-
-    fn push_image(
-        &mut self,
-        index: usize,
-        width: u16,
-        picker: Option<&Picker>,
-        rows: &mut Vec<Row>,
-    ) {
-        let Some(slot) = self.slots.get_mut(index) else {
-            return;
-        };
-        let label = slot.label();
-        let protocol = picker.and_then(|picker| {
-            let image = slot.decoded()?.clone();
-            let available = Size::new(width, MAX_IMAGE_ROWS);
-            let size = Resize::Fit(None).size_for(&image, picker.font_size(), available);
-            if size.width == 0 || size.height == 0 {
-                return None;
-            }
-            if !slot
-                .protocol
-                .as_ref()
-                .is_some_and(|(cached, _)| *cached == size)
-            {
-                let protocol = picker.new_protocol(image, size, Resize::Fit(None)).ok()?;
-                slot.protocol = Some((size, protocol));
-            }
-            Some(size.height)
-        });
-        match protocol {
-            Some(height) => {
-                let start = rows.len();
-                rows.push(Row::Image {
-                    slot: index,
-                    height,
-                });
-                rows.extend((1..height).map(|_| Row::Covered { start }));
-            }
-            None if matches!(slot.picture, Picture::Ready(_)) && slot.decoded().is_none() => {}
-            None => rows.push(Row::Line(Line::styled(label, theme::muted()))),
-        }
+        layout
     }
 
     pub fn protocol(&self, slot: usize) -> Option<&Protocol> {
@@ -322,6 +279,104 @@ impl Body {
             .as_ref()
             .map(|(_, protocol)| protocol)
     }
+}
+
+fn rgb_of(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Indexed(index) => indexed(index),
+        Color::Black => (0, 0, 0),
+        Color::White => (255, 255, 255),
+        _ => (48, 48, 48),
+    }
+}
+
+/// The RGB value of a 256-colour palette entry.
+fn indexed(index: u8) -> (u8, u8, u8) {
+    match index {
+        16..=231 => {
+            let index = index - 16;
+            let level = |value: u8| if value == 0 { 0 } else { 55 + value * 40 };
+            (level(index / 36), level((index / 6) % 6), level(index % 6))
+        }
+        232..=255 => {
+            let level = 8 + (index - 232) * 10;
+            (level, level, level)
+        }
+        _ => [
+            (0, 0, 0),
+            (128, 0, 0),
+            (0, 128, 0),
+            (128, 128, 0),
+            (0, 0, 128),
+            (128, 0, 128),
+            (0, 128, 128),
+            (192, 192, 192),
+            (128, 128, 128),
+            (255, 0, 0),
+            (0, 255, 0),
+            (255, 255, 0),
+            (0, 0, 255),
+            (255, 0, 255),
+            (0, 255, 255),
+            (255, 255, 255),
+        ][usize::from(index)],
+    }
+}
+
+/// How many cells a picture takes, at most `room` columns wide, and its protocol.
+/// Without terminal graphics, or before a remote picture loads, its label is shown.
+fn fit(slot: &mut Slot, room: u16, picker: Option<&Picker>) -> Result<(u16, u16), Option<String>> {
+    let label = slot.label();
+    let Some(picker) = picker else {
+        return Err(Some(label));
+    };
+    if matches!(
+        slot.picture,
+        Picture::Blocked(_) | Picture::Loading | Picture::Failed
+    ) {
+        return Err(Some(label));
+    }
+    let width_px = slot.width_px;
+    let height_px = slot.height_px;
+    let image = match slot.decoded() {
+        Some(image) => image.clone(),
+        None => return Err(None),
+    };
+    let (font_width, font_height) = {
+        let size = picker.font_size();
+        (u32::from(size.width.max(1)), u32::from(size.height.max(1)))
+    };
+    // The size the HTML asks for, else the picture's own, in cells.
+    let (pixels_wide, pixels_high) = match (width_px, height_px) {
+        (Some(width), Some(height)) => (width, height),
+        (Some(width), None) => (width, width * image.height() / image.width().max(1)),
+        (None, Some(height)) => (height * image.width() / image.height().max(1), height),
+        (None, None) => (image.width(), image.height()),
+    };
+    let wanted = Size::new(
+        u16::try_from(pixels_wide.div_ceil(font_width))
+            .unwrap_or(u16::MAX)
+            .clamp(1, room.max(1)),
+        u16::try_from(pixels_high.div_ceil(font_height))
+            .unwrap_or(u16::MAX)
+            .clamp(1, MAX_IMAGE_ROWS),
+    );
+    let size = Resize::Fit(None).size_for(&image, picker.font_size(), wanted);
+    if size.width == 0 || size.height == 0 {
+        return Err(None);
+    }
+    if !slot
+        .protocol
+        .as_ref()
+        .is_some_and(|(cached, _)| *cached == size)
+    {
+        let protocol = picker
+            .new_protocol(image, size, Resize::Fit(None))
+            .map_err(|_| Some(label))?;
+        slot.protocol = Some((size, protocol));
+    }
+    Ok((size.width, size.height))
 }
 
 /// Writes the message's HTML to a private temporary file for a web browser, with
@@ -503,7 +558,15 @@ fn place_images(
                 output.push(MARK_START);
                 output.push_str(&slots.len().to_string());
                 output.push(MARK_END);
-                slots.push(Slot::new(alt, picture));
+                let pixels = |name: &str| {
+                    attribute(name)
+                        .and_then(|value| value.trim().trim_end_matches("px").parse::<u32>().ok())
+                        .filter(|value| *value > 0)
+                };
+                let mut slot = Slot::new(alt, picture);
+                slot.width_px = pixels("width");
+                slot.height_px = pixels("height");
+                slots.push(slot);
             }
             None if !tiny && !alt.trim().is_empty() => {
                 output.push('[');
@@ -602,85 +665,6 @@ fn escape(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Turns html2text's `## ` heading prefix into bold text.
-fn heading(spans: &mut [Span<'static>]) {
-    let Some(first) = spans.first_mut() else {
-        return;
-    };
-    let hashes = first.content.chars().take_while(|c| *c == '#').count();
-    if hashes == 0 || hashes > 6 || !first.content[hashes..].starts_with(' ') {
-        return;
-    }
-    first.content = first.content[hashes + 1..].to_owned().into();
-    for span in spans.iter_mut() {
-        span.style = span.style.add_modifier(Modifier::BOLD);
-    }
-}
-
-fn rgb(colour: &html2text::Colour) -> (u8, u8, u8) {
-    (colour.r, colour.g, colour.b)
-}
-
-/// Relative luminance per WCAG.
-fn luminance((r, g, b): (u8, u8, u8)) -> f64 {
-    let channel = |value: u8| {
-        let value = f64::from(value) / 255.0;
-        if value <= 0.039_28 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
-}
-
-fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
-    let (a, b) = (luminance(a), luminance(b));
-    (a.max(b) + 0.05) / (a.min(b) + 0.05)
-}
-
-/// The reader's background, as the RGB value of `theme::surface()`.
-const SURFACE_RGB: (u8, u8, u8) = (48, 48, 48);
-
-fn style_for(tags: &[RichAnnotation]) -> Style {
-    let mut style = theme::text();
-    let mut foreground = None;
-    let mut background = None;
-    for tag in tags {
-        match tag {
-            RichAnnotation::Strong => style = style.add_modifier(Modifier::BOLD),
-            RichAnnotation::Emphasis => style = style.add_modifier(Modifier::ITALIC),
-            RichAnnotation::Strikeout => style = style.add_modifier(Modifier::CROSSED_OUT),
-            RichAnnotation::Code | RichAnnotation::Preformat(_) => {
-                style = style.fg(theme::accent());
-            }
-            RichAnnotation::Link(_) => {
-                style = style.fg(theme::accent()).add_modifier(Modifier::UNDERLINED);
-            }
-            RichAnnotation::Colour(colour) => foreground = Some(rgb(colour)),
-            RichAnnotation::BgColour(colour) => background = Some(rgb(colour)),
-            _ => {}
-        }
-    }
-    // Page and card backgrounds are white, black or grey; painting them behind each run
-    // of text would leave stripes, so only coloured highlights and buttons are kept.
-    let background = background.filter(|(r, g, b)| r.max(g).max(b) - r.min(g).min(b) >= 32);
-    let behind = background.unwrap_or(SURFACE_RGB);
-    if let Some(colour) = background {
-        style = style.bg(Color::Rgb(colour.0, colour.1, colour.2));
-    }
-    match foreground {
-        Some(colour) if contrast(colour, behind) >= 3.0 => {
-            style = style.fg(Color::Rgb(colour.0, colour.1, colour.2));
-        }
-        _ if background.is_some() && contrast((208, 208, 208), behind) < 3.0 => {
-            style = style.fg(Color::Black);
-        }
-        _ => {}
-    }
-    style
-}
-
 /// Word-wraps a styled line to `width` columns, breaking long words where needed.
 pub fn wrap(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
     let width = usize::from(width.max(1));
@@ -740,6 +724,7 @@ pub fn wrap(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
 
     #[test]
     fn replaces_images_and_drops_tracking_pixels() {
@@ -768,8 +753,8 @@ mod tests {
             ),
             ..Body::default()
         };
-        let rows = body.rows(60, None);
-        let Row::Line(line) = &rows[0] else { panic!() };
+        let layout = body.layout(60, None);
+        let line = &layout.lines[0];
         let style = |text: &str| {
             line.spans
                 .iter()
@@ -780,8 +765,11 @@ mod tests {
         assert!(style("bold").add_modifier.contains(Modifier::BOLD));
         assert!(style("it").add_modifier.contains(Modifier::ITALIC));
         assert!(style("link").add_modifier.contains(Modifier::UNDERLINED));
-        assert_eq!(style("dark").fg, Some(theme::text_color()));
+        // Too dark for the reader's background, so it takes the reader's text colour.
+        let (r, g, b) = rgb_of(theme::text_color());
+        assert_eq!(style("dark").fg, Some(Color::Rgb(r, g, b)));
         assert_eq!(style("red").fg, Some(Color::Rgb(255, 85, 85)));
+        assert_eq!(layout.links.len(), 1);
     }
 
     #[test]

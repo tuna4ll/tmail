@@ -556,6 +556,87 @@ impl App {
         }
     }
 
+    /// Grows or shrinks the reader window around its centre.
+    pub(crate) fn resize_popup(&mut self, columns: i32, rows: i32) {
+        if self.reader_docked {
+            return;
+        }
+        let Some(current) = self
+            .reader
+            .as_ref()
+            .map(widgets::reader::Reader::frame_area)
+        else {
+            return;
+        };
+        let width = (i32::from(current.width) + columns).max(0) as u16;
+        let height = (i32::from(current.height) + rows).max(0) as u16;
+        let x = (i32::from(current.x) - columns / 2).max(0) as u16;
+        let y = (i32::from(current.y) - rows / 2).max(0) as u16;
+        self.place_popup(Rect::new(x, y, width, height));
+    }
+
+    pub(crate) fn move_popup(&mut self, columns: i32, rows: i32) {
+        if self.reader_docked {
+            return;
+        }
+        let Some(current) = self
+            .reader
+            .as_ref()
+            .map(widgets::reader::Reader::frame_area)
+        else {
+            return;
+        };
+        let x = (i32::from(current.x) + columns).max(0) as u16;
+        let y = (i32::from(current.y) + rows).max(0) as u16;
+        self.place_popup(Rect::new(x, y, current.width, current.height));
+    }
+
+    pub(crate) fn place_popup(&mut self, rect: Rect) {
+        let screen = Rect::new(
+            0,
+            0,
+            self.screen_width,
+            self.screen_height.saturating_sub(1),
+        );
+        let rect = ui::clamp_rect(rect, screen);
+        let resized = self
+            .reader
+            .as_ref()
+            .is_some_and(|reader| reader.frame_area().width != rect.width);
+        if resized && let Some(reader) = &mut self.reader {
+            reader.defer_layout();
+        }
+        self.popup = Some(rect);
+        self.popup_maximized = false;
+        self.clear_screen = self.graphics_shown() || self.clear_screen;
+    }
+
+    pub(crate) fn toggle_popup_maximized(&mut self) {
+        self.popup_maximized = !self.popup_maximized;
+        self.clear_screen = true;
+    }
+
+    /// Switches the open HTML message between its own colours and the reader's.
+    pub(crate) fn toggle_reader_colors(&mut self) {
+        let Some(reader) = &mut self.reader else {
+            return;
+        };
+        let Some(mail) = self.mails.iter().find(|mail| mail.id == reader.mail_id()) else {
+            return;
+        };
+        if !reader.is_html(mail) {
+            self.notice = Some("Plain-text message: there are no colours to switch.".into());
+            return;
+        }
+        let original = reader.toggle_colors(mail);
+        self.notice = Some(if original {
+            "Showing the message's own colours · t for reader colours".into()
+        } else {
+            "Showing reader colours · t for the message's own".into()
+        });
+        self.clear_screen = true;
+    }
+
     /// Half-block pictures are ordinary cells that redraw cleanly; graphics protocols
     /// leave pixels behind until the screen is cleared.
     pub(crate) fn uses_halfblocks(&self) -> bool {

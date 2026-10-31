@@ -45,6 +45,11 @@ impl App {
                 }
                 overlay => self.overlay = overlay,
             },
+            Event::Resize(..) => {
+                if let Some(reader) = &mut self.reader {
+                    reader.defer_layout();
+                }
+            }
             Event::Mouse(mouse) => {
                 if let Some(Overlay::BodyEditor { editor, .. }) = &mut self.overlay {
                     match mouse.kind {
@@ -248,10 +253,18 @@ impl App {
         if self.reader.is_some() {
             match key.code {
                 KeyCode::Esc => self.reader = None,
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down | KeyCode::Char('j')
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     self.reader.as_mut().unwrap().scroll_down(1);
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up | KeyCode::Char('k')
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     self.reader.as_mut().unwrap().scroll_up(1);
                 }
                 KeyCode::PageDown | KeyCode::Char(' ') => {
@@ -266,6 +279,57 @@ impl App {
                 KeyCode::End => self.reader.as_mut().unwrap().scroll_down(u16::MAX),
                 KeyCode::Char('n') => self.open_adjacent(true),
                 KeyCode::Char('N') => self.open_adjacent(false),
+                KeyCode::Char('t') => self.toggle_reader_colors(),
+                KeyCode::Char('f') => self.toggle_popup_maximized(),
+                KeyCode::Char('0') => {
+                    self.popup = None;
+                    self.popup_maximized = false;
+                    self.clear_screen = true;
+                }
+                KeyCode::Left | KeyCode::Char('h')
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.reader.as_mut().unwrap().scroll_left(8);
+                }
+                KeyCode::Right
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.reader.as_mut().unwrap().scroll_right(8);
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let half = (self.reader.as_ref().unwrap().frame_area().height / 2).max(1);
+                    self.reader.as_mut().unwrap().scroll_down(half);
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let half = (self.reader.as_ref().unwrap().frame_area().height / 2).max(1);
+                    self.reader.as_mut().unwrap().scroll_up(half);
+                }
+                KeyCode::Char('+' | '=') => self.resize_popup(4, 2),
+                KeyCode::Char('-' | '_') => self.resize_popup(-4, -2),
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.resize_popup(-4, 0)
+                }
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.resize_popup(4, 0)
+                }
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.resize_popup(0, -2)
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.resize_popup(0, 2)
+                }
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.move_popup(-4, 0)
+                }
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.move_popup(4, 0)
+                }
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => self.move_popup(0, -2),
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => self.move_popup(0, 2),
                 _ => {}
             }
             return;

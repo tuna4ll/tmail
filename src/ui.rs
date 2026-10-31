@@ -3,6 +3,33 @@
 use super::*;
 
 impl App {
+    /// Where the reader window goes: maximised, where it was moved, or centred at the
+    /// size the `[reader]` table asks for.
+    pub(crate) fn popup_rect(&self, screen: Rect) -> Rect {
+        if self.popup_maximized {
+            return screen;
+        }
+        match self.popup {
+            Some(rect) => clamp_rect(rect, screen),
+            None => {
+                let reader = settings::reader();
+                let width = (u32::from(screen.width) * u32::from(reader.popup_width) / 100) as u16;
+                let height =
+                    (u32::from(screen.height) * u32::from(reader.popup_height) / 100) as u16;
+                let limit = settings::with(|ui| ui.reader_max_width);
+                let width = if limit > 0 { width.min(limit) } else { width };
+                let width = width.clamp(MIN_POPUP.0.min(screen.width), screen.width);
+                let height = height.clamp(MIN_POPUP.1.min(screen.height), screen.height);
+                Rect::new(
+                    screen.x + (screen.width - width) / 2,
+                    screen.y + (screen.height - height) / 2,
+                    width,
+                    height,
+                )
+            }
+        }
+    }
+
     pub(crate) fn draw(&mut self, frame: &mut Frame) {
         if self.onboarding {
             frame.render_widget(Paragraph::new("Connect an account\n\nAdd an email account to read and send mail.\n\nenter  Add account    q  Quit")
@@ -218,6 +245,7 @@ impl App {
 
         let mut docked_reader_area = None;
         self.screen_width = frame.area().width;
+        self.screen_height = frame.area().height;
         self.workspace_area = None;
         self.inbox_area = None;
         if rows[0].width < settings::with(|ui| ui.split_min_width) {
@@ -285,6 +313,28 @@ impl App {
                 ("ctrl+r", "search server"),
                 ("esc", "clear"),
             ])
+        } else if self.reader.is_some() && !self.reader_docked {
+            let wide = self
+                .reader
+                .as_ref()
+                .is_some_and(widgets::reader::Reader::scrolls_sideways);
+            status_line(&[
+                ("j/k", "scroll"),
+                if wide {
+                    ("←/→", "sideways")
+                } else {
+                    ("ctrl+d/u", "half page")
+                },
+                ("r/A/F", "reply/all/forward"),
+                ("f", "full screen"),
+                ("+/-", "size"),
+                ("t", "colours"),
+                ("l", "links"),
+                ("v", "files"),
+                ("I", "images"),
+                ("a/d", "archive/trash"),
+                ("esc", "close"),
+            ])
         } else if self.reader.is_some() {
             status_line(&[
                 ("j/k", "scroll"),
@@ -337,6 +387,7 @@ impl App {
         self.hint_regions = clickable_hints(&mut hints, rows[1], self.hover);
         frame.render_widget(Paragraph::new(hints), rows[1]);
 
+        let popup = self.popup_rect(rows[0]);
         if let Some(reader) = &mut self.reader
             && let Some(mail) = self.mails.iter().find(|mail| mail.id == reader.mail_id())
         {
@@ -345,7 +396,7 @@ impl App {
             if let Some(area) = docked_reader_area {
                 reader.draw_docked(frame, area, mail, self.picker.as_ref());
             } else {
-                reader.draw(frame, frame.area(), mail, self.picker.as_ref());
+                reader.draw(frame, popup, mail, self.picker.as_ref());
             }
         }
 
@@ -542,6 +593,14 @@ pub(crate) const HELP: &[&str] = &[
     "  r  reply           A  reply all   F  forward",
     "  l  open links       v  attachments",
     "  I  load remote images     O  open in the browser",
+    "",
+    "reader window",
+    "  f  full screen      0  default size     t  switch colours",
+    "  +/-  bigger/smaller    ctrl+arrows  resize    alt+arrows  move",
+    "  drag the title to move it, the left or bottom edge or ◢ to resize",
+    "  scrolling: wheel · drag the page · drag or click the scroll bar",
+    "    ←/→ or shift+wheel  sideways     ctrl+d/ctrl+u  half a page",
+    "  double-click the title for full screen",
     "  D  download a large message that arrived as headers",
     "  U  unsubscribe from a mailing list",
     "  x  retry selected Outbox message",
@@ -1124,5 +1183,23 @@ pub(crate) fn cursor_line(prefix: &str, value: &str, back: usize) -> Line<'stati
 }
 
 pub(crate) fn reader_is_docked(width: u16, reader_open: bool) -> bool {
-    reader_open && width >= settings::with(|ui| ui.dock_min_width)
+    reader_open
+        && settings::reader().layout == "docked"
+        && width >= settings::with(|ui| ui.dock_min_width)
+}
+
+/// The smallest reader window, in cells.
+pub(crate) const MIN_POPUP: (u16, u16) = (30, 8);
+
+/// Keeps a window inside the screen and at least the smallest size.
+pub(crate) fn clamp_rect(rect: Rect, screen: Rect) -> Rect {
+    let width = rect
+        .width
+        .clamp(MIN_POPUP.0.min(screen.width), screen.width);
+    let height = rect
+        .height
+        .clamp(MIN_POPUP.1.min(screen.height), screen.height);
+    let x = rect.x.clamp(screen.x, screen.right() - width);
+    let y = rect.y.clamp(screen.y, screen.bottom() - height);
+    Rect::new(x, y, width, height)
 }

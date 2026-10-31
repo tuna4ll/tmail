@@ -34,9 +34,10 @@ zeroize = "1.9.1"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
-html2text = { version = "0.17", features = ["css"] }
 ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
 unicode-width = "0.2"
+ego-tree = "0.11"
+scraper = { version = "0.29", default-features = false }
 mlua = { version = "0.12", features = ["lua54", "vendored", "serialize"] }
 
 [dev-dependencies]

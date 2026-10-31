@@ -171,10 +171,10 @@ When you open a signed message, the reader shows who signed it and whether the k
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `inbox_width` | `30` | Width of the conversation list. You can also drag its border with the mouse. |
-| `reader_width` | `44` | Width of the reader when it sits beside the map. |
+| `reader_width` | `44` | Width of the reader beside the map, with `reader.layout = "docked"`. |
 | `split_min_width` | `78` | On narrower terminals only one pane shows at a time. |
-| `dock_min_width` | `112` | On terminals this wide the reader sits beside the map instead of on top of it. |
-| `reader_max_width` | `100` | How wide the floating reader gets. |
+| `dock_min_width` | `112` | With `reader.layout = "docked"`, the reader sits beside the map on terminals at least this wide. |
+| `reader_max_width` | `0` | The widest the reader window opens, in columns. `0` means no limit. |
 | `time_format` | `%H:%M` | Dates for today's mail. |
 | `day_format` | `%-d %b` | Dates for mail from this year. |
 | `date_format` | `%-d %b %Y` | Dates for older mail. |
@@ -212,12 +212,22 @@ A German setup might use `reply_prefix = "AW: "` and `attribution = "{from} schr
 
 ## Reading mail: `[reader]`
 
-Remote images in HTML mail are blocked until you press `I`, because they tell the sender when and where you read the message.
+Messages open in a window over the list. Drag its title bar to move it, and its left or bottom edge or the `◢` corner to resize it. Double-click the title, or press `f`, for full screen. With the keyboard, `+` and `-` change the size, `ctrl` with the arrow keys resizes, `alt` with the arrow keys moves it, and `0` puts it back.
+
+To scroll, use the wheel, drag the scroll bar on the right edge, click anywhere on it to jump there, or press on the page and drag it like a sheet of paper. `ctrl+d` and `ctrl+u` move half a window. Newsletters with a fixed width keep that width in a narrow window instead of being squeezed; scroll them sideways with the left and right arrow keys, `shift` and the wheel, or by dragging.
+
+HTML mail is drawn the way its sender designed it: page and card backgrounds, coloured headers, buttons, tables with real columns, centred layouts and pictures where they belong. Links are clickable where they appear. Press `t` to switch between the message's own colours and your theme's.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
+| `html_colors` | `original` | `original` uses the message's colours. `theme` keeps your theme's background and only keeps coloured blocks and buttons. |
+| `layout` | `popup` | `popup` opens messages in a window. `docked` puts the reader beside the conversation map on wide screens instead. |
+| `popup_width` | `84` | Width of the window, in percent of the screen. |
+| `popup_height` | `90` | Height of the window, in percent of the screen. |
 | `remote_images` | `false` | Load remote images in every message. |
 | `remote_images_from` | `[]` | Load them only for these senders. Full addresses or whole domains: `["@github.com", "friend@example.com"]`. |
+
+Remote images are blocked until you press `I`, because they tell the sender when and where you read the message. Pictures need a terminal that can show them, such as kitty, WezTerm, iTerm2, foot or Ghostty. Elsewhere you see their description instead.
 
 ## Colors: `[theme]`
 
