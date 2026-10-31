@@ -98,8 +98,30 @@ impl App {
         }) {
             self.selected = index;
             self.reader = Some(Reader::new(mail_id.into()));
-            self.mark_seen(mail_id);
+            if settings::with(|ui| ui.mark_read_on_open) {
+                self.mark_seen(mail_id);
+            }
+            self.load_trusted_images(mail_id);
+            self.emit_mail_event("open", mail_id);
             self.open_protected(mail_id);
+        }
+    }
+
+    /// Loads remote images right away for senders the `[reader]` table trusts.
+    fn load_trusted_images(&mut self, mail_id: &str) {
+        let Some(mail) = self.mails.iter().find(|mail| mail.id == mail_id) else {
+            return;
+        };
+        if !mail.html || !settings::reader().trusts(&mail::email_of(&mail.from)) {
+            return;
+        }
+        let mail = mail.clone();
+        let blocked = self
+            .reader
+            .as_mut()
+            .is_some_and(|reader| reader.body(&mail).has_blocked());
+        if blocked {
+            self.load_remote_images();
         }
     }
 
@@ -207,6 +229,8 @@ impl App {
             }
             Ok(report) => {
                 let active_mail_id = self.active_mail_id();
+                let before: std::collections::HashSet<String> =
+                    self.mails.iter().map(|mail| mail.id.clone()).collect();
                 self.mails = report.mails;
                 self.folders = report.folders;
                 self.contacts = complete::contacts(&self.mails);
@@ -228,6 +252,7 @@ impl App {
                     self.reader = None;
                 }
                 self.mailbox_state = MailboxState::Ready;
+                self.emit_new_mail(&before);
             }
             Err(error) => {
                 self.clear_mailbox();
@@ -281,16 +306,16 @@ impl App {
                     .iter()
                     .any(|mail| mail_folder(mail) == active)
         });
-        // Newest activity first, like every other mail client.
+        // Newest activity first, like every other mail client, unless ui.sort says not.
+        let oldest_first = settings::with(|ui| ui.sort == "oldest");
         conversations.sort_by_cached_key(|conversation| {
-            std::cmp::Reverse(
-                conversation
-                    .mails(&self.mails)
-                    .iter()
-                    .filter_map(|mail| mail.timestamp)
-                    .max()
-                    .unwrap_or_default(),
-            )
+            let latest = conversation
+                .mails(&self.mails)
+                .iter()
+                .filter_map(|mail| mail.timestamp)
+                .max()
+                .unwrap_or_default();
+            if oldest_first { latest } else { -latest }
         });
         self.conversations = conversations;
         let visible = self.visible_conversations();
@@ -309,6 +334,12 @@ impl App {
         self.workspace = self
             .entry_mail_id()
             .map(|mail_id| Workspace::new(&thread, &mail_id));
+        self.update_script_mailbox();
+        if self.script_folder != self.active_folder {
+            self.script_folder = self.active_folder.clone();
+            let folder = self.active_folder.clone();
+            self.emit_event("folder", &[("name", folder)]);
+        }
     }
 
     pub(crate) fn visible_conversations(&self) -> Vec<usize> {

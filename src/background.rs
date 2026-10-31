@@ -12,7 +12,16 @@ pub(crate) fn notify(title: &str, body: &str) {
             .collect::<String>()
     };
     let (title, body) = (clean(title), clean(body));
-    let command = if cfg!(target_os = "macos") {
+    let custom = settings::with(|ui| ui.notify_command.clone());
+    let command = if let Some((program, arguments)) = custom.split_first() {
+        let fill = |value: &String| value.replace("{title}", &title).replace("{body}", &body);
+        Command::new(fill(program))
+            .args(arguments.iter().map(fill))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    } else if cfg!(target_os = "macos") {
         Command::new("osascript")
             .arg("-e")
             .arg(format!(
@@ -303,6 +312,14 @@ impl App {
                         ),
                     );
                 }
+                self.emit_event(
+                    "sync",
+                    &[
+                        ("account", id.clone()),
+                        ("summary", synced.summary.clone()),
+                        ("downloaded", synced.downloaded.to_string()),
+                    ],
+                );
                 if visible && (synced.changed || manual || synced.held > 0) {
                     self.notice = Some(synced.summary);
                     self.reload();

@@ -280,6 +280,13 @@ impl App {
         }
         names.sort();
         names.dedup();
+        let hidden = settings::with(|ui| ui.hide_folders.clone());
+        names.retain(|name| {
+            *name == self.active_folder
+                || !hidden
+                    .iter()
+                    .any(|folder| folder.eq_ignore_ascii_case(name))
+        });
         if let Some(position) = names.iter().position(|name| name == "INBOX") {
             names.swap(0, position);
         }

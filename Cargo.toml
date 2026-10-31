@@ -37,6 +37,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 html2text = { version = "0.17", features = ["css"] }
 ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
 unicode-width = "0.2"
+mlua = { version = "0.12", features = ["lua54", "vendored", "serialize"] }
 
 [dev-dependencies]
 rcgen = "0.14.5"

@@ -124,16 +124,26 @@ impl Composer {
             });
         }
         crate::storage::write_new(&body_path, body.as_bytes())?;
+        let compose = crate::settings::compose();
         let subject = original
             .map(|mail| {
                 let lowered = mail.subject.to_lowercase();
                 match start {
-                    Start::Forward if lowered.starts_with("fwd:") || lowered.starts_with("fw:") => {
+                    Start::Forward
+                        if lowered.starts_with("fwd:")
+                            || lowered.starts_with("fw:")
+                            || lowered
+                                .starts_with(&compose.forward_prefix.trim().to_lowercase()) =>
+                    {
                         mail.subject.clone()
                     }
-                    Start::Forward => format!("Fwd: {}", mail.subject),
-                    _ if lowered.starts_with("re:") => mail.subject.clone(),
-                    _ => format!("Re: {}", mail.subject),
+                    Start::Forward => format!("{}{}", compose.forward_prefix, mail.subject),
+                    _ if lowered.starts_with("re:")
+                        || lowered.starts_with(&compose.reply_prefix.trim().to_lowercase()) =>
+                    {
+                        mail.subject.clone()
+                    }
+                    _ => format!("{}{}", compose.reply_prefix, mail.subject),
                 }
             })
             .unwrap_or_default();
@@ -161,7 +171,11 @@ impl Composer {
             bcc: String::new(),
             subject,
             attachments: String::new(),
-            format: MessageFormat::Plain,
+            format: if compose.format == "html" {
+                MessageFormat::Html
+            } else {
+                MessageFormat::Plain
+            },
             body_path,
             original_draft: None,
             attachment_dir: None,
@@ -394,19 +408,29 @@ fn short_date(mail: &Mail) -> Option<String> {
 }
 
 fn quoted(mail: &Mail) -> String {
+    let compose = crate::settings::compose();
     let attribution = match short_date(mail) {
-        Some(date) => format!("On {date}, {} wrote:", mail.from),
-        None => format!("{} wrote:", mail.from),
+        Some(date) => compose
+            .attribution
+            .replace("{date}", &date)
+            .replace("{from}", &mail.from),
+        None => compose
+            .attribution
+            .replace("On {date}, ", "")
+            .replace("{date}", "")
+            .replace("{from}", &mail.from),
     };
+    let prefix = compose.quote_prefix.clone();
+    let bare = prefix.trim_end().to_owned();
     let lines: Vec<String> = mail
         .body
         .trim_end()
         .lines()
         .map(|line| {
             if line.is_empty() {
-                ">".into()
+                bare.clone()
             } else {
-                format!("> {line}")
+                format!("{prefix}{line}")
             }
         })
         .collect();
@@ -432,8 +456,11 @@ fn forwarded(mail: &Mail) -> String {
     )
 }
 
-/// Servers commonly refuse messages above 25 MB, and encoding adds about a third.
-const LARGE_ATTACHMENTS: u64 = 18 * 1024 * 1024;
+/// Servers commonly refuse messages above 25 MB, and encoding adds about a third, so
+/// the default warning is at 18 MB.
+fn large_attachments() -> u64 {
+    crate::settings::compose().large_attachment_mb * 1024 * 1024
+}
 
 fn warnings(summary: &Summary, subject: &str, body: &str) -> Vec<String> {
     let mut warnings = Vec::new();
@@ -460,7 +487,7 @@ fn warnings(summary: &Summary, subject: &str, body: &str) -> Vec<String> {
         .filter_map(|path| fs::metadata(path).ok())
         .map(|metadata| metadata.len())
         .sum();
-    if size > LARGE_ATTACHMENTS {
+    if size > large_attachments() {
         warnings.push(format!(
             "Attachments total {:.1} MB; many servers reject messages over 25 MB.",
             size as f64 / (1024.0 * 1024.0)

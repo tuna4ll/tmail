@@ -1,4 +1,4 @@
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 use rataflow::{Palette, Theme};
 use ratatui::style::{Color, Modifier, Style};
@@ -97,17 +97,51 @@ impl Colors {
     }
 }
 
-static COLORS: OnceLock<Colors> = OnceLock::new();
+static COLORS: RwLock<Colors> = RwLock::new(Colors::DARK);
+static CONFIG: RwLock<Option<ThemeConfig>> = RwLock::new(None);
 
-/// Sets the colors once at startup; later calls keep the first palette.
+/// Sets the colors from the `[theme]` table.
 pub fn init(config: &ThemeConfig) -> Result<(), String> {
     let colors = Colors::from_config(config)?;
-    let _ = COLORS.set(colors);
+    if let (Ok(mut current), Ok(mut stored)) = (COLORS.write(), CONFIG.write()) {
+        *current = colors;
+        *stored = Some(config.clone());
+    }
     Ok(())
 }
 
-fn colors() -> &'static Colors {
-    COLORS.get_or_init(|| Colors::DARK)
+/// Changes some colors or the preset while termail runs; unset fields keep their
+/// current value.
+pub fn update(changes: &ThemeConfig) -> Result<(), String> {
+    let mut config = CONFIG
+        .read()
+        .ok()
+        .and_then(|config| config.clone())
+        .unwrap_or_default();
+    if changes.preset.is_some() {
+        // A new preset starts from its own colors.
+        config = ThemeConfig::default();
+    }
+    for (change, slot) in [
+        (&changes.preset, &mut config.preset),
+        (&changes.canvas, &mut config.canvas),
+        (&changes.surface, &mut config.surface),
+        (&changes.muted, &mut config.muted),
+        (&changes.subtle, &mut config.subtle),
+        (&changes.accent, &mut config.accent),
+        (&changes.text, &mut config.text),
+        (&changes.success, &mut config.success),
+        (&changes.error, &mut config.error),
+    ] {
+        if change.is_some() {
+            slot.clone_from(change);
+        }
+    }
+    init(&config)
+}
+
+fn colors() -> Colors {
+    COLORS.read().map(|colors| *colors).unwrap_or(Colors::DARK)
 }
 
 pub fn canvas() -> Color {

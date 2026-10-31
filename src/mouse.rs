@@ -104,8 +104,12 @@ impl App {
             if reader.contains(column, row) {
                 let target = reader.target_at(column, row);
                 match mouse.kind {
-                    MouseEventKind::ScrollDown => reader.scroll_down(3),
-                    MouseEventKind::ScrollUp => reader.scroll_up(3),
+                    MouseEventKind::ScrollDown => {
+                        reader.scroll_down(settings::with(|ui| ui.scroll_lines))
+                    }
+                    MouseEventKind::ScrollUp => {
+                        reader.scroll_up(settings::with(|ui| ui.scroll_lines))
+                    }
                     MouseEventKind::Down(MouseButton::Left) => match target {
                         Some(widgets::reader::Target::Link(link)) => {
                             self.notice = Some(match opener::open(&link) {

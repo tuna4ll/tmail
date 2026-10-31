@@ -380,7 +380,10 @@ fn header_line(label: &str, value: &str, bold: bool) -> Line<'static> {
 
 fn reader_area(area: Rect) -> Rect {
     // Wide enough for the 600-pixel layouts most HTML mail is designed for.
-    let width = area.width.saturating_sub(4).min(100);
+    let width = area
+        .width
+        .saturating_sub(4)
+        .min(crate::settings::with(|ui| ui.reader_max_width));
     let height = area.height.saturating_sub(4);
 
     Rect::new(

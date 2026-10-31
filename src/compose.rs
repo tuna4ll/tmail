@@ -314,6 +314,11 @@ impl App {
     }
 
     pub(crate) fn finish_composer(&mut self, mut state: ComposeState, send: bool) {
+        if send && let Err(error) = self.script_before_send(&mut state) {
+            state.error = Some(format!("{error} Nothing was sent."));
+            self.overlay = Some(Overlay::Compose(state));
+            return;
+        }
         let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let contents = if send {
             state.composer.message(&base)

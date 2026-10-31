@@ -56,12 +56,23 @@ impl App {
                 let last_sender = conversation.last_sender(&self.mails).unwrap_or("unknown");
                 let unread = conversation.is_unread(&self.mails);
                 let starred = conversation.is_starred(&self.mails);
-                let marker = match (unread, starred) {
-                    (true, true) => "●★",
-                    (true, false) => "● ",
-                    (false, true) => " ★",
-                    (false, false) => "  ",
-                };
+                let marker = settings::with(|ui| {
+                    let blank =
+                        |marker: &str| " ".repeat(unicode_width::UnicodeWidthStr::width(marker));
+                    format!(
+                        "{}{}",
+                        if unread {
+                            ui.unread_marker.clone()
+                        } else {
+                            blank(&ui.unread_marker)
+                        },
+                        if starred {
+                            ui.star_marker.clone()
+                        } else {
+                            blank(&ui.star_marker)
+                        },
+                    )
+                });
                 let subject = format!(
                     "{marker} {} · {}",
                     conversation.subject,
@@ -112,6 +123,40 @@ impl App {
                         format!("{sender} · {}", mail_folder(mail))
                     }
                     _ => sender,
+                };
+                let (subject, sender) = match &self.script {
+                    Some(engine) if engine.formats_rows() => {
+                        let mails = conversation.mails(&self.mails);
+                        let latest = mails
+                            .iter()
+                            .filter_map(|mail| mail.timestamp)
+                            .max()
+                            .unwrap_or_default();
+                        let folder = mails
+                            .last()
+                            .map(|mail| mail_folder(mail).to_owned())
+                            .unwrap_or_default();
+                        let key = format!(
+                            "{}:{}:{unread}:{starred}:{latest}:{folder}",
+                            conversation.root_id,
+                            conversation.mail_ids.len()
+                        );
+                        let row = script::Row {
+                            subject: conversation.subject.clone(),
+                            from: last_sender.to_owned(),
+                            date: date.clone(),
+                            timestamp: latest,
+                            count: conversation.mail_ids.len(),
+                            unread,
+                            starred,
+                            folder,
+                            account: account.unwrap_or_default().to_owned(),
+                            title: subject.clone(),
+                            subtitle: sender.clone(),
+                        };
+                        engine.format_row(key, &row).unwrap_or((subject, sender))
+                    }
+                    _ => (subject, sender),
                 };
                 ListItem::new(vec![
                     Line::styled(subject, subject_style),
@@ -175,7 +220,7 @@ impl App {
         self.screen_width = frame.area().width;
         self.workspace_area = None;
         self.inbox_area = None;
-        if rows[0].width < MIN_SPLIT_WIDTH {
+        if rows[0].width < settings::with(|ui| ui.split_min_width) {
             match self.focus {
                 Pane::Inbox => {
                     frame.render_stateful_widget(list, rows[0], &mut list_state);
@@ -276,7 +321,19 @@ impl App {
                 ]),
             }
         };
-        let mut hints = hints;
+        let mut hints = if self.notice.is_none()
+            && self.overlay.is_none()
+            && !settings::with(|ui| ui.show_hints)
+        {
+            Line::default()
+        } else {
+            hints
+        };
+        if let Some(text) = self.script_status() {
+            hints
+                .spans
+                .insert(0, Span::styled(format!(" {text} "), theme::title(true)));
+        }
         self.hint_regions = clickable_hints(&mut hints, rows[1], self.hover);
         frame.render_widget(Paragraph::new(hints), rows[1]);
 
@@ -1067,5 +1124,5 @@ pub(crate) fn cursor_line(prefix: &str, value: &str, back: usize) -> Line<'stati
 }
 
 pub(crate) fn reader_is_docked(width: u16, reader_open: bool) -> bool {
-    reader_open && width >= MIN_DOCK_WIDTH
+    reader_open && width >= settings::with(|ui| ui.dock_min_width)
 }

@@ -22,7 +22,10 @@ pub fn install() {
 /// Switches to the full-screen interface with mouse and paste support.
 pub fn enter() -> std::io::Result<DefaultTerminal> {
     let terminal = ratatui::init();
-    execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+    if crate::settings::with(|ui| ui.mouse) {
+        execute!(stdout(), EnableMouseCapture)?;
+    }
+    execute!(stdout(), EnableBracketedPaste)?;
     // ratatui chains its own restoring hook on every init; replace it with one that
     // also turns the mouse off and ignores panics on worker threads.
     let _ = std::panic::take_hook();

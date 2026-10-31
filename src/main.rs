@@ -17,7 +17,9 @@ mod mouse;
 mod oauth;
 mod outbox;
 mod remote;
+mod script;
 mod sender;
+mod settings;
 mod storage;
 mod terminal;
 mod theme;
@@ -28,6 +30,7 @@ mod actions;
 mod background;
 mod cli;
 mod compose;
+mod hooks;
 mod inbox;
 mod input;
 mod ui;
@@ -71,11 +74,6 @@ use ratatui::{
 use ratatui_spinner::FluxSpinner;
 use tokio::{sync::mpsc, time::interval};
 
-const MIN_SPLIT_WIDTH: u16 = 78;
-const MIN_DOCK_WIDTH: u16 = 112;
-const INBOX_WIDTH: u16 = 30;
-const READER_WIDTH: u16 = 44;
-
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
@@ -88,6 +86,9 @@ async fn main() -> color_eyre::Result<()> {
     mailbox::prune_caches();
     let config = Config::load(options.config_path.as_deref())?;
     theme::init(&config.theme).map_err(color_eyre::eyre::Error::msg)?;
+    settings::init(config.ui.clone()).map_err(color_eyre::eyre::Error::msg)?;
+    settings::init_compose(config.compose.clone()).map_err(color_eyre::eyre::Error::msg)?;
+    settings::init_reader(config.reader.clone());
     keymap::Keymap::from_config(&config.keys).map_err(color_eyre::eyre::Error::msg)?;
     if let Some(account) = &options.oauth {
         if let Err(error) = oauth::run(&config, account.as_deref()) {
@@ -131,6 +132,7 @@ async fn main() -> color_eyre::Result<()> {
             .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks()),
     );
     app.prepare_accounts(needs_setup, explicit_source);
+    app.load_script();
     let result = app.run(terminal).await;
 
     terminal::leave()?;
@@ -221,6 +223,11 @@ pub struct App {
     reader_area: Option<Rect>,
     reader_docked: bool,
     screen_width: u16,
+    /// q was pressed once with ui.confirm_quit on.
+    confirm_quit: bool,
+    script: Option<script::Engine>,
+    /// The folder the script last heard about.
+    script_folder: String,
     /// Decrypted or verified content by message, kept only in memory.
     opened: std::collections::HashMap<String, Result<(Vec<u8>, String), String>>,
     overlay: Option<Overlay>,
@@ -545,7 +552,11 @@ impl App {
             skipped: 0,
             query: String::new(),
             searching: false,
-            filter: InboxFilter::All,
+            filter: match settings::with(|ui| ui.start_filter.clone()).as_str() {
+                "unread" => InboxFilter::Unread,
+                "starred" => InboxFilter::Starred,
+                _ => InboxFilter::All,
+            },
             undo: None,
             confirm_delete: None,
             notice: None,
@@ -559,16 +570,19 @@ impl App {
             hover: None,
             last_click: None,
             overlay_geometry: Default::default(),
-            inbox_width: INBOX_WIDTH,
-            reader_width: READER_WIDTH,
+            inbox_width: settings::with(|ui| ui.inbox_width),
+            reader_width: settings::with(|ui| ui.reader_width),
             dragging: None,
             workspace_area: None,
             reader_area: None,
             reader_docked: false,
             screen_width: 0,
+            confirm_quit: false,
+            script: None,
+            script_folder: String::new(),
             overlay: None,
             config,
-            active_folder: "INBOX".into(),
+            active_folder: settings::with(|ui| ui.start_folder.clone()),
             account_label,
         };
         app.reload();
@@ -596,6 +610,7 @@ impl App {
                     self.check_mailbox_changes();
                     self.sync_if_due();
                     self.retry_due_deliveries();
+                    self.run_script_timers();
                 },
                 task = self.task_rx.recv() => {
                     if let Some(task) = task {
@@ -715,6 +730,9 @@ impl App {
         if !self.sending.is_empty() || self.checking_account {
             self.notice =
                 Some("Wait for the current connection or send to finish before quitting.".into());
+        } else if settings::with(|ui| ui.confirm_quit) && !self.confirm_quit {
+            self.confirm_quit = true;
+            self.notice = Some("Press q again to quit".into());
         } else {
             self.running = false;
         }

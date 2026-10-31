@@ -234,9 +234,12 @@ pub fn parents<M: std::borrow::Borrow<Mail>>(mails: &[M]) -> Vec<Option<usize>> 
                 .filter(|parent| *parent != position);
             let (subject, reply) = base_subject(&mail.subject);
             let parent = explicit.or_else(|| {
-                (reply && mail.reply_to.is_none() && mail.references.is_empty())
-                    .then(|| latest_by_subject.get(&subject).copied())
-                    .flatten()
+                (reply
+                    && mail.reply_to.is_none()
+                    && mail.references.is_empty()
+                    && crate::settings::with(|ui| ui.thread_by_subject))
+                .then(|| latest_by_subject.get(&subject).copied())
+                .flatten()
             });
             if !subject.is_empty() {
                 latest_by_subject.insert(subject, position);
@@ -389,13 +392,15 @@ pub fn short_date(timestamp: i64) -> String {
         return String::new();
     };
     let now = Local::now();
-    if date.date_naive() == now.date_naive() {
-        date.format("%H:%M").to_string()
-    } else if date.year() == now.year() {
-        date.format("%-d %b").to_string()
-    } else {
-        date.format("%-d %b %Y").to_string()
-    }
+    crate::settings::with(|ui| {
+        if date.date_naive() == now.date_naive() {
+            date.format(&ui.time_format).to_string()
+        } else if date.year() == now.year() {
+            date.format(&ui.day_format).to_string()
+        } else {
+            date.format(&ui.date_format).to_string()
+        }
+    })
 }
 
 /// A full date in the local time zone, for message headers.
@@ -404,7 +409,7 @@ pub fn long_date(timestamp: i64) -> String {
     Local
         .timestamp_opt(timestamp, 0)
         .single()
-        .map(|date| date.format("%a %-d %b %Y %H:%M").to_string())
+        .map(|date| crate::settings::with(|ui| date.format(&ui.long_date_format).to_string()))
         .unwrap_or_default()
 }
 

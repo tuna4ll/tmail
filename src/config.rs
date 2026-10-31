@@ -25,6 +25,9 @@ pub struct Config {
     /// Custom keys by action name, such as `archive = "e"`.
     pub keys: std::collections::BTreeMap<String, String>,
     pub crypto: crate::crypto::CryptoConfig,
+    pub ui: crate::settings::UiConfig,
+    pub compose: crate::settings::ComposeConfig,
+    pub reader: crate::settings::ReaderConfig,
     #[serde(skip)]
     pub(crate) active_account: Option<String>,
     #[serde(skip)]

@@ -78,6 +78,9 @@ impl App {
         if key.code != KeyCode::Char('d') {
             self.confirm_delete = None;
         }
+        if key.code != KeyCode::Char('q') {
+            self.confirm_quit = false;
+        }
         if key.modifiers == KeyModifiers::CONTROL
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         {
@@ -143,6 +146,9 @@ impl App {
         }
 
         if key.code == KeyCode::Esc && self.notice.take().is_some() {
+            return;
+        }
+        if self.run_script_key(key) {
             return;
         }
         let key = self.keymap.translate(key);
@@ -249,9 +255,13 @@ impl App {
                     self.reader.as_mut().unwrap().scroll_up(1);
                 }
                 KeyCode::PageDown | KeyCode::Char(' ') => {
-                    self.reader.as_mut().unwrap().scroll_down(10);
+                    let page = settings::with(|ui| ui.page_lines);
+                    self.reader.as_mut().unwrap().scroll_down(page);
                 }
-                KeyCode::PageUp => self.reader.as_mut().unwrap().scroll_up(10),
+                KeyCode::PageUp => {
+                    let page = settings::with(|ui| ui.page_lines);
+                    self.reader.as_mut().unwrap().scroll_up(page);
+                }
                 KeyCode::Home => self.reader.as_mut().unwrap().scroll_up(u16::MAX),
                 KeyCode::End => self.reader.as_mut().unwrap().scroll_down(u16::MAX),
                 KeyCode::Char('n') => self.open_adjacent(true),
@@ -673,10 +683,26 @@ impl App {
                     self.reload();
                 }
             }
+            "script reload" => {
+                self.load_script();
+                if let Some(engine) = self.script.as_ref().filter(|_| self.notice.is_none()) {
+                    self.notice = Some(format!("Script reloaded · {}", engine.path().display()));
+                } else if self.script.is_none() {
+                    self.notice = Some("No init.lua found next to the config.".into());
+                }
+            }
             "" => {}
+            _ if self.run_script_command(command) => {}
             _ => {
+                let scripted = self
+                    .script
+                    .as_ref()
+                    .map(script::Engine::command_names)
+                    .filter(|names| !names.is_empty())
+                    .map(|names| format!(" Script commands: {}.", names.join(", ")))
+                    .unwrap_or_default();
                 self.notice = Some(format!(
-                    "Unknown command: {command}. Press ? to view commands."
+                    "Unknown command: {command}. Press ? to view commands.{scripted}"
                 ));
             }
         }
