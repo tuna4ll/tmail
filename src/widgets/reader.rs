@@ -12,6 +12,13 @@ use ratatui::{
 };
 use ratatui_image::{Image, picker::Picker};
 
+/// Something in the message that reacts to a click.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Target {
+    Link(String),
+    Attachment(usize),
+}
+
 pub struct Reader {
     mail_id: String,
     scroll: u16,
@@ -24,6 +31,11 @@ pub struct Reader {
     opened: Option<Vec<u8>>,
     /// The signature or encryption state, once known.
     security: Option<String>,
+    /// Laid-out row indexes that open a link or an attachment.
+    targets: Vec<(usize, Target)>,
+    /// Where the frame and the text were last drawn.
+    frame_area: Rect,
+    text_area: Rect,
 }
 
 impl Reader {
@@ -37,7 +49,31 @@ impl Reader {
             drew_images: false,
             opened: None,
             security: None,
+            targets: Vec::new(),
+            frame_area: Rect::default(),
+            text_area: Rect::default(),
         }
+    }
+
+    /// Whether a screen cell is inside the reader.
+    pub fn contains(&self, column: u16, row: u16) -> bool {
+        self.frame_area
+            .contains(ratatui::layout::Position::new(column, row))
+    }
+
+    /// The link or attachment drawn at a screen cell.
+    pub fn target_at(&self, column: u16, row: u16) -> Option<Target> {
+        if !self
+            .text_area
+            .contains(ratatui::layout::Position::new(column, row))
+        {
+            return None;
+        }
+        let index = usize::from(self.scroll) + usize::from(row - self.text_area.y);
+        self.targets
+            .iter()
+            .find(|(target_row, _)| *target_row == index)
+            .map(|(_, target)| target.clone())
     }
 
     /// Shows decrypted or verified content in place of the stored message.
@@ -113,6 +149,8 @@ impl Reader {
             .title(" message ")
             .bg(theme::surface());
         let inner = block.inner(area);
+        self.frame_area = area;
+        self.text_area = inner;
         if clear {
             frame.render_widget(Clear, area);
         }
@@ -201,7 +239,7 @@ impl Reader {
             } else {
                 theme::accent()
             };
-            let position = lines.len().min(5);
+            let position = lines.len() - mail.attachments.len();
             lines.insert(
                 position,
                 Line::from(vec![
@@ -214,37 +252,55 @@ impl Reader {
             );
         }
         if mail.partial {
-            lines.push(header_line(
-                "size",
-                "headers only · D to download the rest",
-                true,
-            ));
+            let files = lines.len() - mail.attachments.len();
+            lines.insert(
+                files,
+                header_line("size", "headers only · D to download the rest", true),
+            );
         }
         if mail.unsubscribe.is_some() {
-            lines.push(header_line(
-                "list",
-                "mailing list · U to unsubscribe",
-                false,
-            ));
+            let files = lines.len() - mail.attachments.len();
+            lines.insert(
+                files,
+                header_line("list", "mailing list · U to unsubscribe", false),
+            );
         }
-        let mut rows: Vec<Row> = lines
-            .into_iter()
-            .flat_map(|line| wrap(line, width))
-            .map(Row::Line)
-            .collect();
+        let first_file = lines.len() - mail.attachments.len();
+        let mut targets = Vec::new();
+        let mut rows: Vec<Row> = Vec::new();
+        for (index, line) in lines.into_iter().enumerate() {
+            let start = rows.len();
+            rows.extend(wrap(line, width).into_iter().map(Row::Line));
+            if index >= first_file {
+                for row in start..rows.len() {
+                    targets.push((row, Target::Attachment(index - first_file)));
+                }
+            }
+        }
         rows.push(Row::Line(Line::default()));
         rows.extend(self.body(mail).rows(width, picker));
         if !mail.links.is_empty() {
             rows.push(Row::Line(Line::default()));
             rows.push(Row::Line(Line::styled("links", theme::muted())));
             for (index, link) in mail.links.iter().enumerate() {
+                let start = rows.len();
                 rows.extend(
-                    wrap(Line::from(format!("  {}. {link}", index + 1)), width)
-                        .into_iter()
-                        .map(Row::Line),
+                    wrap(
+                        Line::styled(
+                            format!("  {}. {link}", index + 1),
+                            theme::text().add_modifier(Modifier::UNDERLINED),
+                        ),
+                        width,
+                    )
+                    .into_iter()
+                    .map(Row::Line),
                 );
+                for row in start..rows.len() {
+                    targets.push((row, Target::Link(link.clone())));
+                }
             }
         }
+        self.targets = targets;
         rows
     }
 }

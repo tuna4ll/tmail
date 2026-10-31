@@ -623,12 +623,26 @@ fn header_values(headers: &str, name: &str) -> Vec<String> {
         .collect()
 }
 
+/// An attachment path as typed: `~` is the home folder, and a relative path that is
+/// not found in the working directory is looked up in the home folder too.
 fn resolve_path(value: &str, base: &Path) -> PathBuf {
+    let home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    if value == "~" {
+        return home.unwrap_or_else(|| PathBuf::from(value));
+    }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = &home
+    {
+        return home.join(rest);
+    }
     let path = PathBuf::from(value);
     if path.is_absolute() {
-        path
-    } else {
-        base.join(path)
+        return path;
+    }
+    let local = base.join(&path);
+    match home {
+        Some(home) if !local.exists() && home.join(&path).exists() => home.join(path),
+        _ => local,
     }
 }
 

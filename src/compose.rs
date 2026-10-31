@@ -84,7 +84,9 @@ impl App {
                         protection
                     },
                 };
-                if reply && !forward {
+                if reply && !forward && self.config.uses_builtin_editor() {
+                    self.open_body_editor(state);
+                } else if reply && !forward {
                     self.pending_editor = Some(state);
                 } else {
                     self.overlay = Some(Overlay::Compose(state));
@@ -169,7 +171,17 @@ impl App {
                 self.overlay = Some(Overlay::Compose(state));
             }
             KeyCode::Enter if state.field == ComposeState::BODY_FIELD => {
-                self.pending_editor = Some(state);
+                if self.config.uses_builtin_editor() {
+                    self.open_body_editor(state);
+                } else {
+                    self.pending_editor = Some(state);
+                }
+            }
+            KeyCode::Char('e' | 'E')
+                if state.field == ComposeState::BODY_FIELD
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.open_body_editor(state);
             }
             KeyCode::Enter if state.field == ComposeState::FORMAT_FIELD => {
                 state.composer.format.toggle();
@@ -182,7 +194,7 @@ impl App {
             }
             _ => {
                 if let Some(value) = state.value_mut()
-                    && edit_text(value, key)
+                    && edit_text(value, &mut self.cursor_back, key)
                 {
                     state.error = None;
                     self.suggest(&mut state);
@@ -263,6 +275,34 @@ impl App {
             TerminalJob::Open(mail_id) => self.show_opened(mail_id, result),
         }
         Ok(terminal)
+    }
+
+    /// Edits the body inside termail.
+    pub(crate) fn open_body_editor(&mut self, state: ComposeState) {
+        let text = fs::read_to_string(&state.composer.body_path).unwrap_or_default();
+        self.overlay = Some(Overlay::BodyEditor {
+            state: Box::new(state),
+            editor: widgets::editor::Editor::new(&text),
+        });
+    }
+
+    pub(crate) fn handle_body_editor_key(
+        &mut self,
+        mut state: Box<ComposeState>,
+        mut editor: widgets::editor::Editor,
+        key: KeyEvent,
+    ) {
+        match editor.handle_key(key) {
+            widgets::editor::Outcome::Done => {
+                if editor.modified
+                    && let Err(error) = fs::write(&state.composer.body_path, editor.text())
+                {
+                    state.error = Some(format!("Unable to save the body: {error}"));
+                }
+                self.overlay = Some(Overlay::Compose(*state));
+            }
+            _ => self.overlay = Some(Overlay::BodyEditor { state, editor }),
+        }
     }
 
     pub(crate) fn run_editor(&self, path: &Path) -> color_eyre::Result<()> {

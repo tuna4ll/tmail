@@ -13,6 +13,7 @@ mod log;
 mod mail;
 mod mailbox;
 mod message;
+mod mouse;
 mod oauth;
 mod outbox;
 mod remote;
@@ -33,6 +34,7 @@ mod ui;
 use cli::*;
 use inbox::*;
 use input::*;
+use mouse::clickable_hints;
 use ui::*;
 
 use config::Config;
@@ -74,7 +76,7 @@ use tokio::{sync::mpsc, time::interval};
 
 const MIN_SPLIT_WIDTH: u16 = 78;
 const MIN_DOCK_WIDTH: u16 = 112;
-const INBOX_WIDTH: u16 = 28;
+const INBOX_WIDTH: u16 = 30;
 const READER_WIDTH: u16 = 44;
 
 #[tokio::main]
@@ -209,6 +211,22 @@ pub struct App {
     /// Work that needs the terminal, such as a passphrase prompt.
     pending_terminal: Option<TerminalJob>,
     keymap: keymap::Keymap,
+    /// Characters between the text cursor and the end of the focused field.
+    cursor_back: usize,
+    /// Status-line cells that press a key when clicked.
+    hint_regions: Vec<(Rect, KeyEvent)>,
+    /// The cell under the pointer.
+    hover: Option<(u16, u16)>,
+    last_click: Option<(std::time::Instant, u16, u16)>,
+    overlay_geometry: mouse::OverlayGeometry,
+    /// Pane widths, which the pane borders can be dragged to change.
+    inbox_width: u16,
+    reader_width: u16,
+    dragging: Option<mouse::Divider>,
+    workspace_area: Option<Rect>,
+    reader_area: Option<Rect>,
+    reader_docked: bool,
+    screen_width: u16,
     /// Decrypted or verified content by message, kept only in memory.
     opened: std::collections::HashMap<String, Result<(Vec<u8>, String), String>>,
     overlay: Option<Overlay>,
@@ -309,6 +327,13 @@ enum Overlay {
     Unsubscribe {
         unsubscribe: mail::Unsubscribe,
     },
+    /// Actions for the message under the pointer, opened with a right click.
+    Menu {
+        x: u16,
+        y: u16,
+        items: Vec<mouse::MenuItem>,
+        selected: usize,
+    },
     /// Asks for one line of text, such as a folder name.
     Prompt {
         kind: PromptKind,
@@ -328,6 +353,11 @@ enum Overlay {
         removing: bool,
     },
     Compose(ComposeState),
+    /// The built-in editor for the body of the message being composed.
+    BodyEditor {
+        state: Box<ComposeState>,
+        editor: widgets::editor::Editor,
+    },
 }
 
 impl Overlay {
@@ -337,6 +367,17 @@ impl Overlay {
         let down = matches!(code, KeyCode::Down | KeyCode::Char('j'));
         if !down && !matches!(code, KeyCode::Up | KeyCode::Char('k')) {
             return false;
+        }
+        if let Self::Menu {
+            selected, items, ..
+        } = self
+        {
+            *selected = if down {
+                (*selected + 1).min(items.len().saturating_sub(1))
+            } else {
+                selected.saturating_sub(1)
+            };
+            return true;
         }
         let (selected, count) = match self {
             Self::Folders {
@@ -519,6 +560,18 @@ impl App {
             pending_terminal: None,
             keymap: keymap::Keymap::from_config(&config.keys).unwrap_or_default(),
             opened: Default::default(),
+            cursor_back: 0,
+            hint_regions: Vec::new(),
+            hover: None,
+            last_click: None,
+            overlay_geometry: Default::default(),
+            inbox_width: INBOX_WIDTH,
+            reader_width: READER_WIDTH,
+            dragging: None,
+            workspace_area: None,
+            reader_area: None,
+            reader_docked: false,
+            screen_width: 0,
             overlay: None,
             config,
             active_folder: "INBOX".into(),
@@ -1304,16 +1357,16 @@ mod tests {
 
     #[test]
     fn renders_help_and_command_overlays() {
-        assert!(render_overlay(&Overlay::Help { scroll: 0 }).contains("message actions"));
+        assert!(render_overlay(Overlay::Help { scroll: 0 }).contains("message actions"));
         assert!(
-            render_overlay(&Overlay::Command("filter unread".into())).contains(":filter unread_")
+            render_overlay(Overlay::Command("filter unread".into())).contains(":filter unread ")
         );
     }
 
     #[test]
     fn renders_the_builtin_compose_form() {
         let composer = Composer::new(None, Some("Tuna <tuna@example.com>"), None).unwrap();
-        let screen = render_overlay(&Overlay::Compose(ComposeState {
+        let screen = render_overlay(Overlay::Compose(ComposeState {
             composer,
             field: 0,
             error: None,
@@ -1324,7 +1377,7 @@ mod tests {
 
         assert!(screen.contains("From"));
         assert!(screen.contains("headers"));
-        assert!(screen.contains("To       _"));
+        assert!(screen.contains("To        "));
         assert!(screen.contains("Plain text"));
         assert!(screen.contains("body"));
         assert!(screen.contains("$EDITOR"));
@@ -1346,10 +1399,14 @@ mod tests {
             .collect()
     }
 
-    fn render_overlay(overlay: &Overlay) -> String {
+    fn render_overlay(mut overlay: Overlay) -> String {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_overlay(frame, overlay)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_overlay(frame, &mut overlay, 0);
+            })
+            .unwrap();
         terminal
             .backend()
             .buffer()

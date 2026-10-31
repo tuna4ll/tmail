@@ -8,7 +8,23 @@ impl App {
             self.clear_screen = true;
         }
         match event {
-            Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key_event(key),
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                let editing = self.editing_kind();
+                self.on_key_event(key);
+                // A cursor position belongs to one field.
+                if self.editing_kind() != editing
+                    || matches!(
+                        key.code,
+                        KeyCode::Tab
+                            | KeyCode::BackTab
+                            | KeyCode::Up
+                            | KeyCode::Down
+                            | KeyCode::Enter
+                    )
+                {
+                    self.cursor_back = 0;
+                }
+            }
             Event::Paste(text) => match self.overlay.take() {
                 Some(Overlay::AccountSetup(mut form)) => {
                     if !form.busy {
@@ -18,39 +34,43 @@ impl App {
                 }
                 Some(Overlay::Compose(mut state)) => {
                     if let Some(value) = state.value_mut() {
-                        value.extend(text.chars().filter(|character| !character.is_control()));
+                        insert_text(value, self.cursor_back, &text);
                     }
                     self.suggest(&mut state);
                     self.overlay = Some(Overlay::Compose(state));
                 }
+                Some(Overlay::BodyEditor { state, mut editor }) => {
+                    editor.insert(&text);
+                    self.overlay = Some(Overlay::BodyEditor { state, editor });
+                }
                 overlay => self.overlay = overlay,
             },
             Event::Mouse(mouse) => {
-                if self.overlay.is_some() || self.onboarding {
-                    return;
-                }
-                if let Some(reader) = &mut self.reader {
+                if let Some(Overlay::BodyEditor { editor, .. }) = &mut self.overlay {
                     match mouse.kind {
-                        MouseEventKind::ScrollDown => reader.scroll_down(3),
-                        MouseEventKind::ScrollUp => reader.scroll_up(3),
-                        _ => return,
-                    }
-                    if reader.shows_images() && !self.uses_halfblocks() {
-                        self.clear_screen = true;
+                        MouseEventKind::ScrollDown => editor.scroll(true, 3),
+                        MouseEventKind::ScrollUp => editor.scroll(false, 3),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            editor.click(mouse.column, mouse.row);
+                        }
+                        _ => {}
                     }
                     return;
                 }
-                if self.handle_inbox_mouse(mouse) {
-                    return;
-                }
-                if !self.visible_conversations().is_empty()
-                    && let Some(workspace) = &mut self.workspace
-                    && let Some(mail_id) = workspace.handle_mouse(mouse)
-                {
-                    self.open_mail(&mail_id);
-                }
+                self.handle_mouse(mouse);
             }
             _ => {}
+        }
+    }
+
+    /// Which text field has the keyboard, so its cursor resets when another one does.
+    pub(crate) fn editing_kind(&self) -> u8 {
+        match &self.overlay {
+            Some(Overlay::Command(_)) => 1,
+            Some(Overlay::Prompt { .. }) => 2,
+            Some(Overlay::Compose(state)) => 10 + state.field as u8,
+            _ if self.searching => 3,
+            _ => 0,
         }
     }
 
@@ -114,7 +134,7 @@ impl App {
                     self.refresh_inbox();
                 }
                 _ => {
-                    if edit_text(&mut self.query, key) {
+                    if edit_text(&mut self.query, &mut self.cursor_back, key) {
                         self.refresh_inbox();
                     }
                 }
@@ -335,42 +355,6 @@ impl App {
         }
     }
 
-    /// Scrolls the inbox with the wheel; a click selects a conversation and a click on
-    /// the selected one opens it.
-    pub(crate) fn handle_inbox_mouse(&mut self, mouse: MouseEvent) -> bool {
-        let Some(area) = self.inbox_area else {
-            return false;
-        };
-        let inside = mouse.column >= area.x
-            && mouse.column < area.x + area.width
-            && mouse.row > area.y
-            && mouse.row + 1 < area.y + area.height;
-        if !inside || !matches!(self.mailbox_state, MailboxState::Ready) {
-            return false;
-        }
-        let count = self.visible_conversations().len();
-        match mouse.kind {
-            MouseEventKind::ScrollDown => self.select_conversation(self.selected + 1),
-            MouseEventKind::ScrollUp => self.select_conversation(self.selected.saturating_sub(1)),
-            MouseEventKind::Down(MouseButton::Left) => {
-                let index = self.list_offset + usize::from(mouse.row - area.y - 1) / 2;
-                if index >= count {
-                    return true;
-                }
-                self.focus = Pane::Inbox;
-                if index == self.selected {
-                    if let Some(mail_id) = self.entry_mail_id() {
-                        self.open_mail(&mail_id);
-                    }
-                } else {
-                    self.select_conversation(index);
-                }
-            }
-            _ => {}
-        }
-        true
-    }
-
     pub(crate) fn handle_overlay_key(&mut self, key: KeyEvent) -> bool {
         let Some(overlay) = self.overlay.take() else {
             return false;
@@ -393,6 +377,10 @@ impl App {
             }
             Overlay::Compose(state) => {
                 self.handle_compose_key(state, key);
+                return true;
+            }
+            Overlay::BodyEditor { state, editor } => {
+                self.handle_body_editor_key(state, editor, key);
                 return true;
             }
             Overlay::DraftReady { state, summary } => {
@@ -446,7 +434,7 @@ impl App {
                     self.run_command(&command);
                 }
                 _ => {
-                    edit_text(input, key);
+                    edit_text(input, &mut self.cursor_back, key);
                     self.overlay = Some(overlay);
                 }
             },
@@ -504,6 +492,26 @@ impl App {
                 }
                 _ => self.overlay = Some(overlay),
             },
+            Overlay::Menu {
+                items, selected, ..
+            } => match key.code {
+                KeyCode::Enter => {
+                    if let Some(item) = items.get(*selected) {
+                        let key = item.key;
+                        self.handle_event(Event::Key(key));
+                    }
+                }
+                KeyCode::Esc => {}
+                _ => {
+                    // A menu key works as a shortcut while the menu is open.
+                    if let Some(item) = items.iter().find(|item| item.key == key) {
+                        let key = item.key;
+                        self.handle_event(Event::Key(key));
+                    } else {
+                        self.overlay = Some(overlay);
+                    }
+                }
+            },
             Overlay::Unsubscribe { unsubscribe } => {
                 if action_key(key, 'y') || key.code == KeyCode::Enter {
                     let unsubscribe = unsubscribe.clone();
@@ -534,7 +542,7 @@ impl App {
                     }
                 }
                 _ => {
-                    edit_text(input, key);
+                    edit_text(input, &mut self.cursor_back, key);
                     self.overlay = Some(overlay);
                 }
             },
@@ -608,6 +616,7 @@ impl App {
             Overlay::DraftReady { .. }
             | Overlay::ComposeClose(_)
             | Overlay::Compose(_)
+            | Overlay::BodyEditor { .. }
             | Overlay::DeliveryReview { .. } => {
                 unreachable!()
             }
@@ -674,23 +683,110 @@ impl App {
     }
 }
 
-/// Line editing shared by every text field: typing, backspace, ctrl+w to delete a
-/// word and ctrl+u to clear. Returns whether the key changed or belonged to the field.
-pub(crate) fn edit_text(value: &mut String, key: KeyEvent) -> bool {
+/// Line editing shared by every text field. `back` is how many characters the cursor
+/// sits before the end, so appending stays the default. Supports arrows, home/end,
+/// delete, ctrl+a/e/k/u/w and alt or ctrl with arrows to move by word. Returns whether
+/// the key belonged to the field.
+pub(crate) fn edit_text(value: &mut String, back: &mut usize, key: KeyEvent) -> bool {
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let count = value.chars().count();
+    *back = (*back).min(count);
+    let position = count - *back;
+    let byte = |index: usize| {
+        value
+            .char_indices()
+            .nth(index)
+            .map_or(value.len(), |(byte, _)| byte)
+    };
     match key.code {
-        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => delete_word(value),
-        KeyCode::Backspace => {
-            value.pop();
+        KeyCode::Left if control || alt => *back = count - word_start(value, position),
+        KeyCode::Right if control || alt => *back = count - word_end(value, position),
+        KeyCode::Left => *back = (*back + 1).min(count),
+        KeyCode::Right => *back = back.saturating_sub(1),
+        KeyCode::Home => *back = count,
+        KeyCode::End => *back = 0,
+        KeyCode::Char('a' | 'A') if control => *back = count,
+        KeyCode::Char('e' | 'E') if control => *back = 0,
+        KeyCode::Backspace if alt => {
+            let start = word_start(value, position);
+            value.replace_range(byte(start)..byte(position), "");
         }
-        KeyCode::Char('w' | 'W') if control => delete_word(value),
-        KeyCode::Char('u' | 'U') if control => value.clear(),
-        KeyCode::Char(character) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
-            value.push(character);
+        KeyCode::Char('w' | 'W') if control => {
+            let start = word_start(value, position);
+            value.replace_range(byte(start)..byte(position), "");
+        }
+        KeyCode::Backspace if position > 0 => {
+            value.replace_range(byte(position - 1)..byte(position), "");
+        }
+        KeyCode::Backspace => {}
+        KeyCode::Delete if *back > 0 => {
+            value.replace_range(byte(position)..byte(position + 1), "");
+            *back -= 1;
+        }
+        KeyCode::Delete => {}
+        KeyCode::Char('u' | 'U') if control => {
+            if *back == 0 {
+                value.clear();
+            } else {
+                value.replace_range(..byte(position), "");
+            }
+        }
+        KeyCode::Char('k' | 'K') if control => {
+            value.truncate(byte(position));
+            *back = 0;
+        }
+        KeyCode::Char(character) if !control && !alt => {
+            value.insert(byte(position), character);
         }
         _ => return false,
     }
     true
+}
+
+/// Inserts pasted text at the cursor, dropping control characters.
+pub(crate) fn insert_text(value: &mut String, back: usize, text: &str) {
+    let count = value.chars().count();
+    let position = count - back.min(count);
+    let byte = value
+        .char_indices()
+        .nth(position)
+        .map_or(value.len(), |(byte, _)| byte);
+    let clean: String = text
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    value.insert_str(byte, &clean);
+}
+
+fn is_separator(character: char) -> bool {
+    character.is_whitespace() || ",;/".contains(character)
+}
+
+/// The character index where the word before `position` starts.
+fn word_start(value: &str, position: usize) -> usize {
+    let characters: Vec<char> = value.chars().collect();
+    let mut index = position.min(characters.len());
+    while index > 0 && is_separator(characters[index - 1]) {
+        index -= 1;
+    }
+    while index > 0 && !is_separator(characters[index - 1]) {
+        index -= 1;
+    }
+    index
+}
+
+/// The character index just after the word at or after `position`.
+fn word_end(value: &str, position: usize) -> usize {
+    let characters: Vec<char> = value.chars().collect();
+    let mut index = position.min(characters.len());
+    while index < characters.len() && is_separator(characters[index]) {
+        index += 1;
+    }
+    while index < characters.len() && !is_separator(characters[index]) {
+        index += 1;
+    }
+    index
 }
 
 /// Copies through the terminal (OSC 52), which also works over SSH.
@@ -703,19 +799,6 @@ pub(crate) fn copy_to_clipboard(text: &str) {
         widgets::rich::base64(text.as_bytes())
     );
     let _ = output.flush();
-}
-
-pub(crate) fn delete_word(value: &mut String) {
-    let trimmed = value
-        .trim_end_matches(|character: char| character.is_whitespace() || ",;".contains(character))
-        .len();
-    value.truncate(trimmed);
-    let start = value
-        .char_indices()
-        .rev()
-        .find(|(_, character)| character.is_whitespace() || ",;".contains(*character))
-        .map_or(0, |(index, character)| index + character.len_utf8());
-    value.truncate(start);
 }
 
 /// Folders every account has; they map to server roles and cannot be changed.

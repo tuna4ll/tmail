@@ -1,3 +1,4 @@
+pub mod editor;
 pub mod mail_card;
 pub mod reader;
 pub mod rich;

@@ -41,7 +41,7 @@ pub const ACTIONS: &[(&str, char, &str)] = &[
 #[derive(Clone, Debug, Default)]
 pub struct Keymap {
     bindings: HashMap<(KeyCode, KeyModifiers), char>,
-    /// The custom bindings by action, for the help screen.
+    /// The custom bindings by action.
     pub custom: Vec<(String, String)>,
 }
 

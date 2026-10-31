@@ -369,6 +369,13 @@ impl Config {
         }
     }
 
+    /// `editor = ["builtin"]` edits bodies inside termail.
+    pub fn uses_builtin_editor(&self) -> bool {
+        self.editor
+            .first()
+            .is_some_and(|program| program == "builtin")
+    }
+
     pub fn editor_command(&self) -> Vec<String> {
         if !self.editor.is_empty() {
             return self.editor.clone();

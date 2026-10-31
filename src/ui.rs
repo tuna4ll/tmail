@@ -8,8 +8,8 @@ impl App {
             frame.render_widget(Paragraph::new("Connect an account\n\nAdd an email account to read and send mail.\n\nenter  Add account    q  Quit")
                 .style(theme::text()).alignment(Alignment::Center)
                 .block(Block::bordered().title(" termail ").border_style(theme::border(true))), frame.area());
-            if let Some(overlay) = &self.overlay {
-                draw_overlay(frame, overlay);
+            if let Some(overlay) = &mut self.overlay {
+                self.overlay_geometry = draw_overlay(frame, overlay, self.cursor_back);
             }
             return;
         }
@@ -39,9 +39,11 @@ impl App {
                     ("q", "quit"),
                 ])
             };
+            let mut hints = hints;
+            self.hint_regions = clickable_hints(&mut hints, rows[1], self.hover);
             frame.render_widget(Paragraph::new(hints), rows[1]);
-            if let Some(overlay) = &self.overlay {
-                draw_overlay(frame, overlay);
+            if let Some(overlay) = &mut self.overlay {
+                self.overlay_geometry = draw_overlay(frame, overlay, self.cursor_back);
             }
             return;
         }
@@ -131,22 +133,26 @@ impl App {
             self.active_folder.clone()
         };
         let title = if self.searching {
-            format!(" search: {}_ ", self.query)
-        } else if !self.query.is_empty() {
-            format!(" inbox • {} • /{} ", self.filter.label(), self.query)
-        } else if self.filter != InboxFilter::All {
-            format!(" inbox • {} ", self.filter.label())
-        } else if self.skipped > 0 {
-            format!(
-                " {} · {folder} • {} skipped ",
-                self.account_label, self.skipped
-            )
-        } else if !self.syncing.is_empty() {
-            format!(" {} · {folder} • syncing ", self.account_label)
-        } else if inbox_focused {
-            format!(" {} · {folder} • active ", self.account_label)
+            let mut line = cursor_line(" search: ", &self.query, self.cursor_back);
+            line.spans.push(Span::raw(" "));
+            line
         } else {
-            format!(" {} · {folder} ", self.account_label)
+            Line::from(if !self.query.is_empty() {
+                format!(" inbox • {} • /{} ", self.filter.label(), self.query)
+            } else if self.filter != InboxFilter::All {
+                format!(" inbox • {} ", self.filter.label())
+            } else if self.skipped > 0 {
+                format!(
+                    " {} · {folder} • {} skipped ",
+                    self.account_label, self.skipped
+                )
+            } else if !self.syncing.is_empty() {
+                format!(" {} · {folder} • syncing ", self.account_label)
+            } else if inbox_focused {
+                format!(" {} · {folder} • active ", self.account_label)
+            } else {
+                format!(" {} · {folder} ", self.account_label)
+            })
         };
         let list = List::new(items)
             .style(theme::text())
@@ -166,6 +172,9 @@ impl App {
             .with_selected(Some(self.selected));
 
         let mut docked_reader_area = None;
+        self.screen_width = frame.area().width;
+        self.workspace_area = None;
+        self.inbox_area = None;
         if rows[0].width < MIN_SPLIT_WIDTH {
             match self.focus {
                 Pane::Inbox => {
@@ -183,17 +192,18 @@ impl App {
                     } else if let Some(workspace) = &mut self.workspace {
                         workspace.draw(frame, rows[0], workspace_focused);
                     }
+                    self.workspace_area = Some(rows[0]);
                 }
             }
         } else {
             let constraints = if reader_is_docked(rows[0].width, self.reader.is_some()) {
                 vec![
-                    Constraint::Length(INBOX_WIDTH),
+                    Constraint::Length(self.inbox_width.min(rows[0].width / 3)),
                     Constraint::Min(0),
-                    Constraint::Length(READER_WIDTH),
+                    Constraint::Length(self.reader_width),
                 ]
             } else {
-                vec![Constraint::Length(30), Constraint::Min(0)]
+                vec![Constraint::Length(self.inbox_width), Constraint::Min(0)]
             };
             let areas = Layout::default()
                 .direction(Direction::Horizontal)
@@ -211,6 +221,7 @@ impl App {
             } else if let Some(workspace) = &mut self.workspace {
                 workspace.draw(frame, areas[1], workspace_focused);
             }
+            self.workspace_area = Some(areas[1]);
             if areas.len() == 3 {
                 docked_reader_area = Some(areas[2]);
             }
@@ -265,11 +276,15 @@ impl App {
                 ]),
             }
         };
+        let mut hints = hints;
+        self.hint_regions = clickable_hints(&mut hints, rows[1], self.hover);
         frame.render_widget(Paragraph::new(hints), rows[1]);
 
         if let Some(reader) = &mut self.reader
             && let Some(mail) = self.mails.iter().find(|mail| mail.id == reader.mail_id())
         {
+            self.reader_docked = docked_reader_area.is_some();
+            self.reader_area = docked_reader_area;
             if let Some(area) = docked_reader_area {
                 reader.draw_docked(frame, area, mail, self.picker.as_ref());
             } else {
@@ -277,8 +292,8 @@ impl App {
             }
         }
 
-        if let Some(overlay) = &self.overlay {
-            draw_overlay(frame, overlay);
+        if let Some(overlay) = &mut self.overlay {
+            self.overlay_geometry = draw_overlay(frame, overlay, self.cursor_back);
         }
     }
 
@@ -305,6 +320,7 @@ impl App {
                 ("esc", "close"),
             ],
             Overlay::Unsubscribe { .. } => &[("y", "unsubscribe"), ("esc", "keep")],
+            Overlay::Menu { .. } => &[("j/k", "select"), ("enter", "choose"), ("esc", "close")],
             Overlay::Prompt { .. } => &[
                 ("type", "name · / for subfolders"),
                 ("enter", "save"),
@@ -317,6 +333,11 @@ impl App {
                 ("tab", "next field or accept ⇥"),
                 ("ctrl+s", "review"),
                 ("esc", "close"),
+            ],
+            Overlay::BodyEditor { .. } => &[
+                ("ctrl+s/esc", "done"),
+                ("arrows", "move"),
+                ("ctrl+k", "delete line"),
             ],
             Overlay::AccountSetup(_) | Overlay::DeliveryReview { .. } => return None,
         };
@@ -444,9 +465,16 @@ pub(crate) fn draw_no_matches(frame: &mut Frame, area: Rect, folder: &str, folde
 pub(crate) const HELP: &[&str] = &[
     "navigation",
     "  j/k or arrows  select     tab  switch pane",
-    "  pgup/pgdn home/end  jump   mouse  wheel and click",
+    "  pgup/pgdn home/end  jump",
     "  reading: space  page   n/N  next/previous conversation",
     "  enter          open / resume draft     esc  close",
+    "",
+    "mouse",
+    "  click         select · click again or double-click to open",
+    "  right-click   actions for a message (inbox, map, reader)",
+    "  middle-click  read/unread        wheel  scroll anywhere",
+    "  drag a pane border to resize it  click a hint to press it",
+    "  click the inbox title for folders, links and files to open",
     "",
     "message actions",
     "  m  read/unread     s  star/unstar",
@@ -457,32 +485,49 @@ pub(crate) const HELP: &[&str] = &[
     "  r  reply           A  reply all   F  forward",
     "  l  open links       v  attachments",
     "  I  load remote images     O  open in the browser",
+    "  D  download a large message that arrived as headers",
+    "  U  unsubscribe from a mailing list",
     "  x  retry selected Outbox message",
     "  z  resolve unconfirmed Outbox delivery",
     "",
     "inbox",
-    "  /  search      g  folders      1/2/3  filters",
+    "  /  search      g  folders (n new · e rename · x delete)",
     "     from: to: subject: body: in: in:all is:unread is:starred",
-    "     has:attachment \"exact phrase\" -exclude",
+    "     has:attachment before: after: on: (2026-03-14, 2026-03, 7d, 2w)",
+    "     \"exact phrase\" -exclude      ctrl+r  search the server",
+    "  1/2/3  filters",
     "  p  accounts (a add · e edit · l sign in · x remove)",
     "",
     "compose",
     "  tab  next field      shift+tab  previous field",
-    "  ctrl+w  delete word   ctrl+u  clear field",
-    "  arrows/space  format      enter on Body  $EDITOR",
+    "  left/right home/end  move    ctrl+w  delete word",
+    "  ctrl+u  delete to start      ctrl+k  delete to end",
+    "  space on Format or Security  change it",
+    "  enter on Body  $EDITOR     ctrl+e on Body  built-in editor",
     "  ctrl+s  review             ctrl+d  save draft",
     "",
     "commands",
     "  :reload                 :filter unread",
     "  :sync                   sync every account now",
+    "  :upload                 send local mail kept off the server",
+    "  :search server          search the server for older mail",
+    "  :folder new             create a folder",
     "  :mark read              mark the whole folder read",
     "  :accounts               :account add / :account edit",
     "  :login                  enter an account password",
     "  :open maildir PATH      :compose  :reply  :quit",
     "  :reply all              :forward",
+    "",
+    "config",
+    "  [keys] archive = \"e\"     [theme] preset = \"light\"",
+    "  [crypto] sign = true     notifications = false",
 ];
 
-pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
+pub(crate) fn draw_overlay(
+    frame: &mut Frame,
+    overlay: &mut Overlay,
+    cursor_back: usize,
+) -> mouse::OverlayGeometry {
     let (width, height) = match overlay {
         Overlay::AccountSetup(form) => (
             76,
@@ -503,14 +548,42 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
         Overlay::Attachments { items, .. } => (64, (items.len() as u16 + 2).min(16)),
         Overlay::Accounts { items, .. } => (64, (items.len() as u16 + 2).min(16)),
         Overlay::Compose(_) => (78, 21),
+        Overlay::BodyEditor { .. } => (100, 40),
+        Overlay::Menu { items, .. } => (
+            items
+                .iter()
+                .map(|item| item.label.chars().count() as u16 + 8)
+                .max()
+                .unwrap_or(20)
+                .max(22),
+            items.len() as u16 + 2,
+        ),
     };
     let screen = frame.area();
-    let area = Rect::new(
-        screen.x + screen.width.saturating_sub(width.min(screen.width)) / 2,
-        screen.y + screen.height.saturating_sub(height.min(screen.height)) / 2,
-        width.min(screen.width),
-        height.min(screen.height),
-    );
+    let (width, height) = (width.min(screen.width), height.min(screen.height));
+    let area = match overlay {
+        // The menu opens at the pointer and stays on screen.
+        Overlay::Menu { x, y, .. } => Rect::new(
+            (*x).min(screen.right().saturating_sub(width)),
+            if *y + height > screen.bottom() {
+                y.saturating_sub(height)
+            } else {
+                *y
+            },
+            width,
+            height,
+        ),
+        _ => Rect::new(
+            screen.x + screen.width.saturating_sub(width) / 2,
+            screen.y + screen.height.saturating_sub(height) / 2,
+            width,
+            height,
+        ),
+    };
+    let mut geometry = mouse::OverlayGeometry {
+        area,
+        ..Default::default()
+    };
     frame.render_widget(Clear, area);
     match overlay {
         Overlay::AccountSetup(form) => form.draw(frame, area),
@@ -545,7 +618,7 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
         }
         Overlay::Command(input) => {
             frame.render_widget(
-                Paragraph::new(format!(":{input}_"))
+                Paragraph::new(cursor_line(":", input, cursor_back))
                     .style(theme::text())
                     .block(
                         Block::bordered()
@@ -651,7 +724,7 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                 PromptKind::RenameFolder(name) => format!(" rename {name} "),
             };
             frame.render_widget(
-                Paragraph::new(format!("{input}_"))
+                Paragraph::new(cursor_line("", input, cursor_back))
                     .style(theme::text())
                     .block(
                         Block::bordered()
@@ -669,6 +742,7 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
             moving,
             deleting,
         } => {
+            let count = items.len();
             let rows: Vec<ListItem> = items
                 .iter()
                 .map(|folder| {
@@ -697,8 +771,10 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
             frame.render_stateful_widget(list, area, &mut state);
+            geometry.list = Some((area.y + 1, state.offset(), count));
         }
         Overlay::Links { selected, items } => {
+            let count = items.len();
             let rows: Vec<ListItem> = items
                 .iter()
                 .enumerate()
@@ -717,8 +793,10 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
             frame.render_stateful_widget(list, area, &mut state);
+            geometry.list = Some((area.y + 1, state.offset(), count));
         }
         Overlay::Attachments { selected, items } => {
+            let count = items.len();
             let rows: Vec<ListItem> = items
                 .iter()
                 .enumerate()
@@ -745,12 +823,14 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
             frame.render_stateful_widget(list, area, &mut state);
+            geometry.list = Some((area.y + 1, state.offset(), count));
         }
         Overlay::Accounts {
             selected,
             items,
             removing,
         } => {
+            let count = items.len();
             let rows: Vec<ListItem> = items
                 .iter()
                 .map(|item| ListItem::new(item.label.clone()))
@@ -772,12 +852,69 @@ pub(crate) fn draw_overlay(frame: &mut Frame, overlay: &Overlay) {
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
             frame.render_stateful_widget(list, area, &mut state);
+            geometry.list = Some((area.y + 1, state.offset(), count));
         }
-        Overlay::Compose(state) => draw_compose(frame, area, state),
+        Overlay::Compose(state) => {
+            let (fields, body) = draw_compose(frame, area, state, cursor_back);
+            geometry.fields = fields;
+            geometry.body = Some(body);
+        }
+        Overlay::Menu {
+            items, selected, ..
+        } => {
+            let rows: Vec<ListItem> = items
+                .iter()
+                .map(|item| {
+                    let key = match item.key.code {
+                        KeyCode::Char(character) => character.to_string(),
+                        KeyCode::Enter => "enter".into(),
+                        KeyCode::Esc => "esc".into(),
+                        _ => String::new(),
+                    };
+                    let width = usize::from(area.width.saturating_sub(4));
+                    let gap =
+                        width.saturating_sub(item.label.chars().count() + key.chars().count() + 1);
+                    ListItem::new(Line::from(vec![
+                        Span::raw(format!(" {}", item.label)),
+                        Span::raw(" ".repeat(gap)),
+                        Span::styled(key, theme::muted()),
+                    ]))
+                })
+                .collect();
+            let list = List::new(rows)
+                .style(theme::text())
+                .highlight_style(theme::selection())
+                .block(
+                    Block::bordered()
+                        .border_style(theme::border(true))
+                        .bg(theme::surface()),
+                );
+            let mut state = ListState::default().with_selected(Some(*selected));
+            frame.render_stateful_widget(list, area, &mut state);
+            geometry.list = Some((area.y + 1, state.offset(), items.len()));
+        }
+        Overlay::BodyEditor { state, editor } => {
+            let title = format!(
+                " body · {} ",
+                if state.composer.subject.is_empty() {
+                    "new message"
+                } else {
+                    state.composer.subject.as_str()
+                }
+            );
+            editor.draw(frame, area, &title);
+        }
     }
+    geometry
 }
 
-pub(crate) fn draw_compose(frame: &mut Frame, area: Rect, state: &ComposeState) {
+/// Draws the composer. Returns each header row with its field, and the body box.
+pub(crate) fn draw_compose(
+    frame: &mut Frame,
+    area: Rect,
+    state: &ComposeState,
+    cursor_back: usize,
+) -> (Vec<(Rect, usize)>, Rect) {
     let block = Block::bordered()
         .border_style(theme::border(true))
         .title_style(theme::title(true))
@@ -811,14 +948,9 @@ pub(crate) fn draw_compose(frame: &mut Frame, area: Rect, state: &ComposeState) 
         .iter()
         .enumerate()
         .map(|(index, (label, value))| {
-            let cursor = if index == state.field
+            let editing = index == state.field
                 && index != ComposeState::FORMAT_FIELD
-                && index != ComposeState::SECURITY_FIELD
-            {
-                "_"
-            } else {
-                ""
-            };
+                && index != ComposeState::SECURITY_FIELD;
             let hint = state
                 .suggestion
                 .as_ref()
@@ -832,11 +964,12 @@ pub(crate) fn draw_compose(frame: &mut Frame, area: Rect, state: &ComposeState) 
                         .trim();
                     Span::styled(format!("  ⇥ {entry}"), theme::muted())
                 });
-            ListItem::new(Line::from_iter(
-                [Span::raw(format!("{label:<8} {value}{cursor}"))]
-                    .into_iter()
-                    .chain(hint),
-            ))
+            let line = if editing {
+                cursor_line(&format!("{label:<8} "), value, cursor_back)
+            } else {
+                Line::raw(format!("{label:<8} {value}"))
+            };
+            ListItem::new(Line::from_iter(line.spans.into_iter().chain(hint)))
         })
         .collect();
     let list = List::new(items)
@@ -892,6 +1025,45 @@ pub(crate) fn draw_compose(frame: &mut Frame, area: Rect, state: &ComposeState) 
         .style(theme::muted()),
         rows[4],
     );
+    let fields = (0..ComposeState::BODY_FIELD)
+        .filter(|index| (*index as u16) + 2 < rows[1].height)
+        .map(|index| {
+            (
+                Rect::new(
+                    rows[1].x + 1,
+                    rows[1].y + 1 + index as u16,
+                    rows[1].width.saturating_sub(2),
+                    1,
+                ),
+                index,
+            )
+        })
+        .collect();
+    (fields, rows[2])
+}
+
+/// A text field with a visible cursor `back` characters before its end.
+pub(crate) fn cursor_line(prefix: &str, value: &str, back: usize) -> Line<'static> {
+    let characters: Vec<char> = value.chars().collect();
+    let position = characters.len() - back.min(characters.len());
+    let before: String = characters[..position].iter().collect();
+    let at = characters
+        .get(position)
+        .map_or(" ".to_owned(), char::to_string);
+    let after: String = characters
+        .get(position + 1..)
+        .unwrap_or_default()
+        .iter()
+        .collect();
+    Line::from(vec![
+        Span::raw(prefix.to_owned()),
+        Span::raw(before),
+        Span::styled(
+            at,
+            theme::keycap().add_modifier(ratatui::style::Modifier::REVERSED),
+        ),
+        Span::raw(after),
+    ])
 }
 
 pub(crate) fn reader_is_docked(width: u16, reader_open: bool) -> bool {

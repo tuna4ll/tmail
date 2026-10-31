@@ -110,6 +110,10 @@ fn colors() -> &'static Colors {
     COLORS.get_or_init(|| Colors::DARK)
 }
 
+pub fn canvas() -> Color {
+    colors().canvas
+}
+
 pub fn surface() -> Color {
     colors().surface
 }
@@ -184,5 +188,13 @@ pub fn keycap() -> Style {
     Style::default()
         .fg(text_color())
         .bg(subtle())
+        .add_modifier(Modifier::BOLD)
+}
+
+/// A hint under the pointer: the accent color behind the key.
+pub fn hover() -> Style {
+    Style::default()
+        .fg(canvas())
+        .bg(accent())
         .add_modifier(Modifier::BOLD)
 }
