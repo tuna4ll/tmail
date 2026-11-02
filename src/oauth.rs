@@ -11,6 +11,27 @@ use crate::{config::Config, remote::RemoteConfig};
 
 pub fn run(config: &Config, account: Option<&str>) -> Result<(), String> {
     let remote = pick(config, account)?;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let refresh = authorize(&remote, &cancel, &mut |url| {
+        println!("Opening the sign-in page for {}.", remote.username);
+        println!("If no browser opens, visit:\n\n{url}\n");
+    })?;
+    remote.store_keyring_password(&refresh)?;
+    remote.forget_cached();
+    println!("Signed in. The refresh token is in the system keyring.");
+    if !remote.keyring {
+        println!("Add `keyring = true` to this account's [remote] table so Termail reads it.");
+    }
+    Ok(())
+}
+
+/// Signs in through the provider's page and returns the refresh token. `show` gets
+/// the page's address in case no browser opens; `cancel` stops the wait.
+pub fn authorize(
+    remote: &RemoteConfig,
+    cancel: &std::sync::atomic::AtomicBool,
+    show: &mut dyn FnMut(&str),
+) -> Result<String, String> {
     let oauth = remote
         .oauth2
         .as_ref()
@@ -50,10 +71,9 @@ pub fn run(config: &Config, account: Option<&str>) -> Result<(), String> {
         if auth_url.contains('?') { '&' } else { '?' },
         encode_query(&query)
     );
-    println!("Opening the sign-in page for {}.", remote.username);
-    println!("If no browser opens, visit:\n\n{url}\n");
+    show(&url);
     let _ = opener::open(&url);
-    let code = wait_for_code(&listener, &state)?;
+    let code = wait_for_code(&listener, &state, cancel)?;
     let mut form = vec![
         ("grant_type", "authorization_code"),
         ("code", code.as_str()),
@@ -65,17 +85,13 @@ pub fn run(config: &Config, account: Option<&str>) -> Result<(), String> {
         form.push(("client_secret", oauth.client_secret.as_str()));
     }
     let response = crate::remote::token_request(&oauth.token_url(), &form)?;
-    let refresh = response["refresh_token"]
+    response["refresh_token"]
         .as_str()
         .filter(|token| !token.is_empty())
-        .ok_or("The provider returned no refresh token. Check the scope and client type.")?;
-    remote.store_keyring_password(refresh)?;
-    remote.forget_cached();
-    println!("Signed in. The refresh token is in the system keyring.");
-    if !remote.keyring {
-        println!("Add `keyring = true` to this account's [remote] table so Termail reads it.");
-    }
-    Ok(())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            "The provider returned no refresh token. Check the scope and client type.".into()
+        })
 }
 
 fn pick(config: &Config, account: Option<&str>) -> Result<RemoteConfig, String> {
@@ -102,7 +118,11 @@ fn pick(config: &Config, account: Option<&str>) -> Result<RemoteConfig, String> 
 }
 
 /// Waits up to five minutes for the browser to come back with the code.
-fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String, String> {
+fn wait_for_code(
+    listener: &TcpListener,
+    state: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<String, String> {
     listener
         .set_nonblocking(true)
         .map_err(|error| error.to_string())?;
@@ -110,6 +130,9 @@ fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String, String> 
     loop {
         if started.elapsed() > Duration::from_secs(300) {
             return Err("Sign-in timed out.".into());
+        }
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("Sign-in cancelled.".into());
         }
         let mut stream = match listener.accept() {
             Ok((stream, _)) => stream,

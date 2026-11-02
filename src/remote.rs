@@ -80,6 +80,18 @@ pub struct RemoteConfig {
     /// Messages larger than this many bytes download headers first; zero downloads all.
     #[serde(skip_serializing_if = "is_zero")]
     pub max_download_bytes: u64,
+    /// A different SMTP sign-in, for the few providers that need one.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub smtp_username: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub smtp_password_env: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub smtp_password_command: Vec<String>,
+    /// PEM certificates to trust for this account's servers, besides the system's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_certificate: Option<std::path::PathBuf>,
+    #[serde(skip)]
+    pub smtp_session_password: Option<std::sync::Arc<SessionPassword>>,
     pub inbox: String,
     pub sent: String,
     pub sync_interval_secs: u64,
@@ -107,6 +119,11 @@ impl Default for RemoteConfig {
             oauth2: None,
             watch: Vec::new(),
             max_download_bytes: 0,
+            smtp_username: String::new(),
+            smtp_password_env: String::new(),
+            smtp_password_command: Vec::new(),
+            tls_certificate: None,
+            smtp_session_password: None,
             inbox: "INBOX".into(),
             sent: String::new(),
             sync_interval_secs: 60,
@@ -190,6 +207,8 @@ pub enum ErrorKind {
     Auth,
     /// The server lacks a capability the operation needs.
     Unsupported,
+    /// The server's certificate is not trusted.
+    Certificate,
     Other,
 }
 
@@ -203,6 +222,13 @@ impl RemoteError {
     pub fn auth(message: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::Auth,
+            message: message.into(),
+        }
+    }
+
+    pub fn certificate(message: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::Certificate,
             message: message.into(),
         }
     }
@@ -287,10 +313,13 @@ impl RemoteConfig {
 
     pub fn validate(&self) -> Result<(), String> {
         for host in [&self.imap_host, &self.smtp_host] {
+            // IPv6 addresses contain colons; anything else with one is a URL or a port.
+            let ipv6 = host.parse::<std::net::Ipv6Addr>().is_ok();
             if host.is_empty()
                 || host
                     .chars()
-                    .any(|c| c.is_whitespace() || c.is_control() || "/:@".contains(c))
+                    .any(|c| c.is_whitespace() || c.is_control() || "/@".contains(c))
+                || (host.contains(':') && !ipv6)
             {
                 return Err(
                     "IMAP and SMTP hosts must be hostnames without URLs or credentials.".into(),
@@ -303,10 +332,12 @@ impl RemoteConfig {
         if self.username.is_empty() || self.username.chars().any(char::is_control) {
             return Err("Set the remote account username.".into());
         }
-        if !self
-            .password_env
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        if self.smtp_username.chars().any(char::is_control) {
+            return Err("Set a valid SMTP username.".into());
+        }
+        if ![&self.password_env, &self.smtp_password_env]
+            .iter()
+            .all(|name| name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
         {
             return Err("Set password_env to the name of an environment variable.".into());
         }
@@ -413,6 +444,99 @@ impl RemoteConfig {
         })
     }
 
+    /// Whether SMTP signs in with its own username instead of the IMAP one.
+    pub fn separate_smtp(&self) -> bool {
+        !self.smtp_username.is_empty() && self.smtp_username != self.username
+    }
+
+    pub fn smtp_login(&self) -> &str {
+        if self.separate_smtp() {
+            &self.smtp_username
+        } else {
+            &self.username
+        }
+    }
+
+    /// The SMTP secret: the account's own, unless SMTP has a separate username.
+    pub fn smtp_password(&self) -> Result<String, String> {
+        if !self.separate_smtp() || self.oauth2.is_some() {
+            return self.password();
+        }
+        if let Some(password) = &self.smtp_session_password
+            && !password.0.is_empty()
+        {
+            return Ok(password.0.to_string());
+        }
+        if !self.smtp_password_env.is_empty()
+            && let Some(value) = std::env::var(&self.smtp_password_env)
+                .ok()
+                .filter(|value| !value.is_empty())
+        {
+            return Ok(value);
+        }
+        if !self.smtp_password_command.is_empty() {
+            if let Some(value) = self.cached("smtp-command") {
+                return Ok(value);
+            }
+            let value = run_password_command(&self.smtp_password_command)?;
+            self.remember(
+                "smtp-command",
+                &value,
+                Duration::from_secs(self.password_cache_secs),
+            );
+            return Ok(value);
+        }
+        if self.keyring {
+            return smtp_keyring_entry(self)?.get_password().map_err(|_| {
+                "No SMTP password is stored in the system keyring. Sign in again.".into()
+            });
+        }
+        Err("Sign in to enter the SMTP password.".into())
+    }
+
+    pub fn store_smtp_keyring_password(&self, password: &str) -> Result<(), String> {
+        smtp_keyring_entry(self)?
+            .set_password(password)
+            .map_err(|_| "Unable to save the SMTP password in the system keyring.".into())
+    }
+
+    pub fn smtp_keyring_has_password(&self) -> bool {
+        smtp_keyring_entry(self).is_ok_and(|entry| entry.get_password().is_ok())
+    }
+
+    /// The certificates from `tls_certificate`, as PEM blocks.
+    pub fn extra_certificates(&self) -> Result<Vec<Vec<u8>>, String> {
+        let Some(path) = &self.tls_certificate else {
+            return Ok(Vec::new());
+        };
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
+        let blocks: Vec<Vec<u8>> = text
+            .split_inclusive("-----END CERTIFICATE-----")
+            .filter_map(|block| {
+                let start = block.find("-----BEGIN CERTIFICATE-----")?;
+                Some(block.as_bytes()[start..].to_vec())
+            })
+            .collect();
+        if blocks.is_empty() {
+            return Err(format!("{} holds no PEM certificate.", path.display()));
+        }
+        Ok(blocks)
+    }
+
+    /// A TLS connector that trusts the system's certificates and the account's own.
+    pub fn tls_connector(&self) -> Result<native_tls::TlsConnector, String> {
+        let mut builder = native_tls::TlsConnector::builder();
+        for pem in self.extra_certificates()? {
+            let certificate = native_tls::Certificate::from_pem(&pem)
+                .map_err(|_| "The trusted certificate file is not valid PEM.".to_owned())?;
+            builder.add_root_certificate(certificate);
+        }
+        builder
+            .build()
+            .map_err(crate::log::fail("Unable to configure TLS."))
+    }
+
     pub fn keyring_has_password(&self) -> bool {
         keyring_entry(self).is_ok_and(|entry| entry.get_password().is_ok())
     }
@@ -487,6 +611,14 @@ pub(crate) fn token_request(url: &str, form: &[(&str, &str)]) -> Result<serde_js
         ));
     }
     Ok(body)
+}
+
+fn smtp_keyring_entry(remote: &RemoteConfig) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(
+        "termail",
+        &format!("smtp:{}@{}", remote.smtp_login(), remote.smtp_host),
+    )
+    .map_err(|_| "The system keyring is unavailable.".into())
 }
 
 fn keyring_entry(remote: &RemoteConfig) -> Result<keyring::Entry, String> {

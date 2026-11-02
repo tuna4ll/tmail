@@ -77,6 +77,9 @@ impl Config {
         let base = path.parent().unwrap_or(Path::new("."));
         resolve_path(&mut config.maildir, base);
         resolve_path(&mut config.download_dir, base);
+        if let Some(remote) = &mut config.remote {
+            resolve_path(&mut remote.tls_certificate, base);
+        }
         if let Some(remote) = &config.remote {
             remote.validate().map_err(color_eyre::eyre::Error::msg)?;
             if config.maildir.is_none() || !config.send_command.is_empty() {
@@ -88,6 +91,9 @@ impl Config {
         for account in &mut config.accounts {
             resolve_path(&mut account.maildir, base);
             resolve_path(&mut account.download_dir, base);
+            if let Some(remote) = &mut account.remote {
+                resolve_path(&mut remote.tls_certificate, base);
+            }
         }
         let mut ids = std::collections::HashSet::new();
         let mut roots = std::collections::HashSet::new();

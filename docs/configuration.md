@@ -85,13 +85,28 @@ send_command = ["msmtp", "-a", "work"]
 
 Press `p` inside termail to switch accounts or to see all of them together.
 
+## Adding an account in termail
+
+You rarely need to write the server settings yourself. Press `p` and then `a`, or start termail without a config, and type your address. When you press tab, termail fills in the servers:
+
+- for well-known providers (Gmail, Outlook, iCloud, Yahoo, Fastmail, GMX, Proton Mail Bridge and others) from a list built into termail, without going online
+- otherwise from Thunderbird's provider database, the domain's own autoconfig file, its DNS records, or its mail servers, which also finds Google Workspace and Microsoft 365 on your own domain
+
+Online lookups send only the domain of your address, never the address or a password, to `autoconfig.thunderbird.net`, to the domain itself, and to Cloudflare's DNS resolver. Press `ctrl+f` to look again, or type the servers in yourself.
+
+The form also lets you pick the sign-in type (a password, or OAuth2 for Google, Microsoft or another provider) and the security of each server. `ctrl+r` shows what you typed in the password fields. termail checks the account before saving it and never sends a message while doing so.
+
+If a server is rejected because of its certificate, as with Proton Mail Bridge or a server you run yourself, the form shows the certificate's SHA-256 fingerprint. Compare it with the one your server shows, then press `ctrl+t` to trust it. termail saves it in `certs/` next to the config and checks again.
+
+When the server turns your password down, termail shows the reason it gave, with a hint for the usual fixes such as an app password. It stops trying that account, so a wrong password never gets the account locked, and asks you to sign in again. Other accounts that need a password are marked "sign in needed" in the account list; choose one and press `l`.
+
 ## Server settings: `[remote]`
 
 With a `[remote]` table termail syncs the account over IMAP and sends over SMTP by itself. You do not need `send_command` then, and setting both is an error.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `imap_host` | | The IMAP server name, without `imaps://` or a port. |
+| `imap_host` | | The IMAP server name or IP address (IPv6 works too), without `imaps://` or a port. |
 | `imap_port` | `993` | |
 | `imap_security` | `auto` | `tls`, `starttls` or `auto`. Auto uses STARTTLS on ports 143, 587 and 25 and TLS everywhere else. |
 | `smtp_host` | | The SMTP server name. |
@@ -106,6 +121,8 @@ With a `[remote]` table termail syncs the account over IMAP and sends over SMTP 
 | `timeout_secs` | `30` | How long to wait for the server before giving up. |
 | `watch` | the inbox | Folders to watch for new mail as it arrives (IMAP IDLE): `["INBOX", "Lists"]`. Each one keeps a connection open. |
 | `max_download_bytes` | `0` | Messages larger than this arrive as headers only. Press `D` on one to download the rest. `0` downloads everything. |
+| `smtp_username` | | A different username for SMTP, for the few providers that need one. Its password comes from `smtp_password_env`, `smtp_password_command` or the keyring, like the main one. |
+| `tls_certificate` | | A PEM file with certificates to trust for this account, besides the ones your system trusts. termail writes it when you trust a certificate in the account form. |
 
 ### Passwords
 
@@ -137,13 +154,13 @@ client_secret = "your-client-secret"
 
 `provider` can be `gmail` or `outlook`. For anything else, give `auth_url`, `token_url` and `scope` yourself. You need a client ID from your provider's developer console. Register it as a desktop app.
 
-Then run:
+Then sign in from the account form, which opens your browser, or run:
 
 ```sh
 termail oauth
 ```
 
-Your browser opens the provider's sign-in page. After you approve, termail keeps the refresh token in the keyring and gets new access tokens by itself. With several accounts, name the one you mean: `termail oauth work`.
+Your browser opens the provider's sign-in page. If it does not, the form shows the link and `ctrl+y` copies it. After you approve, termail keeps the refresh token in the keyring and gets new access tokens by itself. With several accounts, name the one you mean: `termail oauth work`.
 
 ### The first sync
 

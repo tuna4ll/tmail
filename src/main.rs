@@ -1,8 +1,10 @@
 mod account_setup;
+mod certs;
 mod complete;
 mod config;
 mod crypto;
 mod delivery;
+mod discover;
 mod doctor;
 mod draft;
 #[cfg(test)]
@@ -229,6 +231,9 @@ pub struct App {
     screen_height: u16,
     /// q was pressed once with ui.confirm_quit on.
     confirm_quit: bool,
+    /// Accounts whose server rejected the sign-in; they wait for a new password
+    /// instead of retrying, which could get the account locked.
+    auth_failed: std::collections::HashSet<String>,
     script: Option<script::Engine>,
     /// The folder the script last heard about.
     script_folder: String,
@@ -266,6 +271,13 @@ enum Task {
         mail_id: String,
         result: Result<(Vec<u8>, String), String>,
     },
+    /// Server settings were looked up for an address in the account form.
+    Discovered {
+        email: String,
+        result: Result<discover::Found, String>,
+    },
+    /// The OAuth2 sign-in page for a connection check, in case no browser opened.
+    SetupLink { request: u64, url: String },
     /// A partial message finished downloading.
     Downloaded {
         mail_id: String,
@@ -281,8 +293,8 @@ struct MailboxLoad {
 
 struct SetupResult {
     request: u64,
-    account: config::Account,
-    result: Result<(), String>,
+    /// The checked account, with any OAuth2 token it got, or why the check failed.
+    result: Result<config::Account, account_setup::Failure>,
 }
 
 struct UndoAction {
@@ -585,6 +597,7 @@ impl App {
             screen_width: 0,
             screen_height: 0,
             confirm_quit: false,
+            auth_failed: Default::default(),
             script: None,
             script_folder: String::new(),
             overlay: None,
@@ -723,6 +736,29 @@ impl App {
                 }
             }
             Task::Opened { mail_id, result } => self.show_opened(mail_id, result),
+            Task::Discovered { email, result } => {
+                if let Some(Overlay::AccountSetup(form)) = &mut self.overlay
+                    && form.value(account_setup::Field::Email).trim() == email
+                {
+                    form.discovering = false;
+                    match result {
+                        Ok(found)
+                            if form.value(account_setup::Field::ImapHost).trim().is_empty() =>
+                        {
+                            form.apply(&found);
+                        }
+                        Ok(_) => {}
+                        Err(message) => form.info = Some(message),
+                    }
+                }
+            }
+            Task::SetupLink { request, url } => {
+                if let Some(Overlay::AccountSetup(form)) = &mut self.overlay
+                    && form.request == request
+                {
+                    form.oauth_link = Some(url);
+                }
+            }
             Task::Downloaded { mail_id, result } => match result {
                 Ok(()) => {
                     self.notice = Some("Full message downloaded".into());
@@ -876,10 +912,10 @@ mod tests {
         let mut app = super::App::new(MailboxSource::Demo, config);
         app.prepare_accounts(true, false);
         let account = pending_setup(&mut app, 1);
+        let _ = account;
         app.finish_account_setup(super::SetupResult {
             request: 1,
-            account,
-            result: Err("Sign-in failed".into()),
+            result: Err("Sign-in failed".to_owned().into()),
         });
         assert!(
             matches!(app.overlay, Some(Overlay::AccountSetup(ref form)) if !form.busy && form.error.as_deref() == Some("Sign-in failed"))
@@ -890,8 +926,7 @@ mod tests {
         app.on_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.finish_account_setup(super::SetupResult {
             request: 2,
-            account,
-            result: Ok(()),
+            result: Ok(account),
         });
         assert!(app.overlay.is_none());
         assert!(app.onboarding);
@@ -910,8 +945,7 @@ mod tests {
         let account = pending_setup(&mut app, 1);
         app.finish_account_setup(super::SetupResult {
             request: 1,
-            account,
-            result: Ok(()),
+            result: Ok(account),
         });
         assert!(!app.onboarding);
         assert!(app.overlay.is_none());
@@ -936,15 +970,17 @@ mod tests {
         let Some(Overlay::AccountSetup(mut form)) = restarted.overlay.take() else {
             panic!()
         };
-        form.values[3] = "another-fake-password".into();
+        form.set(
+            crate::account_setup::Field::Password,
+            "another-fake-password",
+        );
         form.request = 2;
         let account = form.build().unwrap();
         restarted.setup_generation = 2;
         restarted.overlay = Some(Overlay::AccountSetup(form));
         restarted.finish_account_setup(super::SetupResult {
             request: 2,
-            account,
-            result: Ok(()),
+            result: Ok(account),
         });
         assert_eq!(std::fs::read(path).unwrap(), before);
         assert_eq!(
@@ -968,7 +1004,7 @@ mod tests {
         let Some(Overlay::AccountSetup(form)) = &app.overlay else {
             panic!()
         };
-        assert_eq!(form.values[0], "TunaKılıç");
+        assert_eq!(form.value(crate::account_setup::Field::Name), "TunaKılıç");
         assert!(!form.busy);
     }
 

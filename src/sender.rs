@@ -57,20 +57,39 @@ pub async fn send_smtp(
     .map_err(|_| SendError::uncertain("SMTP worker stopped. Check delivery before retrying."))?
 }
 
-pub fn check_connection(remote: &crate::remote::RemoteConfig) -> Result<(), String> {
+pub fn check_connection(
+    remote: &crate::remote::RemoteConfig,
+) -> Result<(), crate::remote::RemoteError> {
     remote.validate()?;
-    check_transport(&smtp_transport(remote)?)
+    let secret = remote
+        .smtp_password()
+        .map_err(crate::remote::RemoteError::auth)?;
+    check_transport(&smtp_transport(remote)?, remote, &secret)
 }
 
 fn smtp_transport(remote: &crate::remote::RemoteConfig) -> Result<lettre::SmtpTransport, String> {
-    use lettre::transport::smtp::authentication::{Credentials, Mechanism};
-    let secret = remote.password()?;
-    let builder = if remote.smtp_security.starttls(remote.smtp_port) {
-        lettre::SmtpTransport::starttls_relay(&remote.smtp_host)
-    } else {
-        lettre::SmtpTransport::relay(&remote.smtp_host)
+    use lettre::transport::smtp::{
+        authentication::{Credentials, Mechanism},
+        client::{Certificate, Tls, TlsParameters},
+    };
+    let secret = remote.smtp_password()?;
+    let mut parameters = TlsParameters::builder(remote.smtp_host.clone());
+    for pem in remote.extra_certificates()? {
+        parameters = parameters.add_root_certificate(
+            Certificate::from_pem(&pem)
+                .map_err(|_| "The trusted certificate file is not valid PEM.")?,
+        );
     }
-    .map_err(|_| "Unable to configure SMTP TLS.")?;
+    let parameters = parameters
+        .build()
+        .map_err(|_| "Unable to configure SMTP TLS.")?;
+    let builder = lettre::SmtpTransport::builder_dangerous(&remote.smtp_host).tls(
+        if remote.smtp_security.starttls(remote.smtp_port) {
+            Tls::Required(parameters)
+        } else {
+            Tls::Wrapper(parameters)
+        },
+    );
     let mechanisms = match remote.auth {
         crate::remote::Auth::Password => vec![Mechanism::Plain, Mechanism::Login],
         crate::remote::Auth::Xoauth2 => vec![Mechanism::Xoauth2],
@@ -78,21 +97,57 @@ fn smtp_transport(remote: &crate::remote::RemoteConfig) -> Result<lettre::SmtpTr
     Ok(builder
         .port(remote.smtp_port)
         .timeout(Some(remote.timeout()))
-        .credentials(Credentials::new(remote.username.clone(), secret))
+        .credentials(Credentials::new(remote.smtp_login().to_owned(), secret))
         .authentication(mechanisms)
         .build())
 }
 
-fn check_transport(transport: &lettre::SmtpTransport) -> Result<(), String> {
-    match transport.test_connection() {
-        Ok(true) => Ok(()),
-        result => {
-            if let Err(error) = result {
-                crate::log::write("smtp", error);
-            }
-            Err("SMTP sign-in failed. Check the server, port and password.".into())
-        }
+/// Signs in to SMTP without sending anything, and says what went wrong in words that
+/// point at the fix: the address, the certificate or the password.
+fn check_transport(
+    transport: &lettre::SmtpTransport,
+    remote: &crate::remote::RemoteConfig,
+    secret: &str,
+) -> Result<(), crate::remote::RemoteError> {
+    use crate::remote::RemoteError;
+    let host = format!("{}:{}", remote.smtp_host, remote.smtp_port);
+    let error = match transport.test_connection() {
+        Ok(true) => return Ok(()),
+        Ok(false) => return Err(format!("{host} did not accept the connection.").into()),
+        Err(error) => error,
+    };
+    let detail = if secret.is_empty() {
+        error.to_string()
+    } else {
+        error.to_string().replace(secret, "[redacted]")
+    };
+    crate::log::write("smtp", &detail);
+    let reason = crate::imap_client::short(&detail);
+    if error.is_tls() {
+        return Err(crate::imap_client::tls_failure(
+            "SMTP",
+            &remote.smtp_host,
+            &detail,
+        ));
     }
+    if let Some(code) = error.status().map(|code| code.to_string()) {
+        if matches!(code.as_str(), "535" | "534" | "530" | "454") {
+            return Err(RemoteError::auth(format!(
+                "SMTP rejected the username or password ({code}). The server said: {reason}.{}",
+                crate::imap_client::sign_in_hint(&detail.to_lowercase())
+            )));
+        }
+        return Err(format!("SMTP refused the sign-in ({code}): {reason}").into());
+    }
+    if error.is_timeout() {
+        return Err(
+            format!("{host} did not answer in time. Check the server name and port.").into(),
+        );
+    }
+    Err(
+        format!("Unable to reach {host}: {reason}. Check the server name, port and security.")
+            .into(),
+    )
 }
 
 fn smtp_with_transport(transport: &lettre::SmtpTransport, message: &[u8]) -> Result<(), SendError> {
@@ -281,6 +336,7 @@ mod smtp_tests {
     #[test]
     fn connection_check_authenticates_without_sending_mail() {
         let server = Server::new();
+        let server_remote = server.remote();
         let transport = transport(&server, true);
         let worker = server.spawn(|stream| {
             let mut stream = BufReader::new(stream.unwrap());
@@ -314,7 +370,7 @@ mod smtp_tests {
             assert!(authenticated);
             assert!(checked);
         });
-        check_transport(&transport).unwrap();
+        check_transport(&transport, &server_remote, "fake-password").unwrap();
         drop(transport);
         worker.join().unwrap();
     }

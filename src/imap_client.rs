@@ -25,8 +25,7 @@ const MASS_DELETE_LIMIT: usize = 20;
 
 pub fn connect(remote: &RemoteConfig) -> Result<Session, RemoteError> {
     let secret = zeroize::Zeroizing::new(remote.password().map_err(RemoteError::auth)?);
-    let tls = native_tls::TlsConnector::new()
-        .map_err(crate::log::fail("Unable to configure IMAP TLS."))?;
+    let tls = remote.tls_connector()?;
     connect_with_tls(remote, &secret, &tls)
 }
 
@@ -59,11 +58,7 @@ fn connect_with_tls(
     }
     let stream = tls
         .connect(&remote.imap_host, stream)
-        .map_err(crate::log::fail(if starttls {
-            "IMAP STARTTLS verification or handshake failed."
-        } else {
-            "IMAP TLS verification or handshake failed."
-        }))?;
+        .map_err(|error| tls_failure("IMAP", &remote.imap_host, &error.to_string()))?;
     let mut client = imap::Client::new(stream);
     if !starttls {
         client
@@ -138,7 +133,47 @@ fn start_tls(stream: &mut TcpStream) -> Result<(), String> {
     }
 }
 
-/// Logs a rejected sign-in without the secret, which some servers echo back.
+/// A TLS failure, telling an untrusted certificate apart from other problems so the
+/// user can be offered to trust it.
+pub fn tls_failure(protocol: &str, host: &str, detail: &str) -> RemoteError {
+    crate::log::write(
+        "error",
+        format_args!("{protocol} TLS with {host}: {detail}"),
+    );
+    let lower = detail.to_lowercase();
+    if lower.contains("certif")
+        || lower.contains("self signed")
+        || lower.contains("self-signed")
+        || lower.contains("issuer")
+    {
+        RemoteError::certificate(format!(
+            "{host} uses a certificate this computer does not trust."
+        ))
+    } else {
+        format!(
+            "{protocol} TLS handshake with {host} failed: {}",
+            short(detail)
+        )
+        .into()
+    }
+}
+
+/// A server reply cut to one readable line.
+pub fn short(detail: &str) -> String {
+    let line: String = detail
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() > 160 {
+        format!("{}…", line.chars().take(160).collect::<String>())
+    } else {
+        line
+    }
+}
+
+/// Explains a rejected sign-in with the server's own reason, without the secret,
+/// which some servers echo back.
 fn sign_in_failure(message: &str, error: &imap::Error, secret: &str) -> String {
     let detail = error.to_string();
     let detail = if secret.is_empty() {
@@ -147,7 +182,40 @@ fn sign_in_failure(message: &str, error: &imap::Error, secret: &str) -> String {
         detail.replace(secret, "[redacted]")
     };
     crate::log::write("error", format_args!("{message} ({detail})"));
-    message.into()
+    let reason = short(
+        detail
+            .trim_start_matches("No Response: ")
+            .trim_start_matches("Bad Response: "),
+    );
+    let hint = sign_in_hint(&detail.to_lowercase());
+    if reason.is_empty() {
+        format!("{message}{hint}")
+    } else {
+        format!("{message} The server said: {reason}.{hint}")
+    }
+}
+
+/// What usually fixes a rejected sign-in, from the words servers use.
+pub fn sign_in_hint(reason: &str) -> &'static str {
+    if reason.contains("application-specific")
+        || reason.contains("app password")
+        || reason.contains("web login required")
+        || reason.contains("webloginrequired")
+    {
+        " Create an app password in the account's security settings and use it here."
+    } else if reason.contains("basicauthblocked")
+        || reason.contains("basic auth")
+        || reason.contains("logondenied")
+    {
+        " This provider wants OAuth2 sign-in: choose it on the Sign-in line."
+    } else if reason.contains("too many")
+        || reason.contains("rate limit")
+        || reason.contains("try again later")
+    {
+        " Wait a few minutes before trying again."
+    } else {
+        ""
+    }
 }
 
 struct OAuth2<'a> {
@@ -2436,7 +2504,7 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert!(error.message.contains("TLS"));
+        assert_eq!(error.kind, crate::remote::ErrorKind::Certificate);
         worker.join().unwrap();
     }
 

@@ -11,6 +11,25 @@ impl App {
             self.open_account_setup(account_setup::Mode::Add);
         } else if !explicit_source {
             self.prompt_login();
+            let waiting: Vec<String> = self
+                .config
+                .accounts
+                .iter()
+                .filter(|account| account.id != self.config.current_account().id)
+                .filter(|account| {
+                    account
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| !remote.has_credentials())
+                })
+                .map(config::Account::label)
+                .collect();
+            if !waiting.is_empty() && self.overlay.is_none() {
+                self.notice = Some(format!(
+                    "Sign in to {} to sync it · press p, choose it, then l",
+                    waiting.join(", ")
+                ));
+            }
         }
     }
 
@@ -54,77 +73,117 @@ impl App {
             return;
         }
         if form.busy {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('y' | 'Y'))
+                && let Some(link) = &form.oauth_link
+            {
+                copy_to_clipboard(link);
+                form.info = Some("Sign-in link copied.".into());
+            }
             self.overlay = Some(Overlay::AccountSetup(form));
             return;
         }
-        let submit = key.modifiers.contains(KeyModifiers::CONTROL)
-            && key.code == KeyCode::Char('s')
-            || key.code == KeyCode::Enter
-                && (form.mode == account_setup::Mode::Login || form.field >= 10);
-        if submit {
-            if self.checking_account {
-                form.error =
-                    Some("The previous connection check is finishing. Try again shortly.".into());
-            } else {
-                match form.build() {
-                    Ok(account) => {
-                        self.setup_generation += 1;
-                        form.request = self.setup_generation;
-                        form.busy = true;
-                        form.error = None;
-                        self.checking_account = true;
-                        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        self.setup_cancel = Some(cancel.clone());
-                        let request = form.request;
-                        let sender = self.setup_tx.clone();
-                        tokio::spawn(async move {
-                            let checked = account.clone();
-                            let result = tokio::task::spawn_blocking(move || {
-                                account_setup::verify(&checked, &cancel)
-                            })
-                            .await
-                            .unwrap_or_else(|_| Err("Connection check stopped. Try again.".into()));
-                            let _ = sender.send(SetupResult {
-                                request,
-                                account,
-                                result,
-                            });
-                        });
-                    }
-                    Err((field, error)) => {
-                        form.field = field;
-                        form.error = Some(error);
-                    }
+        match form.handle_key(key) {
+            account_setup::Action::Submit => return self.submit_account(form),
+            account_setup::Action::Discover(email) => {
+                let lookup = email.clone();
+                self.spawn_task(move || Task::Discovered {
+                    result: discover::discover(&lookup),
+                    email,
+                });
+            }
+            account_setup::Action::Trust => return self.trust_certificate(form),
+            account_setup::Action::CopyLink => {
+                if let Some(link) = &form.oauth_link {
+                    copy_to_clipboard(link);
                 }
             }
-        } else {
-            match key.code {
-                KeyCode::Tab | KeyCode::Down | KeyCode::Enter => form.move_field(false),
-                KeyCode::BackTab | KeyCode::Up => form.move_field(true),
-                KeyCode::Backspace => {
-                    if let Some(value) = form.values.get_mut(form.field) {
-                        value.pop();
-                    }
-                }
-                KeyCode::Char(' ') if form.field == 10 => form.make_default = !form.make_default,
-                KeyCode::Char(' ') if form.field == 11 => form.remember = !form.remember,
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(value) = form.values.get_mut(form.field) {
-                        use zeroize::Zeroize;
-                        value.zeroize();
-                    }
-                }
-                KeyCode::Char(character)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    form.input(&character.to_string())
-                }
-                _ => {}
+            account_setup::Action::None => {}
+        }
+        self.overlay = Some(Overlay::AccountSetup(form));
+    }
+
+    /// Checks the form's account against its servers in the background.
+    fn submit_account(&mut self, mut form: Box<account_setup::Form>) {
+        if self.checking_account {
+            form.error =
+                Some("The previous connection check is finishing. Try again shortly.".into());
+            self.overlay = Some(Overlay::AccountSetup(form));
+            return;
+        }
+        match form.build() {
+            Ok(account) => {
+                self.setup_generation += 1;
+                form.request = self.setup_generation;
+                form.busy = true;
+                form.error = None;
+                form.untrusted = None;
+                form.oauth_link = None;
+                self.checking_account = true;
+                let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                self.setup_cancel = Some(cancel.clone());
+                let request = form.request;
+                let mode = form.mode;
+                let sender = self.setup_tx.clone();
+                let links = self.task_tx.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        account_setup::verify(account, mode, &cancel, &mut |url| {
+                            let _ = links.send(Task::SetupLink {
+                                request,
+                                url: url.to_owned(),
+                            });
+                        })
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err("Connection check stopped. Try again.".to_owned().into())
+                    });
+                    let _ = sender.send(SetupResult { request, result });
+                });
+            }
+            Err((field, error)) => {
+                form.field = field;
+                form.error = Some(error);
             }
         }
         self.overlay = Some(Overlay::AccountSetup(form));
+    }
+
+    /// Saves the certificate the form offered next to the config and checks again.
+    fn trust_certificate(&mut self, mut form: Box<account_setup::Form>) {
+        let Some(presented) = form.untrusted.take() else {
+            self.overlay = Some(Overlay::AccountSetup(form));
+            return;
+        };
+        let saved = (|| -> Result<PathBuf, String> {
+            let directory = self
+                .config
+                .path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .ok_or("Start with --config PATH to choose where certificates are saved.")?
+                .join("certs");
+            fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+            let path = directory.join(format!("{}.pem", form.account.id));
+            let mut bundle = fs::read_to_string(&path).unwrap_or_default();
+            if !bundle.contains(presented.pem.trim()) {
+                bundle.push_str(&presented.pem);
+            }
+            fs::write(&path, bundle).map_err(|error| error.to_string())?;
+            Ok(path)
+        })();
+        match saved {
+            Ok(path) => {
+                form.tls_certificate = Some(path);
+                form.info = Some(format!("Trusting the certificate of {}.", presented.host));
+                self.submit_account(form);
+            }
+            Err(error) => {
+                form.error = Some(format!("Unable to save the certificate: {error}"));
+                self.overlay = Some(Overlay::AccountSetup(form));
+            }
+        }
     }
 
     pub(crate) fn finish_account_setup(&mut self, result: SetupResult) {
@@ -141,7 +200,27 @@ impl App {
             return;
         }
         form.busy = false;
-        let saved = result.result.and_then(|_| {
+        form.oauth_link = None;
+        let account = match result.result {
+            Ok(account) => account,
+            Err(failure) => {
+                if failure.untrusted.is_some() {
+                    form.untrusted = failure.untrusted;
+                    form.error = None;
+                } else {
+                    form.error = Some(failure.message);
+                }
+                self.overlay = Some(Overlay::AccountSetup(form));
+                return;
+            }
+        };
+        // Keeps the saving code below reading `result.account`, as before.
+        struct Checked {
+            account: config::Account,
+        }
+        let id = account.id.clone();
+        let result = Checked { account };
+        let saved = (|| -> Result<(), String> {
             let root = result
                 .account
                 .maildir
@@ -155,6 +234,12 @@ impl App {
                     }
                     _ if !remote.keyring => remote.forget_keyring_password(),
                     _ => {}
+                }
+                if remote.keyring
+                    && remote.separate_smtp()
+                    && let Some(password) = &remote.smtp_session_password
+                {
+                    remote.store_smtp_keyring_password(&password.0)?;
                 }
             }
             let remembered = self
@@ -191,7 +276,7 @@ impl App {
                     form.make_default,
                 )
             }
-        });
+        })();
         if let Err(error) = saved {
             form.error = Some(error);
             self.overlay = Some(Overlay::AccountSetup(form));
@@ -201,6 +286,7 @@ impl App {
             self.notice = Some("The account has no Maildir. Edit it with p, then e.".into());
             return;
         };
+        self.auth_failed.remove(&id);
         self.onboarding = false;
         self.last_sync.clear();
         self.stop_watchers();
@@ -238,7 +324,15 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(index, account)| AccountItem {
-                    label: account.label(),
+                    label: match &account.remote {
+                        Some(remote)
+                            if self.auth_failed.contains(&account.id)
+                                || !remote.has_credentials() =>
+                        {
+                            format!("{} · sign in needed (l)", account.label())
+                        }
+                        _ => account.label(),
+                    },
                     index: Some(index),
                 }),
         );

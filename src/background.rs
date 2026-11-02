@@ -212,6 +212,9 @@ impl App {
             return;
         }
         for (id, remote, _) in self.remote_accounts() {
+            if self.auth_failed.contains(&id) {
+                continue;
+            }
             let due = self.last_sync.get(&id).is_none_or(|time| {
                 remote.sync_interval_secs > 0
                     && time.elapsed().as_secs() >= remote.sync_interval_secs
@@ -241,10 +244,15 @@ impl App {
             self.prompt_login();
             return;
         }
+        let active = self.config.current_account().id;
+        if self.auth_failed.contains(&active) {
+            self.open_account_setup(account_setup::Mode::Login);
+            return;
+        }
         self.manual_sync = true;
         self.notice = Some("Syncing…".into());
         for (id, remote, _) in accounts {
-            if remote.has_credentials() {
+            if remote.has_credentials() && !self.auth_failed.contains(&id) {
                 self.start_account_sync(&id);
             }
         }
@@ -336,15 +344,38 @@ impl App {
                     ));
                 }
             }
+            Err(error) if error.kind == remote::ErrorKind::Auth => {
+                // Retrying a rejected password every minute can get the account locked,
+                // so the account waits for a new one.
+                self.auth_failed.insert(id.clone());
+                if let Some(stop) = self.watchers.remove(&id) {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                remote.forget_cached();
+                let active = self.config.remote.as_ref().is_some_and(|active| {
+                    active.username == remote.username && active.imap_host == remote.imap_host
+                });
+                if active && self.overlay.is_none() {
+                    self.open_account_setup(account_setup::Mode::Login);
+                    if let Some(Overlay::AccountSetup(form)) = &mut self.overlay {
+                        form.error = Some(error.message);
+                    }
+                } else {
+                    let label = self
+                        .config
+                        .accounts
+                        .iter()
+                        .find(|account| account.id == id)
+                        .map_or_else(|| self.account_label.clone(), config::Account::label);
+                    self.notice = Some(format!(
+                        "Sign-in to {label} failed · press p, choose it, then l · {}",
+                        error.message
+                    ));
+                }
+            }
             Err(error) => {
                 if visible {
                     self.notice = Some(format!("Sync failed · {error}"));
-                }
-                if self.config.remote.as_ref().is_some_and(|active| {
-                    active.username == remote.username && active.imap_host == remote.imap_host
-                }) && error.kind == remote::ErrorKind::Auth
-                {
-                    self.prompt_login();
                 }
             }
         }
