@@ -215,6 +215,14 @@ impl App {
                 self.open_move_picker();
                 return;
             }
+            KeyCode::Char('J') => {
+                self.toggle_spam();
+                return;
+            }
+            KeyCode::Char('K') => {
+                self.add_sender_to_contacts();
+                return;
+            }
             KeyCode::Char('F') => {
                 self.start_draft(draft::Start::Forward);
                 return;
@@ -474,7 +482,15 @@ impl App {
                     self.finish_composer(state, false);
                 } else if action_key(key, 'd') {
                     let _ = state.composer.remove_body();
+                    // A draft autosave made for this message goes too; a draft that
+                    // existed before keeps its last saved version.
+                    if state.autosave.created
+                        && let Some(path) = &state.composer.original_draft
+                    {
+                        let _ = fs::remove_file(path);
+                    }
                     self.notice = Some("Draft discarded".into());
+                    self.reload();
                 } else if key.code == KeyCode::Esc {
                     self.overlay = Some(Overlay::Compose(state));
                 } else {
@@ -586,6 +602,20 @@ impl App {
                     }
                 }
             },
+            Overlay::LinkWarning { url, .. } => {
+                if action_key(key, 'o') {
+                    let url = url.clone();
+                    self.notice = Some(match opener::open(&url) {
+                        Ok(()) => "Link opened in the default browser.".into(),
+                        Err(error) => format!("Unable to open link: {error}"),
+                    });
+                } else if action_key(key, 'y') {
+                    copy_to_clipboard(url);
+                    self.notice = Some("Link copied to the clipboard.".into());
+                } else if key.code != KeyCode::Esc && !action_key(key, 'n') {
+                    self.overlay = Some(overlay);
+                }
+            }
             Overlay::Unsubscribe { unsubscribe } => {
                 if action_key(key, 'y') || key.code == KeyCode::Enter {
                     let unsubscribe = unsubscribe.clone();
@@ -594,6 +624,46 @@ impl App {
                     self.overlay = Some(overlay);
                 }
             }
+            Overlay::Contacts {
+                selected,
+                filter,
+                items,
+            } => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => {
+                    let chosen = contacts_matching(items, filter)
+                        .get(*selected)
+                        .map(|contact| contact.address());
+                    if let Some(address) = chosen {
+                        self.start_draft(draft::Start::New);
+                        if let Some(Overlay::Compose(state)) = &mut self.overlay {
+                            state.composer.to = address;
+                            state.field = 3;
+                        }
+                    }
+                }
+                KeyCode::Char('x' | 'X') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let email = contacts_matching(items, filter)
+                        .get(*selected)
+                        .map(|contact| contact.email.clone());
+                    if let (Some(email), Some(path)) = (email, self.config.contacts_path()) {
+                        self.notice = Some(match contacts::remove(&path, &email) {
+                            Ok(()) => format!("Removed {email} from contacts"),
+                            Err(error) => format!("Unable to change contacts: {error}"),
+                        });
+                        self.address_book = contacts::load(&path);
+                        items.retain(|contact| contact.email != email);
+                        *selected = selected.saturating_sub(1);
+                    }
+                    self.overlay = Some(overlay);
+                }
+                _ => {
+                    if edit_text(filter, &mut self.cursor_back, key) {
+                        *selected = 0;
+                    }
+                    self.overlay = Some(overlay);
+                }
+            },
             Overlay::Prompt { kind, input } => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Enter => {
@@ -629,13 +699,8 @@ impl App {
                     }
                 }
                 KeyCode::Enter => {
-                    if let Some(link) = items.get(*selected) {
-                        self.notice = match opener::open(link) {
-                            Ok(()) => Some("Link opened in the default browser.".into()),
-                            Err(error) => Some(format!(
-                                "Unable to open link: {error}. Copy it from the message."
-                            )),
-                        };
+                    if let Some(link) = items.get(*selected).cloned() {
+                        self.open_link(&link, "");
                     }
                 }
                 _ => self.overlay = Some(overlay),
@@ -708,6 +773,11 @@ impl App {
             "reload" => self.reload(),
             "sync" => self.start_sync(),
             "upload" => self.upload_held(),
+            "contacts" => self.open_contacts(),
+            "accept" => self.answer_invite(crate::calendar::Answer::Accepted),
+            "tentative" => self.answer_invite(crate::calendar::Answer::Tentative),
+            "decline" => self.answer_invite(crate::calendar::Answer::Declined),
+            "calendar" => self.add_invite_to_calendar(),
             "search server" => self.search_server(),
             "folder new" => {
                 self.overlay = Some(Overlay::Prompt {

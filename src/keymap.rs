@@ -19,6 +19,8 @@ pub const ACTIONS: &[(&str, char, &str)] = &[
     ("toggle_star", 's', "star or unstar"),
     ("undo", 'u', "undo"),
     ("move", 'M', "move to a folder"),
+    ("spam", 'J', "mark as spam, or not spam in Junk"),
+    ("contact", 'K', "add the sender to contacts"),
     ("folders", 'g', "folders"),
     ("accounts", 'p', "accounts"),
     ("search", '/', "search"),

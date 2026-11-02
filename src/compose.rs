@@ -52,13 +52,44 @@ impl App {
             }
             mail
         });
+        // Answer from the address the message was sent to, when it is one of ours.
+        let identities = config.identities();
+        let identity = original
+            .as_ref()
+            .and_then(|mail| {
+                identities.iter().find(|identity| {
+                    let address = mail::email_of(identity);
+                    mail.to
+                        .iter()
+                        .chain(&mail.cc)
+                        .any(|to| mail::email_of(to) == address)
+                })
+            })
+            .cloned()
+            .or_else(|| config.identity());
         match draft::Composer::start(
             start,
             original.as_ref(),
-            config.identity().as_deref(),
+            identity.as_deref(),
             config.signature.as_deref(),
         ) {
-            Ok(composer) => {
+            Ok(mut composer) => {
+                // Reply-all leaves out every address of ours, not just the sender's.
+                let own: Vec<String> = identities
+                    .iter()
+                    .map(|identity| mail::email_of(identity))
+                    .collect();
+                let others = |field: &str| {
+                    field
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty() && !own.contains(&mail::email_of(entry)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                if start == draft::Start::ReplyAll {
+                    composer.cc = others(&composer.cc);
+                }
                 let forward = start == draft::Start::Forward;
                 let state = ComposeState {
                     field: if reply && !forward {
@@ -83,6 +114,7 @@ impl App {
                         }
                         protection
                     },
+                    autosave: Default::default(),
                 };
                 if reply && !forward && self.config.uses_builtin_editor() {
                     self.open_body_editor(state);
@@ -120,6 +152,23 @@ impl App {
     }
 
     pub(crate) fn handle_compose_key(&mut self, mut state: ComposeState, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+            // Sends from the next address of the account.
+            let (_, config) = self.compose_context(state.account);
+            let identities = config.identities();
+            if identities.len() > 1 {
+                let current = identities
+                    .iter()
+                    .position(|identity| *identity == state.composer.from)
+                    .unwrap_or(0);
+                state.composer.from = identities[(current + 1) % identities.len()].clone();
+            } else {
+                state.error =
+                    Some("Add aliases to the account to send from another address.".into());
+            }
+            self.overlay = Some(Overlay::Compose(state));
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
             let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             match state.composer.summary(&base) {
@@ -298,6 +347,88 @@ impl App {
                 self.overlay = Some(Overlay::Compose(*state));
             }
             _ => self.overlay = Some(Overlay::BodyEditor { state, editor }),
+        }
+    }
+
+    /// Saves the open message to Drafts when it changed, at most every 15 seconds.
+    pub(crate) fn autosave_draft(&mut self) {
+        let Some(mut overlay) = self.overlay.take() else {
+            return;
+        };
+        let state = match &mut overlay {
+            Overlay::Compose(state)
+            | Overlay::ComposeClose(state)
+            | Overlay::DraftReady { state, .. } => Some(state),
+            Overlay::BodyEditor { state, editor } => {
+                // The built-in editor keeps its text in memory until it closes.
+                if editor.modified {
+                    let _ = fs::write(&state.composer.body_path, editor.text());
+                }
+                Some(&mut **state)
+            }
+            _ => None,
+        };
+        if let Some(state) = state {
+            self.autosave(state);
+        }
+        self.overlay = Some(overlay);
+    }
+
+    fn autosave(&mut self, state: &mut ComposeState) {
+        if matches!(self.source, MailboxSource::Demo)
+            || state
+                .autosave
+                .last
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(15))
+        {
+            return;
+        }
+        let composer = &state.composer;
+        let body = fs::read(&composer.body_path).unwrap_or_default();
+        let digest = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (
+                &composer.to,
+                &composer.cc,
+                &composer.bcc,
+                &composer.subject,
+                &composer.attachments,
+                &body,
+            )
+                .hash(&mut hasher);
+            hasher.finish()
+        };
+        // Nothing typed yet, or nothing new since the last save.
+        let opened = *state.autosave.opened.get_or_insert(digest);
+        if digest == opened && state.autosave.saved.is_none()
+            || state.autosave.saved == Some(digest)
+        {
+            return;
+        }
+        state.autosave.last = Some(std::time::Instant::now());
+        let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let Ok(contents) = composer.draft_message(&base) else {
+            return;
+        };
+        let (source, _) = self.compose_context(state.account);
+        let saved = match &composer.original_draft {
+            Some(path) if path.exists() => source.update_draft(path, &contents),
+            _ => source
+                .save_draft(&contents)
+                .inspect(|_| state.autosave.created = true),
+        };
+        match saved {
+            Ok(path) => {
+                state.composer.original_draft = Some(path);
+                state.autosave.saved = Some(digest);
+                state.autosave.status = Some(format!(
+                    "Saved to Drafts at {}",
+                    chrono::Local::now().format("%H:%M")
+                ));
+                self.refresh_fingerprint();
+            }
+            Err(error) => state.autosave.status = Some(format!("Not saved to Drafts: {error}")),
         }
     }
 

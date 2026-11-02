@@ -51,6 +51,12 @@ pub struct Mail {
     /// How the message is signed or encrypted.
     #[serde(default)]
     pub security: Option<crate::crypto::Kind>,
+    /// What the receiving server found when it checked the sender.
+    #[serde(default)]
+    pub sender_check: Option<crate::links::SenderCheck>,
+    /// A meeting invitation the message carries.
+    #[serde(default)]
+    pub invite: Option<crate::calendar::Invite>,
 }
 
 /// The `List-Unsubscribe` choices of a message (RFC 2369 and RFC 8058).
@@ -304,6 +310,8 @@ impl Mail {
             partial: false,
             unsubscribe: None,
             security: None,
+            sender_check: None,
+            invite: None,
         }
     }
 

@@ -273,9 +273,11 @@ impl App {
             MailboxSource::Maildir(_) | MailboxSource::Unified(_)
         ) {
             names.extend(
-                ["INBOX", "Drafts", "Sent", "Archive", "Trash", "Outbox"]
-                    .into_iter()
-                    .map(str::to_owned),
+                [
+                    "INBOX", "Drafts", "Sent", "Archive", "Trash", "Junk", "Outbox",
+                ]
+                .into_iter()
+                .map(str::to_owned),
             );
         }
         names.sort();
@@ -343,6 +345,23 @@ impl App {
             items,
             moving: true,
             deleting: false,
+        });
+    }
+
+    /// Moves the conversation to Junk, or back to the Inbox when it is already there.
+    pub(crate) fn toggle_spam(&mut self) {
+        let in_junk = self.active_folder.eq_ignore_ascii_case("Junk");
+        self.reader = None;
+        let (folder, label) = if in_junk {
+            ("INBOX", "Not spam · moved to the Inbox")
+        } else {
+            ("Junk", "Marked as spam")
+        };
+        let targets = self.action_targets(true);
+        self.change_messages(&targets, label, |source, mail| {
+            let change = source.move_to_named(mail, folder)?;
+            mail.mailbox = Some(folder.to_owned());
+            Ok(change)
         });
     }
 
@@ -495,6 +514,213 @@ impl App {
                 }
             });
         }
+    }
+
+    /// Opens a link in the browser, asking first when it looks deceptive.
+    pub(crate) fn open_link(&mut self, url: &str, shown: &str) {
+        let assessment = crate::links::assess(url, shown, settings::reader().clean_links);
+        if assessment.blocked {
+            self.notice = Some(assessment.warnings.join(" "));
+        } else if assessment.warnings.is_empty() {
+            self.notice = Some(match opener::open(&assessment.url) {
+                Ok(()) => "Link opened in the default browser.".into(),
+                Err(error) => format!("Unable to open link: {error}. Copy it from the message."),
+            });
+        } else {
+            self.overlay = Some(Overlay::LinkWarning {
+                url: assessment.url,
+                warnings: assessment.warnings,
+            });
+        }
+    }
+
+    fn invite_mail(&mut self) -> Option<Mail> {
+        let mail = self
+            .active_mail_id()
+            .and_then(|id| self.mails.iter().find(|mail| mail.id == id))
+            .filter(|mail| mail.invite.is_some())
+            .cloned();
+        if mail.is_none() {
+            self.notice = Some("Open a message with a meeting invitation first.".into());
+        }
+        mail
+    }
+
+    /// Prepares the answer to an invitation for the organizer, to review and send.
+    pub(crate) fn answer_invite(&mut self, answer: crate::calendar::Answer) {
+        let Some(mail) = self.invite_mail() else {
+            return;
+        };
+        let invite = mail.invite.clone().unwrap_or_default();
+        if invite.organizer.is_empty() {
+            self.notice = Some("The invitation names no organizer to answer.".into());
+            return;
+        }
+        let account = self.account_index(&mail);
+        let (_, config) = self.compose_context(account);
+        // Answer as the address the invitation was sent to.
+        let identities = config.identities();
+        let me = identities
+            .iter()
+            .find(|identity| {
+                let address = mail::email_of(identity);
+                mail.to
+                    .iter()
+                    .chain(&mail.cc)
+                    .any(|to| mail::email_of(to) == address)
+            })
+            .cloned()
+            .or_else(|| config.identity())
+            .unwrap_or_default();
+        let reply = crate::calendar::reply(
+            &invite,
+            &mail::email_of(&me),
+            config.name.as_deref().unwrap_or_default(),
+            answer,
+        );
+        let path = std::env::temp_dir().join(format!(
+            "{}.ics",
+            crate::storage::unique_name("termail-reply")
+        ));
+        if let Err(error) = crate::storage::write_new(&path, reply.as_bytes()) {
+            self.notice = Some(format!("Unable to prepare the reply: {error}"));
+            return;
+        }
+        self.start_draft(draft::Start::New);
+        if let Some(Overlay::Compose(state)) = &mut self.overlay {
+            state.composer.from = me;
+            state.composer.to = invite.organizer.clone();
+            state.composer.subject = format!("{}: {}", answer.verb(), invite.summary);
+            state.composer.calendar = Some(path);
+            let _ = fs::write(
+                &state.composer.body_path,
+                format!(
+                    "{} the invitation to {} ({}).\n",
+                    answer.verb(),
+                    invite.summary,
+                    invite.when
+                ),
+            );
+            self.notice = Some("Review the answer, then press ctrl+s to send it.".into());
+        }
+    }
+
+    /// Opens the invitation in the system's calendar app.
+    pub(crate) fn add_invite_to_calendar(&mut self) {
+        let Some(mail) = self.invite_mail() else {
+            return;
+        };
+        let Some(path) = mail.source_path.as_ref() else {
+            return;
+        };
+        let ics = fs::read(path).ok().and_then(|contents| {
+            let message = mail_parser::MessageParser::default().parse(&contents)?;
+            message.parts.iter().find_map(|part| {
+                use mail_parser::MimeHeaders;
+                let calendar = part.content_type().is_some_and(|kind| {
+                    kind.c_subtype
+                        .as_deref()
+                        .is_some_and(|subtype| subtype.eq_ignore_ascii_case("calendar"))
+                });
+                let named = part
+                    .attachment_name()
+                    .is_some_and(|name| name.to_ascii_lowercase().ends_with(".ics"));
+                (calendar || named).then(|| part.contents().to_vec())
+            })
+        });
+        let Some(ics) = ics else {
+            self.notice = Some("The invitation could not be read.".into());
+            return;
+        };
+        let name = mail
+            .invite
+            .map(|invite| invite.summary)
+            .unwrap_or_else(|| "invite".into());
+        let file = self
+            .config
+            .download_dir()
+            .join(format!("{}.ics", crate::mailbox::safe_file_name(&name)));
+        let opened = fs::write(&file, ics)
+            .map_err(|error| error.to_string())
+            .and_then(|()| opener::open(&file).map_err(|error| error.to_string()));
+        self.notice = Some(match opened {
+            Ok(()) => format!("Opened {} in your calendar app.", file.display()),
+            Err(error) => format!("Unable to open the invitation: {error}"),
+        });
+    }
+
+    pub(crate) fn open_contacts(&mut self) {
+        let mut items = self.address_book.clone();
+        // Everyone else mail was exchanged with, after the saved contacts.
+        for value in &self.contacts {
+            let email = mail::email_of(value);
+            if !items
+                .iter()
+                .any(|contact| contact.email.eq_ignore_ascii_case(&email))
+            {
+                let name = value
+                    .split('<')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .trim_matches('"')
+                    .to_owned();
+                items.push(contacts::Contact {
+                    name: if name.contains('@') {
+                        String::new()
+                    } else {
+                        name
+                    },
+                    email,
+                });
+            }
+        }
+        if items.is_empty() {
+            self.notice = Some("No contacts yet. Press K on a message to add its sender.".into());
+            return;
+        }
+        self.overlay = Some(Overlay::Contacts {
+            selected: 0,
+            filter: String::new(),
+            items,
+        });
+    }
+
+    /// Saves the open or selected message's sender in the address book.
+    pub(crate) fn add_sender_to_contacts(&mut self) {
+        let Some(mail) = self
+            .active_mail_id()
+            .and_then(|id| self.mails.iter().find(|mail| mail.id == id))
+        else {
+            return;
+        };
+        let email = mail::email_of(&mail.from);
+        let name = mail
+            .from
+            .split('<')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"')
+            .to_owned();
+        let Some(path) = self.config.contacts_path() else {
+            self.notice = Some("Start with --config PATH to keep an address book.".into());
+            return;
+        };
+        let contact = contacts::Contact {
+            name: if name.contains('@') {
+                String::new()
+            } else {
+                name
+            },
+            email: email.clone(),
+        };
+        self.notice = Some(match contacts::add(&path, &contact) {
+            Ok(true) => format!("Added {email} to contacts"),
+            Ok(false) => format!("{email} is already in contacts"),
+            Err(error) => format!("Unable to save the contact: {error}"),
+        });
+        self.address_book = contacts::load(&path);
     }
 
     /// Asks before leaving the mailing list of the open message.

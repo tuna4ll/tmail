@@ -144,6 +144,16 @@ impl App {
                     _ if date.is_empty() => format!("from {last_sender}"),
                     _ => format!("{date} · {last_sender}"),
                 };
+                // A sender the receiving server could not verify is flagged in the list.
+                let forged = conversation.mails(&self.mails).iter().any(|mail| {
+                    mail.sender_check.as_ref().is_some_and(|check| check.failed)
+                        || crate::links::spoofed_name(&mail.from).is_some()
+                });
+                let sender = if forged {
+                    format!("⚠ {sender}")
+                } else {
+                    sender
+                };
                 // Results from every folder say where they live.
                 let sender = match conversation.mails(&self.mails).last() {
                     Some(mail) if self.built_everywhere => {
@@ -428,6 +438,15 @@ impl App {
                 ("esc", "close"),
             ],
             Overlay::Unsubscribe { .. } => &[("y", "unsubscribe"), ("esc", "keep")],
+            Overlay::Contacts { .. } => &[
+                ("type", "filter"),
+                ("enter", "write to"),
+                ("ctrl+x", "remove"),
+                ("esc", "close"),
+            ],
+            Overlay::LinkWarning { .. } => {
+                &[("o", "open anyway"), ("y", "copy"), ("esc", "cancel")]
+            }
             Overlay::Menu { .. } => &[("j/k", "select"), ("enter", "choose"), ("esc", "close")],
             Overlay::Prompt { .. } => &[
                 ("type", "name · / for subfolders"),
@@ -588,7 +607,7 @@ pub(crate) const HELP: &[&str] = &[
     "  m  read/unread     s  star/unstar",
     "  a  archive         d  move to Trash",
     "  d d  in Trash: delete permanently",
-    "  M  move to another folder",
+    "  M  move to another folder     J  spam / not spam",
     "  u  undo            c  compose",
     "  r  reply           A  reply all   F  forward",
     "  l  open links       v  attachments",
@@ -657,6 +676,8 @@ pub(crate) fn draw_overlay(
         Overlay::Help { .. } => (66, 23),
         Overlay::Command(_) | Overlay::Prompt { .. } => (64, 3),
         Overlay::Unsubscribe { .. } => (64, 9),
+        Overlay::Contacts { .. } => (70, 20),
+        Overlay::LinkWarning { warnings, .. } => (72, 8 + 2 * warnings.len() as u16),
         Overlay::DraftReady { summary, .. } => (68, 11 + summary.warnings.len() as u16),
         Overlay::ComposeClose(_) => (58, 7),
         Overlay::Folders { items, .. } => (50, (items.len() as u16 + 2).min(18)),
@@ -806,6 +827,68 @@ pub(crate) fn draw_overlay(
                         .bg(theme::surface()),
                 )
                 .wrap(Wrap { trim: true }),
+                area,
+            );
+        }
+        Overlay::Contacts {
+            selected,
+            filter,
+            items,
+        } => {
+            let matching = contacts_matching(items, filter);
+            let rows: Vec<ListItem> = matching
+                .iter()
+                .map(|contact| {
+                    let name = if contact.name.is_empty() {
+                        "-"
+                    } else {
+                        contact.name.as_str()
+                    };
+                    ListItem::new(format!("{name:<28} {}", contact.email))
+                })
+                .collect();
+            let count = rows.len();
+            let list = List::new(rows)
+                .style(theme::text())
+                .highlight_symbol("▌ ")
+                .highlight_style(theme::selection())
+                .block(
+                    Block::bordered()
+                        .border_style(theme::border(true))
+                        .title_style(theme::title(true))
+                        .title(cursor_line(" contacts · find: ", filter, cursor_back))
+                        .bg(theme::surface()),
+                );
+            let mut state =
+                ListState::default().with_selected(Some((*selected).min(count.saturating_sub(1))));
+            frame.render_stateful_widget(list, area, &mut state);
+            geometry.list = Some((area.y + 1, state.offset(), count));
+        }
+        Overlay::LinkWarning { url, warnings } => {
+            let mut lines: Vec<Line> = warnings
+                .iter()
+                .map(|warning| {
+                    Line::styled(
+                        format!("⚠ {warning}"),
+                        ratatui::style::Style::default().fg(theme::error_color()),
+                    )
+                })
+                .collect();
+            lines.push(Line::default());
+            lines.push(Line::styled(format!("Goes to: {url}"), theme::text()));
+            lines.push(Line::default());
+            lines.push(Line::styled(
+                " o  Open anyway     y  Copy link     esc  Cancel",
+                theme::muted(),
+            ));
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                    Block::bordered()
+                        .border_style(ratatui::style::Style::default().fg(theme::error_color()))
+                        .title_style(theme::title(true))
+                        .title(" check this link ")
+                        .bg(theme::surface()),
+                ),
                 area,
             );
         }
@@ -1048,7 +1131,11 @@ pub(crate) fn draw_compose(
     ])
     .split(inner);
     frame.render_widget(
-        Paragraph::new(format!("From     {}", state.composer.from)).style(theme::muted()),
+        Paragraph::new(format!(
+            "From     {}  · ctrl+o other address",
+            state.composer.from
+        ))
+        .style(theme::muted()),
         rows[0],
     );
     let values = [
@@ -1123,6 +1210,7 @@ pub(crate) fn draw_compose(
     let feedback = state
         .error
         .as_deref()
+        .or(state.autosave.status.as_deref())
         .unwrap_or("Use ; between attachment paths.");
     frame.render_widget(
         Paragraph::new(feedback)

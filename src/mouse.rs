@@ -134,11 +134,8 @@ impl App {
                     MouseEventKind::ScrollDown => reader.scroll_down(lines),
                     MouseEventKind::ScrollUp => reader.scroll_up(lines),
                     MouseEventKind::Down(MouseButton::Left) => match target {
-                        Some(widgets::reader::Target::Link(link)) => {
-                            self.notice = Some(match opener::open(&link) {
-                                Ok(()) => "Link opened in the default browser.".into(),
-                                Err(error) => format!("Unable to open link: {error}"),
-                            });
+                        Some(widgets::reader::Target::Link { url, text }) => {
+                            self.open_link(&url, &text);
                         }
                         Some(widgets::reader::Target::Attachment(index)) => {
                             self.open_attachments();
@@ -543,7 +540,8 @@ impl App {
                 Overlay::Folders { .. }
                 | Overlay::Links { .. }
                 | Overlay::Attachments { .. }
-                | Overlay::Accounts { .. },
+                | Overlay::Accounts { .. }
+                | Overlay::Contacts { .. },
             ) => {
                 if let Some(code) = wheel {
                     self.handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
@@ -571,7 +569,8 @@ impl App {
                         Overlay::Folders { selected, .. }
                         | Overlay::Links { selected, .. }
                         | Overlay::Attachments { selected, .. }
-                        | Overlay::Accounts { selected, .. },
+                        | Overlay::Accounts { selected, .. }
+                        | Overlay::Contacts { selected, .. },
                     ) => std::mem::replace(selected, index),
                     _ => return,
                 };
@@ -637,6 +636,7 @@ impl App {
         );
         add(if mail.starred { "Unstar" } else { "Star" }, 's');
         add("Archive", 'a');
+        add(if folder == "Junk" { "Not spam" } else { "Spam" }, 'J');
         add(
             if folder == "Trash" {
                 "Delete forever"

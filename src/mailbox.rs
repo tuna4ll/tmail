@@ -526,6 +526,30 @@ fn load_maildir(path: &Path) -> Result<LoadReport, LoadError> {
                     .header_raw(crate::imap_client::PARTIAL_HEADER)
                     .is_some(),
                 security: crate::crypto::Kind::detect(&parsed),
+                invite: parsed.parts.iter().find_map(|part| {
+                    let kind = part.content_type()?;
+                    let calendar = kind.c_type.eq_ignore_ascii_case("text")
+                        && kind
+                            .c_subtype
+                            .as_deref()
+                            .is_some_and(|subtype| subtype.eq_ignore_ascii_case("calendar"));
+                    let named = part
+                        .attachment_name()
+                        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".ics"));
+                    (calendar || named)
+                        .then(|| crate::calendar::parse(&String::from_utf8_lossy(part.contents())))
+                        .flatten()
+                }),
+                sender_check: parsed
+                    .header_raw("Authentication-Results")
+                    .and_then(|results| {
+                        let address = parsed
+                            .from()
+                            .and_then(Address::first)
+                            .and_then(|from| from.address())
+                            .unwrap_or_default();
+                        crate::links::sender_check(results, address)
+                    }),
                 unsubscribe: parsed.header_raw("List-Unsubscribe").and_then(|value| {
                     crate::mail::Unsubscribe::parse(
                         &value.replace(['\r', '\n'], ""),
@@ -656,7 +680,7 @@ fn cache_dir() -> Option<PathBuf> {
 fn cache_path(maildir: &Path) -> Option<PathBuf> {
     let mut hasher = DefaultHasher::new();
     maildir.hash(&mut hasher);
-    cache_dir().map(|dir| dir.join(format!("maildir-v6-{:016x}.json", hasher.finish())))
+    cache_dir().map(|dir| dir.join(format!("maildir-v8-{:016x}.json", hasher.finish())))
 }
 
 /// Removes caches nobody has opened for a month.

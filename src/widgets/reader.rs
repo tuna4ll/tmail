@@ -18,7 +18,11 @@ use ratatui_image::{Image, picker::Picker};
 /// Something in the message that reacts to a click.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Target {
-    Link(String),
+    /// A link and the text it shows, which may name another site than it goes to.
+    Link {
+        url: String,
+        text: String,
+    },
     Attachment(usize),
 }
 
@@ -100,7 +104,18 @@ impl Reader {
                 .iter()
                 .find(|link| link.y == index && column >= link.start && column < link.end)
         {
-            return Some(Target::Link(link.url.clone()));
+            // A link wrapped over several rows shows all of its text.
+            let text = laid
+                .links
+                .iter()
+                .filter(|other| other.url == link.url && other.y.abs_diff(link.y) <= 3)
+                .map(|other| other.text.as_str())
+                .collect::<Vec<_>>()
+                .join("");
+            return Some(Target::Link {
+                url: link.url.clone(),
+                text,
+            });
         }
         self.targets
             .iter()
@@ -426,6 +441,64 @@ impl Reader {
                 ]),
             );
         }
+        let spoof = crate::links::spoofed_name(&mail.from);
+        if mail.sender_check.is_some() || spoof.is_some() {
+            let (text, color) = match (&mail.sender_check, &spoof) {
+                (_, Some(warning)) => (format!("⚠ {warning}"), theme::error_color()),
+                (Some(check), None) if check.failed => {
+                    (format!("⚠ {}", check.detail), theme::error_color())
+                }
+                (Some(check), None) if check.verified => (
+                    format!("✓ verified · {}", check.detail),
+                    theme::success_color(),
+                ),
+                (Some(check), None) => (check.detail.clone(), theme::muted_color()),
+                (None, None) => unreachable!(),
+            };
+            let files = lines.len() - mail.attachments.len();
+            lines.insert(
+                files,
+                Line::from(vec![
+                    Span::styled(format!("{:<8}", "sender"), theme::muted()),
+                    Span::styled(text, Style::default().fg(color)),
+                ]),
+            );
+        }
+        if let Some(invite) = &mail.invite {
+            let files = lines.len() - mail.attachments.len();
+            let mut text = format!("{} · {}", invite.summary, invite.when);
+            if !invite.location.is_empty() {
+                text.push_str(&format!(" · {}", invite.location));
+            }
+            let organizer = if invite.organizer_name.is_empty() {
+                &invite.organizer
+            } else {
+                &invite.organizer_name
+            };
+            text.push_str(&format!(" · from {organizer}"));
+            lines.insert(
+                files,
+                header_line(
+                    if invite.cancelled() {
+                        "cancelled"
+                    } else {
+                        "invite"
+                    },
+                    &text,
+                    true,
+                ),
+            );
+            if !invite.cancelled() {
+                lines.insert(
+                    files + 1,
+                    header_line(
+                        "",
+                        ":accept · :tentative · :decline · :calendar to add it",
+                        false,
+                    ),
+                );
+            }
+        }
         if mail.partial {
             let files = lines.len() - mail.attachments.len();
             lines.insert(
@@ -489,7 +562,13 @@ impl Reader {
                     width,
                 ));
                 for row in start..laid.lines.len() {
-                    targets.push((row, Target::Link(link.clone())));
+                    targets.push((
+                        row,
+                        Target::Link {
+                            url: link.clone(),
+                            text: link.clone(),
+                        },
+                    ));
                 }
             }
         }

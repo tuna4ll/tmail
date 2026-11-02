@@ -1,7 +1,9 @@
 mod account_setup;
+mod calendar;
 mod certs;
 mod complete;
 mod config;
+mod contacts;
 mod crypto;
 mod delivery;
 mod discover;
@@ -11,6 +13,7 @@ mod draft;
 mod fake_imap;
 mod imap_client;
 mod keymap;
+mod links;
 mod log;
 mod mail;
 mod mailbox;
@@ -234,6 +237,7 @@ pub struct App {
     /// Accounts whose server rejected the sign-in; they wait for a new password
     /// instead of retrying, which could get the account locked.
     auth_failed: std::collections::HashSet<String>,
+    address_book: Vec<contacts::Contact>,
     script: Option<script::Engine>,
     /// The folder the script last heard about.
     script_folder: String,
@@ -340,6 +344,11 @@ enum Overlay {
         /// The highlighted folder is deleted when x is pressed again.
         deleting: bool,
     },
+    /// Asks before opening a link that looks deceptive.
+    LinkWarning {
+        url: String,
+        warnings: Vec<String>,
+    },
     /// Confirms leaving a mailing list.
     Unsubscribe {
         unsubscribe: mail::Unsubscribe,
@@ -350,6 +359,12 @@ enum Overlay {
         y: u16,
         items: Vec<mouse::MenuItem>,
         selected: usize,
+    },
+    /// The address book, filtered by what was typed.
+    Contacts {
+        selected: usize,
+        filter: String,
+        items: Vec<contacts::Contact>,
     },
     /// Asks for one line of text, such as a folder name.
     Prompt {
@@ -407,6 +422,14 @@ impl Overlay {
                 (selected, items.len())
             }
             Self::Links { selected, items } => (selected, items.len()),
+            Self::Contacts {
+                selected,
+                filter,
+                items,
+            } => {
+                let count = contacts_matching(items, filter).len();
+                (selected, count)
+            }
             Self::Attachments { selected, items } => (selected, items.len()),
             Self::Accounts {
                 selected,
@@ -438,6 +461,21 @@ struct ComposeState {
     suggestion: Option<String>,
     /// Signing and encryption applied when the message is sent.
     protection: crypto::Protection,
+    autosave: Autosave,
+}
+
+/// Keeps an open message in Drafts while it is being written, so a crash or a closed
+/// terminal loses at most a few seconds of it.
+#[derive(Default)]
+struct Autosave {
+    /// What the message looked like when it was last saved, and when it opened.
+    saved: Option<u64>,
+    opened: Option<u64>,
+    last: Option<std::time::Instant>,
+    /// Shown in the composer, such as "Saved to Drafts at 14:02".
+    status: Option<String>,
+    /// The draft file was made by autosave, so discarding the message removes it.
+    created: bool,
 }
 
 impl ComposeState {
@@ -467,6 +505,21 @@ impl ComposeState {
         self.field = self.field.checked_sub(1).unwrap_or(Self::FIELD_COUNT - 1);
         self.error = None;
     }
+}
+
+/// The contacts whose name or address contains the filter.
+fn contacts_matching<'a>(
+    items: &'a [contacts::Contact],
+    filter: &str,
+) -> Vec<&'a contacts::Contact> {
+    let filter = filter.to_lowercase();
+    items
+        .iter()
+        .filter(|contact| {
+            contact.name.to_lowercase().contains(&filter)
+                || contact.email.to_lowercase().contains(&filter)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -598,6 +651,7 @@ impl App {
             screen_height: 0,
             confirm_quit: false,
             auth_failed: Default::default(),
+            address_book: Vec::new(),
             script: None,
             script_folder: String::new(),
             overlay: None,
@@ -605,6 +659,11 @@ impl App {
             active_folder: settings::with(|ui| ui.start_folder.clone()),
             account_label,
         };
+        app.address_book = app
+            .config
+            .contacts_path()
+            .map(|path| contacts::load(&path))
+            .unwrap_or_default();
         app.reload();
         app
     }
@@ -631,6 +690,7 @@ impl App {
                     self.sync_if_due();
                     self.retry_due_deliveries();
                     self.run_script_timers();
+                    self.autosave_draft();
                 },
                 task = self.task_rx.recv() => {
                     if let Some(task) = task {
@@ -1237,6 +1297,7 @@ mod tests {
                 account: None,
                 suggestion: None,
                 protection: crate::crypto::Protection::default(),
+                autosave: Default::default(),
             },
             false,
         );
@@ -1549,6 +1610,7 @@ mod tests {
             account: None,
             suggestion: None,
             protection: crate::crypto::Protection::default(),
+            autosave: Default::default(),
         }));
 
         assert!(screen.contains("From"));

@@ -83,6 +83,7 @@ impl App {
                             account,
                             suggestion: None,
                             protection: crypto::Protection::default(),
+                            autosave: Default::default(),
                         }))
                     }
                     Err(error) => self.notice = Some(format!("Unable to open draft: {error}")),
@@ -233,7 +234,23 @@ impl App {
                     self.mails.iter().map(|mail| mail.id.clone()).collect();
                 self.mails = report.mails;
                 self.folders = report.folders;
-                self.contacts = complete::contacts(&self.mails);
+                // The address book comes first, then everyone mail was exchanged with.
+                let mut contacts: Vec<String> = self
+                    .address_book
+                    .iter()
+                    .map(contacts::Contact::address)
+                    .collect();
+                let known: Vec<String> = self
+                    .address_book
+                    .iter()
+                    .map(|contact| contact.email.to_lowercase())
+                    .collect();
+                contacts.extend(
+                    complete::contacts(&self.mails)
+                        .into_iter()
+                        .filter(|value| !known.contains(&mail::email_of(value))),
+                );
+                self.contacts = contacts;
                 self.skipped = report.skipped.len();
                 let folders = self.folder_items();
                 if !folders

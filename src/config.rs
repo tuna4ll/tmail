@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub name: Option<String>,
     pub email: Option<String>,
+    /// Other addresses this account sends from, such as `"Ada <ada@alias.test>"`.
+    pub aliases: Vec<String>,
     pub signature: Option<String>,
     pub maildir: Option<PathBuf>,
     pub download_dir: Option<PathBuf>,
@@ -21,6 +23,8 @@ pub struct Config {
     pub accounts: Vec<Account>,
     /// Desktop notifications for new mail; on unless set to false.
     pub notifications: Option<bool>,
+    /// The address book; `contacts.vcf` next to the config when unset.
+    pub contacts: Option<PathBuf>,
     pub theme: crate::theme::ThemeConfig,
     /// Custom keys by action name, such as `archive = "e"`.
     pub keys: std::collections::BTreeMap<String, String>,
@@ -42,6 +46,8 @@ pub struct Account {
     pub id: String,
     pub name: Option<String>,
     pub email: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
     pub signature: Option<String>,
     pub maildir: Option<PathBuf>,
     pub download_dir: Option<PathBuf>,
@@ -77,6 +83,7 @@ impl Config {
         let base = path.parent().unwrap_or(Path::new("."));
         resolve_path(&mut config.maildir, base);
         resolve_path(&mut config.download_dir, base);
+        resolve_path(&mut config.contacts, base);
         if let Some(remote) = &mut config.remote {
             resolve_path(&mut remote.tls_certificate, base);
         }
@@ -146,6 +153,7 @@ impl Config {
                 .unwrap_or_else(|| "local".into()),
             name: self.name.clone(),
             email: self.email.clone(),
+            aliases: self.aliases.clone(),
             signature: self.signature.clone(),
             maildir: self.maildir.clone(),
             download_dir: self.download_dir.clone(),
@@ -370,6 +378,32 @@ impl Config {
         result
     }
 
+    /// Every address the account sends from: its own first, then the aliases. Aliases
+    /// without a name take the account's name.
+    pub fn identities(&self) -> Vec<String> {
+        let mut identities: Vec<String> = self.identity().into_iter().collect();
+        for alias in &self.aliases {
+            let alias = alias.trim();
+            if alias.is_empty() {
+                continue;
+            }
+            identities.push(match (&self.name, alias.contains('<')) {
+                (Some(name), false) => crate::message::display_address(name, alias),
+                _ => alias.to_owned(),
+            });
+        }
+        identities
+    }
+
+    pub fn contacts_path(&self) -> Option<PathBuf> {
+        self.contacts.clone().or_else(|| {
+            self.path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .map(|parent| parent.join("contacts.vcf"))
+        })
+    }
+
     pub fn identity(&self) -> Option<String> {
         match (&self.name, &self.email) {
             (Some(name), Some(email)) => Some(crate::message::display_address(name, email)),
@@ -418,6 +452,7 @@ impl Config {
         self.active_account = Some(account.id.clone());
         self.name = account.name;
         self.email = account.email;
+        self.aliases = account.aliases;
         self.signature = account.signature;
         self.maildir = account.maildir;
         self.download_dir = account.download_dir;

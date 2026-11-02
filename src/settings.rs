@@ -154,6 +154,8 @@ pub struct ReaderConfig {
     pub popup_height: u16,
     /// Loads remote images without asking.
     pub remote_images: bool,
+    /// Removes tracking parameters such as `utm_source` from links before opening them.
+    pub clean_links: bool,
     /// Loads remote images from these senders: whole addresses or `@domain`.
     pub remote_images_from: Vec<String>,
 }
@@ -167,6 +169,7 @@ impl Default for ReaderConfig {
             popup_height: 90,
             remote_images: false,
             remote_images_from: Vec::new(),
+            clean_links: true,
         }
     }
 }

@@ -56,6 +56,8 @@ pub struct LinkArea {
     pub start: u16,
     pub end: u16,
     pub url: String,
+    /// The link's visible text on this row.
+    pub text: String,
 }
 
 /// The widest a page is laid out when it does not fit the window; wider pages are
@@ -435,6 +437,29 @@ impl Canvas {
         };
         for (y, row) in self.rows.into_iter().enumerate() {
             let row = whole_characters(row);
+            let row_text: Vec<(u16, String)> = {
+                let mut column = 0u16;
+                row.iter()
+                    .map(|cell| {
+                        let at = column;
+                        column += cell.width() as u16;
+                        let mut text = String::new();
+                        if cell.width() > 0 {
+                            text.push(cell.ch);
+                        }
+                        (at, text)
+                    })
+                    .collect()
+            };
+            let slice = |start: u16, end: u16| -> String {
+                row_text
+                    .iter()
+                    .filter(|(at, _)| *at >= start && *at < end)
+                    .map(|(_, text)| text.as_str())
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+            };
             let mut spans: Vec<Span<'static>> = Vec::new();
             let mut column = 0u16;
             let mut open: Option<(usize, u16)> = None;
@@ -450,6 +475,7 @@ impl Canvas {
                             start,
                             end: column,
                             url: self.links[index].clone(),
+                            text: slice(start, column),
                         });
                         open = cell.link.map(|index| (index, column));
                     }
@@ -478,6 +504,7 @@ impl Canvas {
                     start,
                     end: column,
                     url: self.links[index].clone(),
+                    text: slice(start, column),
                 });
             }
             page.lines.push(Line::from(spans));

@@ -72,6 +72,8 @@ pub struct Composer {
     reply_to: Option<String>,
     references: Vec<String>,
     message_id: String,
+    /// An iCalendar reply to send as its own part, for answering an invitation.
+    pub calendar: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -182,6 +184,7 @@ impl Composer {
             reply_to: replying.map(|mail| mail.id.clone()),
             references,
             message_id: format!("{name}@{domain}"),
+            calendar: None,
         };
         if start == Start::Forward
             && let Some(path) = original.and_then(|mail| mail.source_path.as_ref())
@@ -356,6 +359,9 @@ impl Composer {
                     .collect::<Vec<_>>()
                     .join(" ")
             ));
+        }
+        if let Some(path) = &self.calendar {
+            headers.push(format!("Calendar: {}", one_line(&path.to_string_lossy())));
         }
         headers.push(format!("Message-ID: <{}>", self.message_id));
         headers.push("MIME-Version: 1.0".into());
@@ -609,6 +615,18 @@ fn prepare_message(
         MessageFormat::Plain => builder.text_body(body),
         MessageFormat::Html => builder.html_body(body),
     };
+    // An invitation reply travels as text/calendar with its method, which calendar
+    // servers read to update the organizer's copy.
+    for path in header_values(headers, "calendar") {
+        let path = resolve_path(path.trim(), base);
+        let bytes = fs::read(&path)
+            .map_err(|error| DraftError(format!("Unable to read the calendar reply: {error}")))?;
+        builder = builder.attachment(
+            "text/calendar; method=REPLY; charset=utf-8",
+            "reply.ics",
+            bytes,
+        );
+    }
     for path in summary.attachments {
         let bytes = fs::read(&path).map_err(|error| {
             DraftError(format!(
