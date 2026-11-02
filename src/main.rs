@@ -791,6 +791,113 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn rejected_passwords_open_sign_in_and_stop_retrying() {
+        let mailbox = TestMailbox::new();
+        let remote = crate::remote::RemoteConfig {
+            imap_host: "imap.example.test".into(),
+            smtp_host: "smtp.example.test".into(),
+            username: "me@example.test".into(),
+            session_password: Some(std::sync::Arc::new(crate::remote::SessionPassword(
+                zeroize::Zeroizing::new("wrong".into()),
+            ))),
+            ..Default::default()
+        };
+        let config = crate::config::Config {
+            email: Some("me@example.test".into()),
+            maildir: Some(mailbox.0.clone()),
+            remote: Some(remote),
+            ..Default::default()
+        };
+        let mut app = super::App::new(MailboxSource::Maildir(mailbox.0.clone()), config);
+        finish_load(&mut app).await;
+        let id = app.config.current_account().id;
+        app.finish_sync(
+            id.clone(),
+            Err(crate::remote::RemoteError::auth(
+                "The server said: Invalid credentials.",
+            )),
+        );
+        assert!(app.auth_failed.contains(&id));
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::AccountSetup(form)) if form.mode == crate::account_setup::Mode::Login
+                && form.error.as_deref().is_some_and(|error| error.contains("Invalid credentials"))
+        ));
+        app.overlay = None;
+        app.last_sync.clear();
+        app.sync_if_due();
+        assert!(
+            app.syncing.is_empty(),
+            "no retry with the rejected password"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reader_window_moves_and_resizes_with_the_mouse() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mailbox = TestMailbox::new();
+        std::fs::write(
+            mailbox.0.join("new/1"),
+            "From: a@example.test\r\nSubject: hello\r\nMessage-ID: <1@x>\r\n\r\nbody\r\n",
+        )
+        .unwrap();
+        let mut app = mailbox.app();
+        finish_load(&mut app).await;
+        let mut terminal = Terminal::new(TestBackend::new(140, 44)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let id = app.mails[0].id.clone();
+        app.open_mail(&id);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let area = app.reader.as_ref().unwrap().frame_area();
+        let mouse = |kind, column, row| {
+            crossterm::event::Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x + 10,
+            area.y,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            area.x + 4,
+            area.y + 2,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            area.x + 4,
+            area.y + 2,
+        ));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let moved = app.reader.as_ref().unwrap().frame_area();
+        assert_eq!((moved.x, moved.y), (area.x - 6, area.y + 2));
+        let corner = (moved.right() - 1, moved.bottom() - 1);
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            corner.0,
+            corner.1,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            moved.x + 60,
+            moved.y + 20,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            moved.x + 60,
+            moved.y + 20,
+        ));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let sized = app.reader.as_ref().unwrap().frame_area();
+        assert_eq!((sized.width, sized.height), (61, 21));
+    }
+
     use std::{ffi::OsString, path::PathBuf};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

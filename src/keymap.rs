@@ -123,3 +123,37 @@ pub fn parse_key(value: &str) -> Option<(KeyCode, KeyModifiers)> {
     };
     Some((code, modifiers))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_keys_and_translates_custom_bindings() {
+        assert_eq!(
+            parse_key("ctrl+E"),
+            Some((KeyCode::Char('e'), KeyModifiers::CONTROL))
+        );
+        assert_eq!(
+            parse_key("E"),
+            Some((KeyCode::Char('E'), KeyModifiers::NONE))
+        );
+        assert_eq!(parse_key("f5"), Some((KeyCode::F(5), KeyModifiers::NONE)));
+        assert_eq!(parse_key("f13"), None);
+        let keys = BTreeMap::from([("archive".to_owned(), "e".to_owned())]);
+        let keymap = Keymap::from_config(&keys).unwrap();
+        let pressed = keymap.translate(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert_eq!(pressed.code, KeyCode::Char('a'));
+        let unknown = BTreeMap::from([("fly".to_owned(), "e".to_owned())]);
+        assert!(
+            Keymap::from_config(&unknown)
+                .unwrap_err()
+                .contains("Unknown action")
+        );
+        let twice = BTreeMap::from([
+            ("archive".to_owned(), "e".to_owned()),
+            ("trash".to_owned(), "e".to_owned()),
+        ]);
+        assert!(Keymap::from_config(&twice).is_err());
+    }
+}

@@ -364,3 +364,32 @@ impl Editor {
         frame.set_cursor_position(Position::new(x.min(inner.right().saturating_sub(1)), y));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(editor: &mut Editor, code: KeyCode, modifiers: KeyModifiers) {
+        editor.handle_key(KeyEvent::new(code, modifiers));
+    }
+
+    #[test]
+    fn edits_lines_like_a_text_editor() {
+        let mut editor = Editor::new("one\ntwo");
+        press(&mut editor, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut editor, KeyCode::End, KeyModifiers::NONE);
+        press(&mut editor, KeyCode::Enter, KeyModifiers::NONE);
+        editor.insert("three\r\nfour");
+        press(&mut editor, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut editor, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut editor, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(editor.text(), "one\ntwothree\nfour");
+        press(&mut editor, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(editor.text(), "one\nfour");
+        assert!(editor.modified);
+        assert!(matches!(
+            editor.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Outcome::Done
+        ));
+    }
+}

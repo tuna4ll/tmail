@@ -2134,6 +2134,139 @@ fn watch_session(
 
 #[cfg(test)]
 mod tests {
+
+    /// Runs against a real IMAP and SMTP server, such as the GreenMail container the
+    /// CI starts. Skipped unless asked for: `cargo test -- --ignored real_server`.
+    /// Settings come from TERMAIL_IT_HOST, _IMAP_PORT, _SMTP_PORT, _USER, _PASSWORD
+    /// and _CA (a PEM file to trust).
+    #[test]
+    #[ignore]
+    fn real_server_round_trip() {
+        let variable = |name: &str, fallback: &str| {
+            std::env::var(format!("TERMAIL_IT_{name}")).unwrap_or_else(|_| fallback.to_owned())
+        };
+        let user = variable("USER", "ada@localhost");
+        let remote = RemoteConfig {
+            imap_host: variable("HOST", "localhost"),
+            imap_port: variable("IMAP_PORT", "3993").parse().unwrap(),
+            smtp_host: variable("HOST", "localhost"),
+            smtp_port: variable("SMTP_PORT", "3465").parse().unwrap(),
+            username: user.clone(),
+            tls_certificate: std::env::var_os("TERMAIL_IT_CA").map(PathBuf::from),
+            sync_interval_secs: 0,
+            session_password: Some(std::sync::Arc::new(crate::remote::SessionPassword(
+                zeroize::Zeroizing::new(variable("PASSWORD", "secret")),
+            ))),
+            ..Default::default()
+        };
+        let root = std::env::temp_dir().join(storage::unique_name("real-server"));
+        let subject = storage::unique_name("termail-it");
+        let message = format!(
+            "From: {user}\r\nTo: {user}\r\nSubject: {subject}\r\nMessage-ID: <{subject}@termail.test>\r\nDate: Mon, 2 Mar 2026 10:00:00 +0000\r\n\r\nhello from the integration test\r\n"
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(crate::sender::send_smtp(
+                remote.clone(),
+                message.clone().into_bytes(),
+            ))
+            .unwrap();
+        // Delivery is asynchronous on most servers.
+        let arrived = (0..20).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            sync(&remote, &root).unwrap();
+            scan_local(&root)
+                .values()
+                .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains(&subject)))
+        });
+        assert!(arrived, "the sent message never reached the Inbox");
+        let path = scan_local(&root)
+            .into_values()
+            .find(|path| fs::read_to_string(path).is_ok_and(|text| text.contains(&subject)))
+            .unwrap();
+        // Mark it read and file it in a new folder; both must reach the server.
+        let read = set_local_flags(&path, "S").unwrap();
+        sync(&remote, &root).unwrap();
+        change_folder(&remote, &root, &FolderChange::Create("Termail Test".into())).unwrap();
+        let folder = root.join(local_name("Termail Test"));
+        storage::rename(&read, &folder.join("cur").join(read.file_name().unwrap())).unwrap();
+        sync(&remote, &root).unwrap();
+        let mut session = connect(&remote).unwrap();
+        let (folders, _) = discover_layout(&mut session, &remote, false).unwrap();
+        let target = folders
+            .iter()
+            .find(|candidate| candidate.local == local_name("Termail Test"))
+            .unwrap();
+        session.examine(&target.remote).unwrap();
+        let found = session
+            .uid_search(format!("SUBJECT \"{subject}\" SEEN"))
+            .unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "the read message is in the new folder on the server"
+        );
+        let _ = session.logout();
+        // The Sent copy is saved once, and IDLE notices new mail.
+        copy_sent(&remote, message.as_bytes(), true)
+            .map_err(|error| error.message)
+            .unwrap();
+        copy_sent(&remote, message.as_bytes(), true)
+            .map_err(|error| error.message)
+            .unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let watcher = {
+            let remote = remote.clone();
+            std::thread::spawn(move || {
+                wait_for_change(&remote, "INBOX", std::time::Duration::from_secs(30), &stop)
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        runtime
+            .block_on(crate::sender::send_smtp(
+                remote.clone(),
+                message.replace(&subject, "idle").into_bytes(),
+            ))
+            .unwrap();
+        assert!(
+            watcher.join().unwrap().unwrap(),
+            "IDLE reported the new message"
+        );
+        change_folder(
+            &remote,
+            &root,
+            &FolderChange::Delete(local_name("Termail Test")),
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_trusted_self_signed_certificate_lets_the_connection_through() {
+        let server = Server::new();
+        let mut remote = server.remote();
+        let port = server.port;
+        fake_imap::serve(server, standard());
+        remote.session_password = Some(std::sync::Arc::new(crate::remote::SessionPassword(
+            zeroize::Zeroizing::new("pw".into()),
+        )));
+        let error = connect(&remote).err().unwrap();
+        assert_eq!(
+            error.kind,
+            crate::remote::ErrorKind::Certificate,
+            "{}",
+            error.message
+        );
+        // "localhost" may resolve to IPv6 first while the server listens on IPv4.
+        let presented =
+            crate::certs::fetch("localhost", port, crate::certs::Protocol::Imap, false).unwrap();
+        let file = std::env::temp_dir().join(storage::unique_name("trusted-cert"));
+        fs::write(&file, &presented.pem).unwrap();
+        remote.tls_certificate = Some(file.clone());
+        connect(&remote).unwrap().logout().unwrap();
+        let _ = fs::remove_file(file);
+    }
+
     use super::*;
     use crate::fake_imap::{self, State, mail};
     use crate::remote::tests::Server;

@@ -91,3 +91,36 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: cargo test --locked
         run: cargo test --locked --all-features --all-targets
+  real-server:
+    # Sync, sending, folders, the Sent copy and IDLE against a real IMAP and SMTP
+    # server, with a certificate made for localhost.
+    name: real server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Start GreenMail with a localhost certificate
+        run: |
+          mkdir -p certs
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            -keyout certs/key.pem -out certs/cert.pem
+          openssl pkcs12 -export -inkey certs/key.pem -in certs/cert.pem \
+            -name greenmail -out certs/greenmail.p12 -passout pass:changeit
+          chmod 644 certs/*
+          docker run -d --name greenmail -p 3993:3993 -p 3465:3465 -v "$PWD/certs:/certs" \
+            -e GREENMAIL_OPTS="-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=ada:secret@localhost -Dgreenmail.users.login=email -Dgreenmail.tls.keystore.file=/certs/greenmail.p12 -Dgreenmail.tls.keystore.password=changeit" \
+            greenmail/standalone:2.1.2
+          for i in $(seq 1 30); do nc -z localhost 3993 && nc -z localhost 3465 && break; sleep 2; done
+      - name: Run the round trip
+        env:
+          TERMAIL_IT_CA: certs/cert.pem
+          TERMAIL_IT_USER: ada@localhost
+          TERMAIL_IT_PASSWORD: secret
+        run: cargo test --locked -- --ignored real_server
+      - name: Server log on failure
+        if: failure()
+        run: docker logs greenmail

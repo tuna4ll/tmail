@@ -305,3 +305,31 @@ pub fn value(name: &str) -> Result<serde_json::Value, String> {
         .cloned()
         .ok_or_else(|| format!("There is no {table} setting called {field}."))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checks_values_and_reader_trust() {
+        let mut ui = UiConfig::default();
+        assert!(ui.validate().is_ok());
+        ui.time_format = "%Q".into();
+        assert!(ui.validate().is_err());
+        let reader = ReaderConfig {
+            remote_images_from: vec!["@github.com".into(), "Friend@Example.com".into()],
+            ..ReaderConfig::default()
+        };
+        assert!(reader.trusts("noreply@github.com"));
+        assert!(reader.trusts("friend@example.com"));
+        assert!(!reader.trusts("github.com@evil.test"));
+        assert!(
+            ReaderConfig {
+                layout: "floating".into(),
+                ..ReaderConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}

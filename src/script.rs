@@ -809,3 +809,94 @@ fn describe(error: &mlua::Error) -> String {
     };
     text.lines().next().unwrap_or_default().to_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine(source: &str) -> (Engine, Option<String>) {
+        let path = std::env::temp_dir().join(format!(
+            "{}.lua",
+            crate::storage::unique_name("termail-script")
+        ));
+        std::fs::write(&path, source).unwrap();
+        let loaded = Engine::load(&path);
+        let _ = std::fs::remove_file(&path);
+        loaded
+    }
+
+    #[test]
+    fn binds_keys_runs_commands_and_reports_errors_with_lines() {
+        let (engine, error) = engine(
+            r#"
+            termail.map("e", "archive")
+            termail.map("ctrl+t", function() termail.notice("pressed") end, { mode = "reader" })
+            termail.command("hello", function(name) termail.notice("hi " .. name) end)
+            "#,
+        );
+        assert!(error.is_none(), "{error:?}");
+        let key = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert_eq!(
+            engine.binding(key, "inbox"),
+            Some(Ok(Some("archive".into())))
+        );
+        let control = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(
+            engine.binding(control, "inbox").is_none(),
+            "reader keys stay in the reader"
+        );
+        assert_eq!(engine.binding(control, "reader"), Some(Ok(None)));
+        assert!(
+            matches!(engine.take_effects().as_slice(), [Effect::Notice(text)] if text == "pressed")
+        );
+        assert_eq!(engine.command("hello", "Ada"), Some(Ok(())));
+        assert!(
+            matches!(engine.take_effects().as_slice(), [Effect::Notice(text)] if text == "hi Ada")
+        );
+        assert!(engine.command("missing", "").is_none());
+        let (_, error) = self::engine("termail.map('e', 'archive')\nthis is not lua\n");
+        assert!(error.unwrap().contains(":2:"), "errors name the line");
+    }
+
+    #[test]
+    fn stops_runaway_scripts() {
+        let (engine, _) = engine(r#"termail.command("spin", function() while true do end end)"#);
+        let started = Instant::now();
+        let result = engine.command("spin", "").unwrap();
+        assert!(result.unwrap_err().contains("too long"));
+        assert!(started.elapsed() < TIME_LIMIT * 2);
+    }
+
+    #[test]
+    fn before_send_can_change_or_stop_a_message() {
+        let (engine, _) = engine(
+            r#"termail.on("before_send", function(m)
+                if m.subject == "" then return false, "Add a subject." end
+                m.body = m.body .. "\n-- sent with lua"
+            end)"#,
+        );
+        let mut draft = Draft {
+            from: "a@x".into(),
+            to: "b@x".into(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: String::new(),
+            body: "hello".into(),
+        };
+        assert_eq!(
+            engine.before_send(&mut draft).unwrap_err(),
+            "Add a subject."
+        );
+        draft.subject = "hi".into();
+        engine.before_send(&mut draft).unwrap();
+        assert!(draft.body.ends_with("-- sent with lua"));
+    }
+
+    #[test]
+    fn settings_are_checked() {
+        let (_, error) = engine(r#"termail.set("sort", "sideways")"#);
+        assert!(error.unwrap().contains("ui.sort"));
+        let (_, error) = engine(r#"termail.on("no_such_event", function() end)"#);
+        assert!(error.unwrap().contains("unknown event"));
+    }
+}

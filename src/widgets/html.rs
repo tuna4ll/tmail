@@ -434,6 +434,7 @@ impl Canvas {
             ..Page::default()
         };
         for (y, row) in self.rows.into_iter().enumerate() {
+            let row = whole_characters(row);
             let mut spans: Vec<Span<'static>> = Vec::new();
             let mut column = 0u16;
             let mut open: Option<(usize, u16)> = None;
@@ -483,6 +484,37 @@ impl Canvas {
         }
         page
     }
+}
+
+/// Repairs wide characters that something else drew over: a half without its other
+/// half becomes a space, so every row keeps its width.
+fn whole_characters(row: Vec<Cell>) -> Vec<Cell> {
+    let blank = |cell: &Cell| Cell {
+        ch: ' ',
+        extra: None,
+        style: cell.style,
+        link: cell.link,
+    };
+    let mut fixed = Vec::with_capacity(row.len());
+    let mut index = 0;
+    while index < row.len() {
+        let cell = &row[index];
+        let whole_wide =
+            cell.width() == 2 && row.get(index + 1).is_some_and(|next| next.ch == '\0');
+        if whole_wide {
+            fixed.push(cell.clone());
+            fixed.push(row[index + 1].clone());
+            index += 2;
+            continue;
+        }
+        fixed.push(if cell.width() == 1 {
+            cell.clone()
+        } else {
+            blank(cell)
+        });
+        index += 1;
+    }
+    fixed
 }
 
 // ----------------------------------------------------------------------------
@@ -769,7 +801,17 @@ impl<'a, 'b> Engine<'a, 'b> {
                     if child_style.display == Display::None || child_style.hidden {
                         continue;
                     }
-                    if child_style.is_block_level() || depth >= MAX_DEPTH {
+                    if depth >= MAX_DEPTH {
+                        // Too deep to lay out: show the rest as plain text, read without
+                        // recursion so hostile mail cannot overflow the stack.
+                        let text: String = child_element
+                            .descendants()
+                            .filter_map(|node| {
+                                node.value().as_text().map(|text| format!("{} ", &**text))
+                            })
+                            .collect();
+                        self.text_pieces(&text, style, &mut inline);
+                    } else if child_style.is_block_level() {
                         self.flush_inline(&mut inline, style, width, canvas);
                         self.block(child_element, &child_style, width, canvas, depth + 1);
                     } else {
@@ -2367,4 +2409,208 @@ pub fn contrast(a: Rgb, b: Rgb) -> f64 {
 /// Coloured enough to keep in the themed mode: not a white, black or grey page.
 fn colourful((r, g, b): Rgb) -> bool {
     r.max(g).max(b) - r.min(g).min(b) >= 32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(html: &str, width: u16, original: bool) -> Page {
+        let options = Options {
+            original,
+            surface: (48, 48, 48),
+            text: (208, 208, 208),
+            link: (95, 215, 255),
+        };
+        let mut size = |slot: usize, room: u16| -> Result<(u16, u16), Option<String>> {
+            if slot == 0 {
+                Ok((room.min(20), 4))
+            } else {
+                Err(Some("[picture]".into()))
+            }
+        };
+        render_document(&Document::parse(html), width, options, &mut size)
+    }
+
+    fn text(page: &Page) -> Vec<String> {
+        page.lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    const CARD: &str = r##"<html><head><style>
+        .card { background:#ffffff; border:1px solid #d8dde4 }
+        .btn { background:#2f6fed; color:#fff; padding:12px 24px }
+        @media (max-width:600px) { .card { width:100% } }
+        </style></head><body bgcolor="#eef1f5">
+        <div style="display:none;max-height:0">secret preview text</div>
+        <table width="100%"><tr><td align="center">
+          <table class="card" width="600"><tr><td style="padding:16px">
+            <p>Hello Ada</p>
+            <table border="1"><tr><th>Name</th><th>Value</th></tr><tr><td>a</td><td>b</td></tr></table>
+            <p style="text-align:center"><a class="btn" href="https://x.test/go">Open</a></p>
+          </td></tr></table>
+        </td></tr></table></body></html>"##;
+
+    #[test]
+    fn draws_mail_layouts_like_a_browser() {
+        let page = page(CARD, 100, true);
+        let lines = text(&page);
+        let all = lines.join("\n");
+        assert!(
+            !all.contains("secret preview"),
+            "hidden preheaders stay hidden"
+        );
+        // The 600px card is 75 columns, centred, with its border.
+        let top = lines.iter().find(|line| line.contains('┌')).unwrap();
+        assert_eq!(top.find('┌').unwrap(), (100 - 75) / 2);
+        // Text inside the centred cell starts at the left again, as in mail clients.
+        let hello = lines.iter().find(|line| line.contains("Hello")).unwrap();
+        assert!(hello.find("Hello").unwrap() < 20, "{hello:?}");
+        // A table with border="1" gets lines between cells.
+        assert!(all.contains('┼'));
+        // The button is a box with its own background, and clickable.
+        let button = page
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains("Open"))
+            .unwrap();
+        assert_eq!(button.style.bg, Some(Color::Rgb(47, 111, 237)));
+        assert!(
+            page.links
+                .iter()
+                .any(|link| link.url == "https://x.test/go")
+        );
+        // The page background fills every row.
+        assert!(
+            page.lines
+                .iter()
+                .all(|line| line.spans.iter().any(|span| span.style.bg.is_some()))
+        );
+    }
+
+    #[test]
+    fn theme_colours_drop_page_backgrounds_and_keep_buttons() {
+        let page = page(CARD, 100, false);
+        let backgrounds: Vec<Color> = page
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter_map(|span| span.style.bg)
+            .collect();
+        assert!(!backgrounds.contains(&Color::Rgb(255, 255, 255)));
+        assert!(backgrounds.contains(&Color::Rgb(47, 111, 237)));
+    }
+
+    #[test]
+    fn fixed_width_pages_keep_their_width() {
+        let page = page(CARD, 40, true);
+        assert!(page.width >= 75, "{}", page.width);
+        // A long word never forces the page wider than the window.
+        let page = super::tests::page(&format!("<p>{}</p>", "x".repeat(400)), 40, true);
+        assert_eq!(page.width, 40);
+    }
+
+    #[test]
+    fn colours_parse_like_css() {
+        assert_eq!(parse_color("#abc"), Some((170, 187, 204)));
+        assert_eq!(parse_color("rgb(10, 20, 30)"), Some((10, 20, 30)));
+        assert_eq!(parse_color("rgba(0,0,0,0)"), None);
+        assert_eq!(parse_color("LightBlue"), Some((173, 216, 230)));
+        assert_eq!(parse_color("#12345"), None);
+    }
+
+    /// Random mixes of tags, attributes and text must never panic, and every row must
+    /// be exactly as wide as the page. A seeded generator keeps failures repeatable.
+    #[test]
+    fn survives_random_html() {
+        const PARTS: &[&str] = &[
+            "<table>",
+            "</table>",
+            "<tr>",
+            "</tr>",
+            "<td colspan=3>",
+            "<td width=900>",
+            "</td>",
+            "<div style='padding:40px;border:2px solid red;width:50%'>",
+            "</div>",
+            "<p>",
+            "</p>",
+            "<ul><li>",
+            "</li></ul>",
+            "<ol><li>",
+            "<a href='https://x.test'>",
+            "</a>",
+            "<br>",
+            "<pre>\tcode  here\n</pre>",
+            "<center>",
+            "</center>",
+            "<b>",
+            "</b>",
+            "<hr>",
+            "<span style='background:#f00;padding:9px'>",
+            "</span>",
+            "<table border=1 cellpadding=30>",
+            "word ",
+            "averyveryveryveryverylongwordthatneverbreaks ",
+            "漢字テキスト ",
+            "🎉 ",
+            "\u{E000}0\u{E001}",
+            "\u{E000}7\u{E001}",
+            "<td valign=top>",
+            "<blockquote>",
+            "</blockquote>",
+            "&nbsp;",
+            "<style>p{x:y}}</style>",
+            "<th align=right>",
+            "<font color=#123>",
+            "</font>",
+            "<img src=x>",
+        ];
+        let mut seed: u64 = 0x5eed;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..300 {
+            let length = 5 + (next() % 60) as usize;
+            let html: String = (0..length)
+                .map(|_| PARTS[(next() % PARTS.len() as u64) as usize])
+                .collect();
+            let width = 8 + (next() % 130) as u16;
+            for original in [true, false] {
+                let page = page(&html, width, original);
+                for line in &page.lines {
+                    let columns: usize = line.spans.iter().map(|span| span.content.width()).sum();
+                    assert_eq!(
+                        columns,
+                        usize::from(page.width),
+                        "width {width} html {html:?}"
+                    );
+                }
+                for link in &page.links {
+                    assert!(link.start < link.end && link.end <= page.width);
+                }
+                for image in &page.images {
+                    assert!(image.x + image.width <= page.width);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deep_nesting_does_not_overflow_the_stack() {
+        let html = "<div><table><tr><td>".repeat(400) + "deep";
+        let page = page(&html, 60, true);
+        assert!(!page.lines.is_empty());
+    }
 }

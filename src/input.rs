@@ -906,3 +906,52 @@ pub(crate) fn action_key(key: KeyEvent, expected: char) -> bool {
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(value: &mut String, back: &mut usize, code: KeyCode, modifiers: KeyModifiers) {
+        edit_text(value, back, KeyEvent::new(code, modifiers));
+    }
+
+    #[test]
+    fn edits_at_the_cursor() {
+        let mut value = String::from("hello wörld");
+        let mut back = 0;
+        press(&mut value, &mut back, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut value, &mut back, KeyCode::Left, KeyModifiers::NONE);
+        press(
+            &mut value,
+            &mut back,
+            KeyCode::Char('X'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(value, "hello wörXld");
+        press(&mut value, &mut back, KeyCode::Delete, KeyModifiers::NONE);
+        assert_eq!(value, "hello wörXd");
+        press(
+            &mut value,
+            &mut back,
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+        );
+        assert_eq!(value, "hello d");
+        press(&mut value, &mut back, KeyCode::Home, KeyModifiers::NONE);
+        press(
+            &mut value,
+            &mut back,
+            KeyCode::Char('>'),
+            KeyModifiers::NONE,
+        );
+        press(
+            &mut value,
+            &mut back,
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        );
+        assert_eq!((value.as_str(), back), (">", 0));
+        insert_text(&mut value, 1, "ab\ncd");
+        assert_eq!(value, "abcd>");
+    }
+}

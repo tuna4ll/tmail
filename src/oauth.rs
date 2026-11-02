@@ -272,3 +272,50 @@ fn random_token(length: usize) -> String {
     }
     base64_url(&bytes)[..length].to_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_takes_only_the_matching_answer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let browser = std::thread::spawn(move || {
+            for request in [
+                "GET /favicon.ico HTTP/1.1\r\n\r\n",
+                "GET /?state=wrong&code=x HTTP/1.1\r\n\r\n",
+                "GET /?state=S&code=a%2Fb+c HTTP/1.1\r\n\r\n",
+            ] {
+                std::thread::sleep(Duration::from_millis(50));
+                let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+                stream.write_all(request.as_bytes()).unwrap();
+                let mut reply = String::new();
+                let _ = stream.read_to_string(&mut reply);
+            }
+        });
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(wait_for_code(&listener, "S", &cancel).unwrap(), "a/b c");
+        browser.join().unwrap();
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            wait_for_code(&listener, "S", &cancel)
+                .unwrap_err()
+                .contains("cancelled")
+        );
+    }
+
+    #[test]
+    fn pkce_values_are_url_safe() {
+        let token = random_token(64);
+        assert_eq!(token.len(), 64);
+        assert!(
+            token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
+        assert_ne!(token, random_token(64));
+        assert_eq!(encode("a b/ç"), "a%20b%2F%C3%A7");
+        assert_eq!(decode("a%2Fb+c"), "a/b c");
+    }
+}

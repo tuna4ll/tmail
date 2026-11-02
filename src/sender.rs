@@ -212,6 +212,53 @@ impl std::error::Error for SendError {}
 
 #[cfg(test)]
 mod smtp_tests {
+
+    #[test]
+    fn explains_smtp_rejections_with_the_server_reason_and_separate_login() {
+        let server = Server::new();
+        let mut remote = server.remote();
+        let file = std::env::temp_dir().join(crate::storage::unique_name("smtp-cert"));
+        std::fs::write(&file, &server.pem).unwrap();
+        remote.tls_certificate = Some(file.clone());
+        remote.smtp_username = "relay@example.test".into();
+        remote.smtp_session_password = Some(std::sync::Arc::new(crate::remote::SessionPassword(
+            zeroize::Zeroizing::new("smtp-secret".into()),
+        )));
+        let worker = server.spawn(|stream| {
+            let mut stream = BufReader::new(stream.unwrap());
+            stream.get_mut().write_all(b"220 hi\r\n").unwrap();
+            let mut auth = String::new();
+            loop {
+                let mut line = String::new();
+                if stream.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let reply: &[u8] = if line.starts_with("EHLO") {
+                    b"250-hi\r\n250 AUTH PLAIN LOGIN\r\n"
+                } else if line.starts_with("AUTH") {
+                    auth = line.clone();
+                    b"535 5.7.8 smtp-secret rejected: app password required\r\n"
+                } else {
+                    b"221 bye\r\n"
+                };
+                stream.get_mut().write_all(reply).unwrap();
+                if line.starts_with("QUIT") {
+                    break;
+                }
+            }
+            auth
+        });
+        let error = check_connection(&remote).unwrap_err();
+        assert_eq!(error.kind, crate::remote::ErrorKind::Auth);
+        assert!(error.message.contains("535") && error.message.contains("app password"));
+        assert!(!error.message.contains("smtp-secret"));
+        let auth = worker.join().unwrap();
+        assert!(auth.contains(&crate::widgets::rich::base64(
+            b"\0relay@example.test\0smtp-secret"
+        )));
+        let _ = std::fs::remove_file(file);
+    }
+
     use super::*;
     use crate::remote::tests::Server;
     use lettre::transport::smtp::{

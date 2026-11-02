@@ -28,6 +28,8 @@ pub struct CryptoConfig {
     pub encrypt: bool,
     /// New messages use S/MIME instead of OpenPGP.
     pub smime: bool,
+    /// A GnuPG home folder other than the default, passed as `--homedir`.
+    pub home: Option<PathBuf>,
 }
 
 impl CryptoConfig {
@@ -418,6 +420,9 @@ fn run(
 ) -> Result<(Vec<u8>, String), String> {
     let program = config.program(standard);
     let mut command = Command::new(&program);
+    if let Some(home) = &config.home {
+        command.arg("--homedir").arg(home);
+    }
     command
         .args(["--status-fd", "2", "--no-tty"])
         .args(arguments)
@@ -725,4 +730,151 @@ pub fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
         }
     }
     Some(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A throwaway keyring with one OpenPGP key, or `None` when GnuPG is missing.
+    fn keyring() -> Option<(CryptoConfig, PathBuf)> {
+        let home = std::env::temp_dir().join(crate::storage::unique_name("termail-gnupg"));
+        std::fs::create_dir_all(&home).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).ok()?;
+        }
+        let generated = Command::new("gpg")
+            .arg("--homedir")
+            .arg(&home)
+            .args([
+                "--batch",
+                "--passphrase",
+                "",
+                "--quick-gen-key",
+                "Ada <ada@example.test>",
+                "ed25519",
+                "sign",
+                "never",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?;
+        if !generated.success() {
+            return None;
+        }
+        // ed25519 cannot encrypt; add an encryption subkey.
+        let fingerprint = String::from_utf8(
+            Command::new("gpg")
+                .arg("--homedir")
+                .arg(&home)
+                .args(["--with-colons", "--list-keys", "ada@example.test"])
+                .output()
+                .ok()?
+                .stdout,
+        )
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("fpr:")
+                .map(|rest| rest.trim_matches(':').to_owned())
+        })?;
+        Command::new("gpg")
+            .arg("--homedir")
+            .arg(&home)
+            .args([
+                "--batch",
+                "--passphrase",
+                "",
+                "--quick-add-key",
+                &fingerprint,
+                "cv25519",
+                "encr",
+                "never",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?;
+        Some((
+            CryptoConfig {
+                home: Some(home.clone()),
+                ..CryptoConfig::default()
+            },
+            home,
+        ))
+    }
+
+    fn message() -> Vec<u8> {
+        b"From: Ada <ada@example.test>\r\nTo: ada@example.test\r\nSubject: hi\r\nMessage-ID: <1@example.test>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nsecret h\xc3\xa9llo\r\n".to_vec()
+    }
+
+    fn roundtrip(config: &CryptoConfig, sign: bool, encrypt: bool) -> (String, String) {
+        let protection = Protection {
+            sign,
+            encrypt,
+            standard: Standard::OpenPgp,
+        };
+        let protected = protect(&message(), protection, config).unwrap();
+        let parsed = mail_parser::MessageParser::default()
+            .parse(&protected)
+            .unwrap();
+        let kind = Kind::detect(&parsed).unwrap();
+        let opened = open(&protected, kind, config).unwrap();
+        let text = mail_parser::MessageParser::default()
+            .parse(&opened.content)
+            .unwrap()
+            .body_text(0)
+            .unwrap()
+            .into_owned();
+        (text, opened.status)
+    }
+
+    #[test]
+    fn openpgp_signs_encrypts_and_catches_tampering() {
+        let Some((config, home)) = keyring() else {
+            eprintln!("gpg could not create a test key; skipping");
+            return;
+        };
+        let (text, status) = roundtrip(&config, true, false);
+        assert!(text.contains("secret héllo"));
+        assert!(status.starts_with("signed by Ada"), "{status}");
+        let (text, status) = roundtrip(&config, false, true);
+        assert!(text.contains("secret héllo"));
+        assert_eq!(status, "encrypted · not signed");
+        let (_, status) = roundtrip(&config, true, true);
+        assert!(status.starts_with("encrypted · signed by Ada"), "{status}");
+        let signed = protect(
+            &message(),
+            Protection {
+                sign: true,
+                encrypt: false,
+                standard: Standard::OpenPgp,
+            },
+            &config,
+        )
+        .unwrap();
+        let tampered = String::from_utf8(signed)
+            .unwrap()
+            .replace("secret", "Secret");
+        let opened = open(tampered.as_bytes(), Kind::PgpSigned, &config).unwrap();
+        assert!(opened.status.contains("BAD"), "{}", opened.status);
+        let _ = Command::new("gpgconf")
+            .arg("--homedir")
+            .arg(&home)
+            .args(["--kill", "gpg-agent"])
+            .status();
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn splits_parts_at_their_boundaries() {
+        let body = b"preamble\r\n--b\r\nfirst\r\n--b\r\nsecond\r\n--b--\r\nepilogue";
+        let parts = parts(body, "b");
+        assert_eq!(parts, vec![&b"first"[..], &b"second"[..]]);
+        assert_eq!(decode_base64(b"aGVs\r\nbG8="), Some(b"hello".to_vec()));
+        assert_eq!(canonical(b"a\nb\r\nc"), b"a\r\nb\r\nc".to_vec());
+    }
 }

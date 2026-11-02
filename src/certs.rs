@@ -152,3 +152,19 @@ fn expect_tagged(stream: &mut TcpStream, prefix: &str) -> Result<(), String> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fingerprints_match_sha256() {
+        assert_eq!(
+            super::fingerprint(b"abc"),
+            "BA:78:16:BF:8F:01:CF:EA:41:41:40:DE:5D:AE:22:23:B0:03:61:A3:96:17:7A:9C:B4:10:FF:61:F2:00:15:AD"
+        );
+        let pem = super::pem(&[7; 100]);
+        assert!(
+            pem.starts_with("-----BEGIN CERTIFICATE-----\n")
+                && pem.lines().all(|line| line.len() <= 64)
+        );
+    }
+}

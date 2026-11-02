@@ -408,3 +408,59 @@ fn base_domain(host: &str) -> Option<String> {
     };
     Some(labels[labels.len() - keep..].join("."))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const XML: &str = r#"<?xml version="1.0"?><clientConfig version="1.1"><emailProvider id="x.test">
+        <incomingServer type="pop3"><hostname>pop.x.test</hostname><port>995</port><socketType>SSL</socketType></incomingServer>
+        <incomingServer type="imap"><hostname>imap.x.test</hostname><port>143</port><socketType>STARTTLS</socketType><username>%EMAILLOCALPART%</username></incomingServer>
+        <outgoingServer type="smtp"><hostname>smtp.x.test</hostname><port>465</port><socketType>SSL</socketType></outgoingServer>
+        </emailProvider></clientConfig>"#;
+
+    #[test]
+    fn reads_autoconfig_files() {
+        let found = parse_autoconfig(XML, "test").unwrap();
+        assert_eq!(
+            (
+                found.imap_host.as_str(),
+                found.imap_port,
+                found.imap_security
+            ),
+            ("imap.x.test", 143, Security::Starttls)
+        );
+        assert_eq!(
+            (
+                found.smtp_host.as_str(),
+                found.smtp_port,
+                found.smtp_security
+            ),
+            ("smtp.x.test", 465, Security::Tls)
+        );
+        assert!(found.local_username);
+        assert!(
+            parse_autoconfig(&XML.replace("STARTTLS", "plain"), "test").is_none(),
+            "plain text is never offered"
+        );
+    }
+
+    #[test]
+    fn knows_common_providers_and_domains() {
+        assert_eq!(known("GMAIL.com").unwrap().imap_host, "imap.gmail.com");
+        assert_eq!(
+            known("outlook.com.tr").unwrap().smtp_security,
+            Security::Starttls
+        );
+        assert!(known("example.test").is_none());
+        assert_eq!(
+            base_domain("mx1.mail.example.co.uk").as_deref(),
+            Some("example.co.uk")
+        );
+        assert_eq!(
+            base_domain("mx.example.com").as_deref(),
+            Some("example.com")
+        );
+        assert!(discover("not-an-address").is_err());
+    }
+}
