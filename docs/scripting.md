@@ -2,7 +2,7 @@
 
 Settings cover the common cases. When you want termail to do something it does not do out of the box, write a little Lua.
 
-termail runs `init.lua` from the same folder as your config file when it starts. You can point it somewhere else with `script` in the `[ui]` table. Type `:script reload` to run it again after editing, without restarting.
+termail runs `init.lua` from the same folder as your config file when it starts. You can point it somewhere else with `script` in the `[ui]` table. Type `:script reload` to run it again after editing, without restarting. It also runs again whenever termail applies an edited config file.
 
 The script uses Lua 5.4. All of the standard library is there, including `io` and `os`, so a script can read files and run programs. Only run scripts you trust.
 
@@ -136,7 +136,7 @@ Functions that hand you a message give a table with these fields:
 | Function | |
 | --- | --- |
 | `termail.selected()` | The selected message, or `nil`. |
-| `termail.mails(query)` | Every loaded message that matches a search, such as `"from:ada is:unread"`. Without a query, all of them. |
+| `termail.mails(query)` | Every loaded message that matches a search, such as `"from:ada is:unread"`. Without a query, all of them. Plain words here match anywhere in the text, not only at the start of a word as in the inbox. |
 | `termail.state()` | `{ folder, account, query, count, unread }` |
 | `termail.move(id, folder)` | Moves a message. |
 | `termail.archive(id)`, `termail.trash(id)` | Shortcuts for the two common moves. |
@@ -179,6 +179,8 @@ termail.notice("Sorted by " .. termail.get("sort"))
 ```
 
 A wrong value is an error with a message that says what was wrong, and the old value stays.
+
+`language` and `accessible` are the exception: they are read when the config is applied, so set them in `config.toml` instead.
 
 `termail.theme(colors)` changes colors the same way the `[theme]` table does:
 

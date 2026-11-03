@@ -21,6 +21,8 @@ After editing, run `termail doctor`. It checks the file, your Maildir, your edit
 
 A mistake in the file stops termail at start with a message that names the problem. Inside the tables described here, such as `[ui]` or `[remote]`, an unknown name is an error too, so a typo does not go unnoticed.
 
+You don't have to restart after an edit. termail notices when the file is saved and applies it within a couple of seconds: colours, keys, language, the `[ui]`, `[compose]`, `[reader]` and `[crypto]` tables, your script, names, signatures and aliases. Type `:reload config` to do it by hand. If the new file has a mistake, termail says so in the status line and keeps the old settings. Changes to how an account connects, such as a server name or a Maildir path, wait for the next start so that running syncs and signed-in sessions are not cut off; termail tells you when that is the case.
+
 ## A small example
 
 ```toml
@@ -56,6 +58,20 @@ Start termail, sign in once when it asks, and the password is kept in your syste
 | `editor` | The program that edits message bodies, as a list: `["nvim", "+set tw=72"]`. Defaults to `$EDITOR`. Use `["builtin"]` for the editor inside termail. |
 | `send_command` | A program that sends mail, such as `["msmtp", "-a", "work"]`. Only for accounts without `[remote]`. |
 | `notifications` | Set to `false` to turn off desktop notifications for new mail. |
+| `aliases` | Other addresses you send from, such as `["Ada <ada@alias.example>", "info@example.com"]`. |
+| `contacts` | The address book file. Defaults to `contacts.vcf` next to the config. |
+
+### Other addresses
+
+When a message reached you through one of your `aliases`, the reply goes out from that address. Reply all leaves all your own addresses out. In the composer, press `ctrl+o` to go through your addresses on the From line.
+
+### The address book
+
+The address book is a plain vCard file, so you can import it from or export it to other programs. Press `K` on a message to add its sender. Type `:contacts` to see the book: type to filter, `enter` writes to the selected person and `ctrl+x` removes them. Addresses from the book come first when the composer suggests recipients, followed by everyone you have exchanged mail with.
+
+### Drafts
+
+While you write, termail saves the message to Drafts every 15 seconds once something changed, and the composer shows when it last did. If termail or your terminal closes, the draft is waiting in Drafts. When you discard a message, the copy saved this way is deleted too.
 
 ## Several accounts
 
@@ -178,10 +194,19 @@ termail signs and encrypts with your own GnuPG setup: `gpg` for OpenPGP and `gpg
 | `key` | your address | The key or certificate to sign with. |
 | `gpg` | `gpg` | Path to the OpenPGP program. |
 | `gpgsm` | `gpgsm` | Path to the S/MIME program. |
+| `home` | | A GnuPG home folder other than your usual one. |
+| `autocrypt` | `false` | Send your public key with every message and save the keys others send this way. |
+| `wkd` | `true` | Before encrypting, look up missing recipient keys at their domain. |
 
 You can change the choice for each message on the Security line of the composer. Encrypted messages are encrypted to you as well, so you can read your own Sent copy. Replies to encrypted mail start encrypted.
 
 When you open a signed message, the reader shows who signed it and whether the key is verified. Encrypted messages are decrypted when you open them; if your key has a passphrase, the usual GnuPG prompt appears.
+
+The subject of an encrypted message travels inside the encryption. Servers and anyone in between see `...` instead. When you open the message, termail shows the real subject, in the reader and in the list. Other programs that support protected headers, such as Thunderbird, do the same.
+
+With `autocrypt = true`, every message you send carries your public key in an `Autocrypt` header, so the other side's mail program can encrypt its replies without any key exchange. When you open a message that carries a key this way, termail saves it in your keyring if the key belongs to the sender's address, and tells you when a new one arrives.
+
+If you encrypt to someone whose key you don't have, termail asks their domain for it first (the Web Key Directory). Many providers publish keys this way, Proton Mail and Posteo among them. The lookup gives up after a few seconds. Set `wkd = false` if you would rather not ask.
 
 ## Interface: `[ui]`
 
@@ -211,8 +236,35 @@ When you open a signed message, the reader shows who signed it and whether the k
 | `hide_folders` | `[]` | Folders to leave out of the folder list. |
 | `notify_command` | | Your own program for new-mail notifications. `{title}` and `{body}` are filled in: `["dunstify", "{title}", "{body}"]`. |
 | `script` | `init.lua` | The Lua script to run at start. See [scripting.md](scripting.md). |
+| `language` | `auto` | The interface language: `en`, `tr`, or `auto` to follow your system. |
+| `accessible` | `false` | Settings for screen readers and magnifiers, described below. |
 
 Date formats use the usual strftime codes. `%d.%m.%Y` gives `14.03.2026`, `%b %e` gives `Mar 14`.
+
+### Language
+
+termail comes in English and Turkish. With `language = "auto"` it follows `LC_ALL`, `LC_MESSAGES` or `LANG`, and uses English for languages it doesn't have.
+
+To translate termail into another language, or to change some of the built-in words, create `locales/CODE.toml` next to the config, for example `locales/de.toml`, and set `language = "de"`. Each line maps the English text to the translation:
+
+```toml
+"archive" = "archivieren"
+"Moved to {}" = "Nach {} verschoben"
+"Deleted {} messages permanently" = "{} Nachrichten endgültig gelöscht"
+```
+
+`{}` stands for the part that changes, such as a number or a folder name. Anything you leave out stays English. The Turkish file in the source tree, `locales/tr.toml`, is a good list of texts to start from.
+
+### Accessibility
+
+`accessible = true` helps when you use a screen reader or a magnifier:
+
+- the terminal cursor sits on the selected message, so your tools follow it
+- unread and starred conversations are marked with `N` and `*` instead of symbols, unless you set your own markers
+- the loading animation is left out
+- colours are left to your terminal, with the selection shown as reversed text, unless you pick a theme preset
+
+termail also follows the [NO_COLOR](https://no-color.org) convention: when the `NO_COLOR` environment variable is set, it uses your terminal's colours unless the config names a preset.
 
 ## Writing mail: `[compose]`
 
@@ -243,8 +295,19 @@ HTML mail is drawn the way its sender designed it: page and card backgrounds, co
 | `popup_height` | `90` | Height of the window, in percent of the screen. |
 | `remote_images` | `false` | Load remote images in every message. |
 | `remote_images_from` | `[]` | Load them only for these senders. Full addresses or whole domains: `["@github.com", "friend@example.com"]`. |
+| `clean_links` | `true` | Remove tracking parameters such as `utm_source` and `fbclid` from links before opening them. |
 
 Remote images are blocked until you press `I`, because they tell the sender when and where you read the message. Pictures need a terminal that can show them, such as kitty, WezTerm, iTerm2, foot or Ghostty. Elsewhere you see their description instead.
+
+### Checking senders and links
+
+Your mail server checks whether a message really comes from the domain it claims (DKIM, SPF and DMARC) and writes down the result. termail shows that result under the sender in the reader. When the check failed, or when the sender's name shows a different address than the one the mail comes from, the reader says so and the conversation gets a `⚠` in the list.
+
+Before a link opens, termail looks at where it really goes. It asks you first when the link text shows one site but leads to another, when the address hides its destination behind an `@`, points at a bare IP address, uses look-alike characters, or is not encrypted. Press `o` to open it anyway, `y` to copy it, or `esc` to leave it. Links that aren't web or mail links, such as `javascript:`, never open.
+
+### Meeting invitations
+
+When a message carries a meeting invitation, the reader shows what it is, when and where, and who organises it. Type `:accept`, `:tentative` or `:decline` to answer. termail prepares the answer for the organiser's calendar and opens it in the composer so you can add a note before sending. `:calendar` saves the event and opens it with your calendar program.
 
 ## Colors: `[theme]`
 
@@ -256,7 +319,7 @@ preset = "light"
 accent = "#d75f00"
 ```
 
-Presets are `dark` (the default), `light` and `contrast`. The colors you can set are `canvas`, `surface`, `text`, `muted`, `subtle`, `accent`, `success` and `error`. Each takes a name (`red`, `lightblue`), a 256-color index (`81`) or a hex value (`#5fd7ff`).
+Presets are `dark` (the default), `light`, `contrast` and `mono`, which uses your terminal's own colours. The colors you can set are `canvas`, `surface`, `text`, `muted`, `subtle`, `accent`, `success` and `error`. Each takes a name (`red`, `lightblue`), a 256-color index (`81`) or a hex value (`#5fd7ff`).
 
 ## Keys: `[keys]`
 
@@ -289,13 +352,14 @@ These are the actions you can rebind:
 | `folders` | `g` | | `review` | `z` |
 | `accounts` | `p` | | `quit` | `q` |
 | `search` | `/` | | `help` | `?` |
-| `command` | `:` | | | |
+| `command` | `:` | | `spam` | `J` |
+| `contact` | `K` | | | |
 
 For keys that run your own code, use a script.
 
 ## Searching
 
-Type `/` in the inbox. Words match the sender, recipients, subject and body. You can also narrow it down:
+Type `/` in the inbox. Each word finds messages with a word that starts with it, in the sender, recipients, subject or body: `pay` finds "payment" and "Paying", but not "repay". Results appear as you type, even in very large mailboxes, because termail keeps an index of every word. You can also narrow it down:
 
 ```
 from:ada  to:team  subject:invoice  body:"exact words"
@@ -304,6 +368,21 @@ before:2026-03-01  after:2026-02  on:today  after:7d
 -word   leaves out messages containing word
 ```
 
+Filters such as `from:` and `subject:` match anywhere in that field, so `subject:voice` finds "Invoice".
+
 Dates can be a day (`2026-03-14`), a month (`2026-03`), `today`, `yesterday`, or an age like `7d`, `2w`, `3m` or `1y`.
 
 termail only downloads the newest messages of each folder. Press `ctrl+r` while searching to run the same search on the server, so older matches are downloaded too.
+
+## Shell completions and the manual
+
+termail can print completions for your shell and a manual page:
+
+```sh
+termail completions bash > ~/.local/share/bash-completion/completions/termail
+termail completions zsh > ~/.zfunc/_termail
+termail completions fish > ~/.config/fish/completions/termail.fish
+termail man > ~/.local/share/man/man1/termail.1
+```
+
+After that, `man termail` works and tab completes the commands and options.
