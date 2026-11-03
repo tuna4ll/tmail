@@ -9,6 +9,8 @@ pub(crate) struct CliOptions {
     pub(crate) log: Option<PathBuf>,
     /// `oauth [ACCOUNT]`: sign in with OAuth2 and store the refresh token.
     pub(crate) oauth: Option<Option<String>>,
+    /// Something to print instead of starting: completions, the manual or the version.
+    pub(crate) print: Option<String>,
 }
 
 pub(crate) fn parse_options(
@@ -20,6 +22,7 @@ pub(crate) fn parse_options(
     let mut doctor = false;
     let mut log = None;
     let mut oauth = None;
+    let mut print = None;
 
     while let Some(argument) = args.next() {
         match argument.to_str() {
@@ -42,6 +45,20 @@ pub(crate) fn parse_options(
                 log = Some(PathBuf::from(path));
             }
             Some("--demo") => source = Some(MailboxSource::Demo),
+            Some("completions") => {
+                let shell = args
+                    .next()
+                    .and_then(|shell| shell.into_string().ok())
+                    .unwrap_or_default();
+                let script = crate::completions::script(&shell).ok_or_else(|| {
+                    color_eyre::eyre::eyre!("completions needs a shell: bash, zsh or fish")
+                })?;
+                print = Some(script.to_owned());
+            }
+            Some("man") => print = Some(crate::completions::man_page()),
+            Some("--version" | "-V") => {
+                print = Some(format!("termail {}\n", env!("CARGO_PKG_VERSION")));
+            }
             Some("doctor") => doctor = true,
             Some("oauth") => oauth = Some(None),
             Some(value) if oauth == Some(None) && !value.starts_with('-') => {
@@ -59,12 +76,13 @@ pub(crate) fn parse_options(
         doctor,
         log,
         oauth,
+        print,
     }))
 }
 
 pub(crate) fn print_help() {
     println!(
-        "termail [doctor | oauth [ACCOUNT]] [--config PATH] [--log PATH] [--demo | --maildir PATH]"
+        "termail [doctor | oauth [ACCOUNT] | completions SHELL | man] [--config PATH] [--log PATH] [--demo | --maildir PATH]"
     );
     println!();
     println!("  --demo          open the built-in mailbox");
@@ -73,6 +91,9 @@ pub(crate) fn print_help() {
     println!("  --log PATH      append connection errors to a file (or set TERMAIL_LOG)");
     println!("  doctor          check account, Maildir, editor, and sender setup");
     println!("  oauth [ACCOUNT] sign in through the provider's page and keep the refresh token");
+    println!("  completions SHELL  print completions for bash, zsh or fish");
+    println!("  man             print the manual page");
+    println!("  --version       show the version");
 }
 
 pub(crate) fn expand_path(value: &str) -> PathBuf {

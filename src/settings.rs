@@ -48,6 +48,12 @@ pub struct UiConfig {
     pub notify_command: Vec<String>,
     /// The Lua script to run at start; `init.lua` next to the config when unset.
     pub script: Option<PathBuf>,
+    /// The interface language, such as `en` or `tr`; `auto` follows the system.
+    pub language: String,
+    /// For screen readers and magnifiers: no colours unless a theme preset is set,
+    /// letters instead of symbols, no animation, and the terminal cursor on the
+    /// selected message.
+    pub accessible: bool,
 }
 
 impl Default for UiConfig {
@@ -77,6 +83,8 @@ impl Default for UiConfig {
             hide_folders: Vec::new(),
             notify_command: Vec::new(),
             script: None,
+            language: "auto".into(),
+            accessible: false,
         }
     }
 }

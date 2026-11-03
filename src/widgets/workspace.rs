@@ -52,11 +52,11 @@ impl Workspace {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
-        let title = if focused {
+        let title = crate::i18n::t(if focused {
             " workspace • active "
         } else {
             " workspace "
-        };
+        });
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme::border(focused))
@@ -90,7 +90,7 @@ impl Workspace {
                         .borders(Borders::ALL)
                         .border_style(theme::border(false))
                         .title_style(theme::muted())
-                        .title(" map "),
+                        .title(crate::i18n::t(" map ")),
                 );
             frame.render_widget(map, inner);
         }

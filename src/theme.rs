@@ -1,10 +1,13 @@
-use std::sync::RwLock;
+use std::sync::{
+    RwLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use rataflow::{Palette, Theme};
 use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
 
-/// Colors from the `[theme]` table: a `preset` (`dark`, `light` or `contrast`) and
+/// Colors from the `[theme]` table: a `preset` (`dark`, `light`, `contrast` or `mono`) and
 /// any colors to override, as names (`red`), indexes (`81`) or hex (`#5fd7ff`).
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -66,14 +69,27 @@ impl Colors {
         error: Color::Indexed(196),
     };
 
+    /// The terminal's own colours; selection shows as reversed text.
+    const MONO: Self = Self {
+        canvas: Color::Reset,
+        surface: Color::Reset,
+        muted: Color::Reset,
+        subtle: Color::Reset,
+        accent: Color::Reset,
+        text: Color::Reset,
+        success: Color::Reset,
+        error: Color::Reset,
+    };
+
     pub fn from_config(config: &ThemeConfig) -> Result<Self, String> {
         let mut colors = match config.preset.as_deref().unwrap_or("dark") {
             "dark" => Self::DARK,
             "light" => Self::LIGHT,
             "contrast" | "high-contrast" => Self::CONTRAST,
+            "mono" => Self::MONO,
             other => {
                 return Err(format!(
-                    "Unknown theme preset {other}. Use dark, light or contrast."
+                    "Unknown theme preset {other}. Use dark, light, contrast or mono."
                 ));
             }
         };
@@ -98,6 +114,18 @@ impl Colors {
 }
 
 static COLORS: RwLock<Colors> = RwLock::new(Colors::DARK);
+static MONO: AtomicBool = AtomicBool::new(false);
+
+/// The theme to use: without a preset, accessible mode and the NO_COLOR convention
+/// (no-color.org) mean the terminal's own colours.
+pub fn effective(config: &ThemeConfig, accessible: bool) -> ThemeConfig {
+    let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+    let mut config = config.clone();
+    if config.preset.is_none() && (accessible || no_color) {
+        config.preset = Some("mono".into());
+    }
+    config
+}
 static CONFIG: RwLock<Option<ThemeConfig>> = RwLock::new(None);
 
 /// Sets the colors from the `[theme]` table.
@@ -106,6 +134,7 @@ pub fn init(config: &ThemeConfig) -> Result<(), String> {
     if let (Ok(mut current), Ok(mut stored)) = (COLORS.write(), CONFIG.write()) {
         *current = colors;
         *stored = Some(config.clone());
+        MONO.store(config.preset.as_deref() == Some("mono"), Ordering::Relaxed);
     }
     Ok(())
 }
@@ -211,18 +240,30 @@ pub fn muted() -> Style {
     Style::default().fg(muted_color())
 }
 
+fn marked(style: Style) -> Style {
+    if MONO.load(Ordering::Relaxed) {
+        style.add_modifier(Modifier::REVERSED)
+    } else {
+        style
+    }
+}
+
 pub fn selection() -> Style {
-    Style::default()
-        .fg(text_color())
-        .bg(subtle())
-        .add_modifier(Modifier::BOLD)
+    marked(
+        Style::default()
+            .fg(text_color())
+            .bg(subtle())
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 pub fn keycap() -> Style {
-    Style::default()
-        .fg(text_color())
-        .bg(subtle())
-        .add_modifier(Modifier::BOLD)
+    marked(
+        Style::default()
+            .fg(text_color())
+            .bg(subtle())
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 /// A hint under the pointer: the accent color behind the key.

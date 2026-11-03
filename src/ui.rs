@@ -34,7 +34,7 @@ impl App {
         if self.onboarding {
             frame.render_widget(Paragraph::new("Connect an account\n\nAdd an email account to read and send mail.\n\nenter  Add account    q  Quit")
                 .style(theme::text()).alignment(Alignment::Center)
-                .block(Block::bordered().title(" termail ").border_style(theme::border(true))), frame.area());
+                .block(Block::bordered().title(i18n::t(" termail ")).border_style(theme::border(true))), frame.area());
             if let Some(overlay) = &mut self.overlay {
                 self.overlay_geometry = draw_overlay(frame, overlay, self.cursor_back);
             }
@@ -86,17 +86,27 @@ impl App {
                 let marker = settings::with(|ui| {
                     let blank =
                         |marker: &str| " ".repeat(unicode_width::UnicodeWidthStr::width(marker));
+                    // Screen readers say "black circle" for ●; letters read better.
+                    let plain = |marker: &str, symbol: &str, letter: &str| {
+                        if ui.accessible && marker == symbol {
+                            letter.to_owned()
+                        } else {
+                            marker.to_owned()
+                        }
+                    };
+                    let unread_marker = plain(&ui.unread_marker, "●", "N");
+                    let star_marker = plain(&ui.star_marker, "★", "*");
                     format!(
                         "{}{}",
                         if unread {
-                            ui.unread_marker.clone()
+                            unread_marker.clone()
                         } else {
-                            blank(&ui.unread_marker)
+                            blank(&unread_marker)
                         },
                         if starred {
-                            ui.star_marker.clone()
+                            star_marker.clone()
                         } else {
-                            blank(&ui.star_marker)
+                            blank(&star_marker)
                         },
                     )
                 });
@@ -215,23 +225,38 @@ impl App {
             self.active_folder.clone()
         };
         let title = if self.searching {
-            let mut line = cursor_line(" search: ", &self.query, self.cursor_back);
+            let mut line = cursor_line(
+                &format!(" {}: ", i18n::t("search")),
+                &self.query,
+                self.cursor_back,
+            );
             line.spans.push(Span::raw(" "));
             line
         } else {
+            let inbox = i18n::t("inbox");
+            let filter = i18n::t(self.filter.label());
             Line::from(if !self.query.is_empty() {
-                format!(" inbox • {} • /{} ", self.filter.label(), self.query)
+                format!(" {inbox} • {filter} • /{} ", self.query)
             } else if self.filter != InboxFilter::All {
-                format!(" inbox • {} ", self.filter.label())
+                format!(" {inbox} • {filter} ")
             } else if self.skipped > 0 {
                 format!(
-                    " {} · {folder} • {} skipped ",
-                    self.account_label, self.skipped
+                    " {} · {folder} • {} ",
+                    self.account_label,
+                    i18n::t(&format!("{} skipped", self.skipped))
                 )
             } else if !self.syncing.is_empty() {
-                format!(" {} · {folder} • syncing ", self.account_label)
+                format!(
+                    " {} · {folder} • {} ",
+                    self.account_label,
+                    i18n::t("syncing")
+                )
             } else if inbox_focused {
-                format!(" {} · {folder} • active ", self.account_label)
+                format!(
+                    " {} · {folder} • {} ",
+                    self.account_label,
+                    i18n::t("active")
+                )
             } else {
                 format!(" {} · {folder} ", self.account_label)
             })
@@ -311,6 +336,19 @@ impl App {
         }
 
         self.list_offset = list_state.offset();
+        // Screen readers and magnifiers follow the terminal cursor.
+        if settings::with(|ui| ui.accessible)
+            && self.overlay.is_none()
+            && (self.reader.is_none() || self.reader_docked)
+            && self.focus == Pane::Inbox
+            && !visible.is_empty()
+            && let Some(area) = self.inbox_area
+        {
+            let row = area.y + 1 + (self.selected.saturating_sub(self.list_offset) * 2) as u16;
+            if row < area.bottom().saturating_sub(1) {
+                frame.set_cursor_position((area.x + 1, row));
+            }
+        }
 
         let hints = if let Some(hints) = self.overlay_hints() {
             hints
@@ -482,7 +520,7 @@ pub(crate) fn draw_mailbox_state(
     let block = Block::bordered()
         .border_style(theme::border(false))
         .title_style(theme::title(false))
-        .title(" termail ");
+        .title(i18n::t(" termail "));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let width = inner.width.min(64);
@@ -501,14 +539,16 @@ pub(crate) fn draw_mailbox_state(
                 6.min(content.width),
                 1,
             );
+            if !settings::with(|ui| ui.accessible) {
+                frame.render_widget(
+                    FluxSpinner::new(spinner_tick)
+                        .width(6)
+                        .color(theme::accent()),
+                    spinner_area,
+                );
+            }
             frame.render_widget(
-                FluxSpinner::new(spinner_tick)
-                    .width(6)
-                    .color(theme::accent()),
-                spinner_area,
-            );
-            frame.render_widget(
-                Paragraph::new(format!("Loading {}", source.label()))
+                Paragraph::new(i18n::t(&format!("Loading {}", source.label())))
                     .style(theme::text())
                     .alignment(Alignment::Center),
                 Rect::new(content.x, content.y.saturating_add(2), content.width, 1),
@@ -516,9 +556,9 @@ pub(crate) fn draw_mailbox_state(
         }
         MailboxState::Empty => {
             frame.render_widget(
-                Paragraph::new(
+                Paragraph::new(i18n::t(
                     "No messages found\n\nPress c to compose or p to switch accounts. New mail appears automatically.",
-                )
+                ))
                 .style(theme::text())
                 .alignment(Alignment::Center)
                 .wrap(Wrap { trim: true }),
@@ -527,9 +567,9 @@ pub(crate) fn draw_mailbox_state(
         }
         MailboxState::Error(error) => {
             frame.render_widget(
-                    Paragraph::new(format!(
+                    Paragraph::new(i18n::t(&format!(
                         "Unable to load mailbox\n\n{error}\n\nCheck the path and permissions, then press r to retry."
-                    ))
+                    )))
                     .style(theme::text())
                     .alignment(Alignment::Center)
                     .wrap(Wrap { trim: true }),
@@ -547,19 +587,28 @@ pub(crate) fn status_line(hints: &[(&str, &str)]) -> Line<'static> {
             spans.push(Span::raw("  "));
         }
         spans.push(Span::styled(format!(" {key} "), theme::keycap()));
-        spans.push(Span::styled(format!(" {label}"), theme::muted()));
+        spans.push(Span::styled(format!(" {}", i18n::t(label)), theme::muted()));
     }
     Line::from(spans)
 }
 
 pub(crate) fn action_line(message: &str, undo: bool) -> Line<'static> {
-    let mut spans = vec![Span::styled(format!(" {message} "), theme::title(true))];
+    let mut spans = vec![Span::styled(
+        format!(" {} ", i18n::t(message)),
+        theme::title(true),
+    )];
     if undo {
         spans.push(Span::styled(" u ", theme::keycap()));
-        spans.push(Span::styled(" undo", theme::muted()));
+        spans.push(Span::styled(
+            format!(" {}", i18n::t("undo")),
+            theme::muted(),
+        ));
     }
     spans.push(Span::styled(" esc ", theme::keycap()));
-    spans.push(Span::styled(" dismiss", theme::muted()));
+    spans.push(Span::styled(
+        format!(" {}", i18n::t("dismiss")),
+        theme::muted(),
+    ));
     Line::from(spans)
 }
 
@@ -567,7 +616,7 @@ pub(crate) fn draw_no_matches(frame: &mut Frame, area: Rect, folder: &str, folde
     let block = Block::bordered()
         .border_style(theme::border(false))
         .title_style(theme::title(false))
-        .title(" workspace ");
+        .title(i18n::t(" workspace "));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let message = if folder_empty {
@@ -575,6 +624,7 @@ pub(crate) fn draw_no_matches(frame: &mut Frame, area: Rect, folder: &str, folde
     } else {
         "No matching conversations\n\nChange the filter or press esc to clear search.".into()
     };
+    let message = i18n::t(&message);
     frame.render_widget(
         Paragraph::new(message)
             .style(theme::muted())
@@ -689,7 +739,7 @@ pub(crate) fn draw_overlay(
         Overlay::Menu { items, .. } => (
             items
                 .iter()
-                .map(|item| item.label.chars().count() as u16 + 8)
+                .map(|item| i18n::t(&item.label).chars().count() as u16 + 8)
                 .max()
                 .unwrap_or(20)
                 .max(22),
@@ -732,12 +782,16 @@ pub(crate) fn draw_overlay(
             frame.render_widget(
                 Paragraph::new(text)
                     .wrap(Wrap { trim: true })
-                    .block(Block::bordered().title(" resolve unconfirmed delivery ")),
+                    .block(Block::bordered().title(i18n::t(" resolve unconfirmed delivery "))),
                 area,
             );
         }
         Overlay::Help { scroll } => {
-            let text = HELP.join("\n");
+            let text = HELP
+                .iter()
+                .map(|line| i18n::t(line))
+                .collect::<Vec<_>>()
+                .join("\n");
             frame.render_widget(
                 Paragraph::new(text)
                     .style(theme::text())
@@ -745,7 +799,7 @@ pub(crate) fn draw_overlay(
                         Block::bordered()
                             .border_style(theme::border(true))
                             .title_style(theme::title(true))
-                            .title(" help · esc to close ")
+                            .title(i18n::t(" help · esc to close "))
                             .bg(theme::surface()),
                     )
                     .scroll((*scroll, 0))
@@ -761,7 +815,7 @@ pub(crate) fn draw_overlay(
                         Block::bordered()
                             .border_style(theme::border(true))
                             .title_style(theme::title(true))
-                            .title(" command ")
+                            .title(i18n::t(" command "))
                             .bg(theme::surface()),
                     ),
                 area,
@@ -805,7 +859,7 @@ pub(crate) fn draw_overlay(
                         Block::bordered()
                             .border_style(theme::border(true))
                             .title_style(theme::title(true))
-                            .title(" choose an action ")
+                            .title(i18n::t(" choose an action "))
                             .bg(theme::surface()),
                     )
                     .wrap(Wrap { trim: true }),
@@ -823,7 +877,7 @@ pub(crate) fn draw_overlay(
                     Block::bordered()
                         .border_style(theme::border(true))
                         .title_style(theme::title(true))
-                        .title(" unsaved message ")
+                        .title(i18n::t(" unsaved message "))
                         .bg(theme::surface()),
                 )
                 .wrap(Wrap { trim: true }),
@@ -886,7 +940,7 @@ pub(crate) fn draw_overlay(
                     Block::bordered()
                         .border_style(ratatui::style::Style::default().fg(theme::error_color()))
                         .title_style(theme::title(true))
-                        .title(" check this link ")
+                        .title(i18n::t(" check this link "))
                         .bg(theme::surface()),
                 ),
                 area,
@@ -911,7 +965,7 @@ pub(crate) fn draw_overlay(
                     Block::bordered()
                         .border_style(theme::border(true))
                         .title_style(theme::title(true))
-                        .title(" unsubscribe ")
+                        .title(i18n::t(" unsubscribe "))
                         .bg(theme::surface()),
                 ),
                 area,
@@ -929,7 +983,7 @@ pub(crate) fn draw_overlay(
                         Block::bordered()
                             .border_style(theme::border(true))
                             .title_style(theme::title(true))
-                            .title(title)
+                            .title(i18n::t(&title))
                             .bg(theme::surface()),
                     ),
                 area,
@@ -959,13 +1013,13 @@ pub(crate) fn draw_overlay(
                     Block::bordered()
                         .border_style(theme::border(true))
                         .title_style(theme::title(true))
-                        .title(if *moving {
+                        .title(i18n::t(if *moving {
                             " move to "
                         } else if *deleting {
                             " press x again to delete the folder and its mail "
                         } else {
                             " folders · n new · e rename · x delete "
-                        })
+                        }))
                         .bg(theme::surface()),
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
@@ -987,7 +1041,7 @@ pub(crate) fn draw_overlay(
                     Block::bordered()
                         .border_style(theme::border(true))
                         .title_style(theme::title(true))
-                        .title(" links · enter to open · y to copy ")
+                        .title(i18n::t(" links · enter to open · y to copy "))
                         .bg(theme::surface()),
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
@@ -1017,7 +1071,7 @@ pub(crate) fn draw_overlay(
                     Block::bordered()
                         .border_style(theme::border(true))
                         .title_style(theme::title(true))
-                        .title(" attachments · s save · o open ")
+                        .title(i18n::t(" attachments · s save · o open "))
                         .bg(theme::surface()),
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
@@ -1042,11 +1096,11 @@ pub(crate) fn draw_overlay(
                     Block::bordered()
                         .border_style(theme::border(true))
                         .title_style(theme::title(true))
-                        .title(if *removing {
+                        .title(i18n::t(if *removing {
                             " press x again to remove · mail stays on disk "
                         } else {
                             " accounts · a add · e edit · l sign in · x remove "
-                        })
+                        }))
                         .bg(theme::surface()),
                 );
             let mut state = ListState::default().with_selected(Some(*selected));
@@ -1070,11 +1124,11 @@ pub(crate) fn draw_overlay(
                         KeyCode::Esc => "esc".into(),
                         _ => String::new(),
                     };
+                    let label = i18n::t(&item.label);
                     let width = usize::from(area.width.saturating_sub(4));
-                    let gap =
-                        width.saturating_sub(item.label.chars().count() + key.chars().count() + 1);
+                    let gap = width.saturating_sub(label.chars().count() + key.chars().count() + 1);
                     ListItem::new(Line::from(vec![
-                        Span::raw(format!(" {}", item.label)),
+                        Span::raw(format!(" {label}")),
                         Span::raw(" ".repeat(gap)),
                         Span::styled(key, theme::muted()),
                     ]))
@@ -1117,7 +1171,7 @@ pub(crate) fn draw_compose(
     let block = Block::bordered()
         .border_style(theme::border(true))
         .title_style(theme::title(true))
-        .title(" compose ")
+        .title(i18n::t(" compose "))
         .bg(theme::surface());
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
@@ -1132,8 +1186,10 @@ pub(crate) fn draw_compose(
     .split(inner);
     frame.render_widget(
         Paragraph::new(format!(
-            "From     {}  · ctrl+o other address",
-            state.composer.from
+            "{:<8} {}  · {}",
+            i18n::t("From"),
+            state.composer.from,
+            i18n::t("ctrl+o other address")
         ))
         .style(theme::muted()),
         rows[0],
@@ -1151,6 +1207,7 @@ pub(crate) fn draw_compose(
         .iter()
         .enumerate()
         .map(|(index, (label, value))| {
+            let label = i18n::t(label);
             let editing = index == state.field
                 && index != ComposeState::FORMAT_FIELD
                 && index != ComposeState::SECURITY_FIELD;
@@ -1183,7 +1240,7 @@ pub(crate) fn draw_compose(
             Block::bordered()
                 .border_style(theme::border(state.field != ComposeState::BODY_FIELD))
                 .title_style(theme::title(state.field != ComposeState::BODY_FIELD))
-                .title(" headers "),
+                .title(i18n::t(" headers ")),
         );
     let mut selected = ListState::default()
         .with_selected((state.field != ComposeState::BODY_FIELD).then_some(state.field));
@@ -1203,7 +1260,7 @@ pub(crate) fn draw_compose(
             Block::bordered()
                 .border_style(theme::border(state.field == ComposeState::BODY_FIELD))
                 .title_style(theme::title(state.field == ComposeState::BODY_FIELD))
-                .title(" body "),
+                .title(i18n::t(" body ")),
         ),
         rows[2],
     );

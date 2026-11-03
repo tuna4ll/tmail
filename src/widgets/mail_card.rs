@@ -52,7 +52,7 @@ impl NodeContent for MailCard {
             .border_style(border)
             .bg(palette.surface);
         if ctx.selected {
-            block = block.title(Line::styled(" ● selected ", border));
+            block = block.title(Line::styled(crate::i18n::t(" ● selected "), border));
         }
         let inner = block.inner(ctx.area);
         block.render(ctx.area, buf);
@@ -81,7 +81,10 @@ impl NodeContent for MailCard {
         }
 
         let sender = Line::from(vec![
-            Span::styled("from ", Style::default().fg(palette.muted)),
+            Span::styled(
+                crate::i18n::t("from") + " ",
+                Style::default().fg(palette.muted),
+            ),
             Span::styled(
                 self.from.as_str(),
                 Style::default()
@@ -119,7 +122,12 @@ impl NodeContent for MailCard {
             } else {
                 format!("{}  ", details.join(" · "))
             };
-            let footer = format!("{details}{}/{}  ↵ open", self.position, self.total);
+            let footer = format!(
+                "{details}{}/{}  ↵ {}",
+                self.position,
+                self.total,
+                crate::i18n::t("open")
+            );
             let style = Style::default().fg(if ctx.selected {
                 palette.accent
             } else {

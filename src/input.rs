@@ -771,6 +771,7 @@ impl App {
             "account edit" => self.open_account_setup(account_setup::Mode::Edit),
             "login" => self.open_account_setup(account_setup::Mode::Login),
             "reload" => self.reload(),
+            "reload config" => self.reload_config(),
             "sync" => self.start_sync(),
             "upload" => self.upload_held(),
             "contacts" => self.open_contacts(),

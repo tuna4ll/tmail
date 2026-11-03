@@ -2,6 +2,7 @@ mod account_setup;
 mod calendar;
 mod certs;
 mod complete;
+mod completions;
 mod config;
 mod contacts;
 mod crypto;
@@ -11,6 +12,7 @@ mod doctor;
 mod draft;
 #[cfg(test)]
 mod fake_imap;
+mod i18n;
 mod imap_client;
 mod keymap;
 mod links;
@@ -39,6 +41,7 @@ mod compose;
 mod hooks;
 mod inbox;
 mod input;
+mod reload;
 mod ui;
 
 use cli::*;
@@ -88,14 +91,24 @@ async fn main() -> color_eyre::Result<()> {
         print_help();
         return Ok(());
     };
+    if let Some(text) = &options.print {
+        print!("{text}");
+        return Ok(());
+    }
     log::init(options.log.clone())?;
     mailbox::prune_caches();
     let config = Config::load(options.config_path.as_deref())?;
-    theme::init(&config.theme).map_err(color_eyre::eyre::Error::msg)?;
+    theme::init(&theme::effective(&config.theme, config.ui.accessible))
+        .map_err(color_eyre::eyre::Error::msg)?;
     settings::init(config.ui.clone()).map_err(color_eyre::eyre::Error::msg)?;
     settings::init_compose(config.compose.clone()).map_err(color_eyre::eyre::Error::msg)?;
     settings::init_reader(config.reader.clone()).map_err(color_eyre::eyre::Error::msg)?;
     keymap::Keymap::from_config(&config.keys).map_err(color_eyre::eyre::Error::msg)?;
+    i18n::init(
+        &config.ui.language,
+        config.path.as_deref().and_then(Path::parent),
+    )
+    .map_err(color_eyre::eyre::Error::msg)?;
     if let Some(account) = &options.oauth {
         if let Err(error) = oauth::run(&config, account.as_deref()) {
             eprintln!("{error}");
@@ -204,6 +217,8 @@ pub struct App {
     skipped: usize,
     query: String,
     search_cache: std::cell::RefCell<search::Cache>,
+    /// When config.toml last changed, to notice edits.
+    config_modified: Option<std::time::SystemTime>,
     searching: bool,
     filter: InboxFilter,
     undo: Option<UndoAction>,
@@ -625,6 +640,11 @@ impl App {
             skipped: 0,
             query: String::new(),
             search_cache: Default::default(),
+            config_modified: config.path.as_deref().and_then(|path| {
+                fs::metadata(path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+            }),
             searching: false,
             filter: match settings::with(|ui| ui.start_filter.clone()).as_str() {
                 "unread" => InboxFilter::Unread,
@@ -696,6 +716,7 @@ impl App {
                     self.retry_due_deliveries();
                     self.run_script_timers();
                     self.autosave_draft();
+                    self.reload_config_if_changed();
                 },
                 task = self.task_rx.recv() => {
                     if let Some(task) = task {

@@ -607,7 +607,7 @@ impl Form {
             Mode::Login => " sign in ",
         };
         let block = Block::bordered()
-            .title(title)
+            .title(crate::i18n::t(title))
             .border_style(theme::border(true))
             .title_style(theme::title(true))
             .style(theme::text().bg(theme::surface()));
@@ -630,7 +630,7 @@ impl Form {
             "Type your address and press tab: termail fills in the servers it can find.\nUsername defaults to your email address.".into()
         };
         frame.render_widget(
-            Paragraph::new(hint)
+            Paragraph::new(crate::i18n::t(&hint))
                 .style(theme::muted())
                 .wrap(Wrap { trim: false }),
             rows[0],
@@ -640,11 +640,15 @@ impl Form {
             .visible()
             .iter()
             .map(|&field| {
-                let label = format!("{:<15} ", field.label());
+                let label = format!("{:<15} ", crate::i18n::t(field.label()));
                 let value = match field {
-                    Field::SignIn => format!("< {} >", self.sign_in.label()),
-                    Field::ImapSecurity => format!("< {} >", security_label(self.imap_security)),
-                    Field::SmtpSecurity => format!("< {} >", security_label(self.smtp_security)),
+                    Field::SignIn => format!("< {} >", crate::i18n::t(self.sign_in.label())),
+                    Field::ImapSecurity => {
+                        format!("< {} >", crate::i18n::t(security_label(self.imap_security)))
+                    }
+                    Field::SmtpSecurity => {
+                        format!("< {} >", crate::i18n::t(security_label(self.smtp_security)))
+                    }
                     Field::MakeDefault => if self.make_default { "[x]" } else { "[ ]" }.into(),
                     Field::Remember => if self.remember { "[x]" } else { "[ ]" }.into(),
                     _ if field.secret() && !self.reveal => {
@@ -709,7 +713,7 @@ impl Form {
             theme::muted()
         };
         frame.render_widget(
-            Paragraph::new(message)
+            Paragraph::new(crate::i18n::t(&message))
                 .style(style)
                 .wrap(Wrap { trim: false }),
             rows[2],
@@ -722,7 +726,7 @@ impl Form {
             "tab  Move · space/←→  Change choice · ctrl+s  Save and connect\nctrl+f  Find servers · ctrl+r  Show passwords · esc  Cancel"
         };
         frame.render_widget(
-            Paragraph::new(actions)
+            Paragraph::new(crate::i18n::t(actions))
                 .style(theme::muted())
                 .wrap(Wrap { trim: false }),
             rows[3],
