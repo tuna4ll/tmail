@@ -243,6 +243,33 @@ impl Body {
                     }
                 }
             }
+        } else if crate::patch::has_diff(&self.text) {
+            let mut in_diff = false;
+            for line in self.text.lines() {
+                in_diff |= line.starts_with("diff --git ") || line.starts_with("--- a/");
+                let style = if !in_diff {
+                    theme::text()
+                } else if line.starts_with("diff --git ") || line.starts_with("index ") {
+                    theme::title(true)
+                } else if line.starts_with("+++ ") || line.starts_with("--- ") {
+                    theme::text().add_modifier(ratatui::style::Modifier::BOLD)
+                } else if line.starts_with("@@") {
+                    Style::default().fg(theme::accent())
+                } else if line.starts_with('+') {
+                    Style::default().fg(theme::success_color())
+                } else if line.starts_with('-') {
+                    Style::default().fg(theme::error_color())
+                } else {
+                    theme::text()
+                };
+                // A trailing "-- " starts the signature, after the last hunk.
+                if line == "-- " {
+                    in_diff = false;
+                }
+                layout
+                    .lines
+                    .extend(wrap(Line::styled(line.to_owned(), style), width));
+            }
         } else {
             for line in self.text.lines() {
                 layout

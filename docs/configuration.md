@@ -382,6 +382,22 @@ Dates can be a day (`2026-03-14`), a month (`2026-03`), `today`, `yesterday`, or
 
 termail only downloads the newest messages of each folder. Press `ctrl+r` while searching to run the same search on the server, so older matches are downloaded too.
 
+## Patches: `[patch]`
+
+termail understands patches sent by mail, the way Git and the Linux kernel work. When a message is part of a series such as `[PATCH v3 2/5]`, the reader says so and colours the diff. With a message of the series selected:
+
+- `:patch apply` applies the whole series with `git am`, in order, using the newest version found in the conversation. It tells you when a part is missing. If `git am` stops on a conflict, finish it in the repository with `git am --continue` or `git am --abort`. `:patch apply ~/src/project` picks another repository for one time.
+- `:patch save` writes the series as an mbox file to your download folder.
+- `:patch b4` hands the message to [b4](https://b4.docs.kernel.org), which fetches the newest version of the series with its review tags and applies it.
+
+`:lore ID` opens a whole thread from lore.kernel.org, by Message-ID or by a link to it. The thread opens as a mailbox of its own, so nothing is copied to your account or its server; press `p` to go back. You can reply and review from there as usual.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `repo` | the folder termail started in | The repository patches go into. |
+| `am_args` | `["-3"]` | Arguments for `git am`, such as `["-3", "--signoff"]`. |
+| `archive` | `https://lore.kernel.org/all` | The public-inbox archive `:lore` reads from. |
+
 ## Shell completions and the manual
 
 termail can print completions for your shell and a manual page:

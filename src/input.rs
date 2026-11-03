@@ -805,6 +805,19 @@ impl App {
             "forward" => self.start_draft(draft::Start::Forward),
             "help" => self.overlay = Some(Overlay::Help { scroll: 0 }),
             "quit" => self.quit(),
+            "patch apply" | "patch" => self.apply_patches(""),
+            "patch save" => self.save_patches(),
+            "patch b4" => self.b4_patches(""),
+            _ if command.starts_with("patch apply ") => {
+                self.apply_patches(command.trim_start_matches("patch apply "))
+            }
+            _ if command.starts_with("patch b4 ") => {
+                self.b4_patches(command.trim_start_matches("patch b4 "))
+            }
+            "lore" => self.open_lore(""),
+            _ if command.starts_with("lore ") => {
+                self.open_lore(command.trim_start_matches("lore "))
+            }
             _ if command.starts_with("open maildir ") => {
                 let path = command.trim_start_matches("open maildir ").trim();
                 if path.is_empty() {

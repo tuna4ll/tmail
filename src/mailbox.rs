@@ -670,7 +670,7 @@ pub fn change_local_folder(
     }
 }
 
-fn cache_dir() -> Option<PathBuf> {
+pub(crate) fn cache_dir() -> Option<PathBuf> {
     if cfg!(test) {
         return Some(std::env::temp_dir().join("termail-test-cache"));
     }

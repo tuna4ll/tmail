@@ -24,6 +24,7 @@ mod message;
 mod mouse;
 mod oauth;
 mod outbox;
+mod patch;
 mod remote;
 mod script;
 mod search;
@@ -289,6 +290,8 @@ enum Task {
     },
     /// Background work that had nothing to report.
     Nothing,
+    /// Shows a Maildir that was just prepared, such as a thread from an archive.
+    OpenMaildir { path: PathBuf, message: String },
     /// Shows a message and optionally reloads the mailbox.
     Done { message: String, reload: bool },
     /// A signed message was checked.
@@ -818,6 +821,15 @@ impl App {
                 }
             }
             Task::Nothing => {}
+            Task::OpenMaildir { path, message } => {
+                self.source = MailboxSource::Maildir(path);
+                self.filter = InboxFilter::All;
+                self.query.clear();
+                self.undo = None;
+                self.mailbox_fingerprint = 0;
+                self.reload();
+                self.notice = Some(message);
+            }
             Task::Done { message, reload } => {
                 self.notice = Some(message);
                 if reload {

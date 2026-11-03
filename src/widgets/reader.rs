@@ -442,6 +442,29 @@ impl Reader {
                 ]),
             );
         }
+        if let Some(position) = crate::patch::position(&mail.subject)
+            .filter(|position| position.index > 0 && crate::patch::has_diff(&mail.body))
+        {
+            let files = lines.len() - mail.attachments.len();
+            let version = if position.version > 1 {
+                format!(" · v{}", position.version)
+            } else {
+                String::new()
+            };
+            lines.insert(
+                files,
+                Line::from(vec![
+                    Span::styled(format!("{:<8}", "patch"), theme::muted()),
+                    Span::styled(
+                        format!(
+                            "{} of {}{version} · :patch apply · :patch save · :patch b4",
+                            position.index, position.total
+                        ),
+                        theme::muted(),
+                    ),
+                ]),
+            );
+        }
         if let Some(text) = privacy {
             let files = lines.len() - mail.attachments.len();
             lines.insert(

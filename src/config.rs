@@ -32,6 +32,7 @@ pub struct Config {
     pub ui: crate::settings::UiConfig,
     pub compose: crate::settings::ComposeConfig,
     pub reader: crate::settings::ReaderConfig,
+    pub patch: crate::patch::PatchConfig,
     #[serde(skip)]
     pub(crate) active_account: Option<String>,
     #[serde(skip)]
