@@ -148,11 +148,6 @@ impl Conversation {
     pub fn is_starred(&self, mails: &[Mail]) -> bool {
         self.mails(mails).iter().any(|mail| mail.starred)
     }
-
-    pub fn matches(&self, mails: &[Mail], query: &str) -> bool {
-        let query = query.to_lowercase();
-        self.mails(mails).iter().any(|mail| mail.matches(&query))
-    }
 }
 
 #[cfg(test)]

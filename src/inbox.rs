@@ -105,6 +105,7 @@ impl App {
             self.load_trusted_images(mail_id);
             self.emit_mail_event("open", mail_id);
             self.open_protected(mail_id);
+            self.import_autocrypt(mail_id);
         }
     }
 
@@ -124,6 +125,34 @@ impl App {
         if blocked {
             self.load_remote_images();
         }
+    }
+
+    /// Saves the key a sender attached with Autocrypt, in the background.
+    fn import_autocrypt(&mut self, mail_id: &str) {
+        if !self.config.crypto.autocrypt {
+            return;
+        }
+        let Some(path) = self
+            .mails
+            .iter()
+            .find(|mail| mail.id == mail_id)
+            .and_then(|mail| mail.source_path.clone())
+        else {
+            return;
+        };
+        let crypto = self.config.crypto.clone();
+        self.spawn_task(move || {
+            let message = fs::read(&path)
+                .ok()
+                .and_then(|contents| crypto::import_autocrypt(&contents, &crypto));
+            match message {
+                Some(message) => Task::Done {
+                    message,
+                    reload: false,
+                },
+                None => Task::Nothing,
+            }
+        });
     }
 
     /// Decrypts or verifies a protected message for the reader. Decryption may ask for
@@ -168,6 +197,15 @@ impl App {
                 Err(error) => reader.set_security(format!("⚠ {error}")),
             }
             self.clear_screen = true;
+        }
+        // An encrypted message may carry its real subject inside.
+        if let Ok((content, _)) = &result
+            && let Some(subject) = crypto::subject_of(content)
+            && let Some(mail) = self.mails.iter_mut().find(|mail| mail.id == mail_id)
+            && mail.subject != subject
+        {
+            mail.subject = subject;
+            self.rebuild_mailbox(Some(&mail_id));
         }
         self.opened.insert(mail_id, result);
     }
@@ -234,6 +272,13 @@ impl App {
                     self.mails.iter().map(|mail| mail.id.clone()).collect();
                 self.mails = report.mails;
                 self.folders = report.folders;
+                for mail in &mut self.mails {
+                    if let Some(Ok((content, _))) = self.opened.get(&mail.id)
+                        && let Some(subject) = crypto::subject_of(content)
+                    {
+                        mail.subject = subject;
+                    }
+                }
                 // The address book comes first, then everyone mail was exchanged with.
                 let mut contacts: Vec<String> = self
                     .address_book
@@ -300,6 +345,7 @@ impl App {
     }
 
     pub(crate) fn rebuild_mailbox(&mut self, mail_id: Option<&str>) {
+        self.search_cache.get_mut().clear();
         // Threads draw on every folder except the bins and queues, so the map shows
         // replies from Sent next to the Inbox messages they answer.
         // `in:all` searches every folder, bins included.
@@ -360,6 +406,13 @@ impl App {
     }
 
     pub(crate) fn visible_conversations(&self) -> Vec<usize> {
+        let query = self.query.to_lowercase();
+        let mut cache = self.search_cache.borrow_mut();
+        let candidates = if query.trim().is_empty() {
+            None
+        } else {
+            cache.candidates(&self.mails, &query)
+        };
         self.conversations
             .iter()
             .enumerate()
@@ -368,7 +421,15 @@ impl App {
                 InboxFilter::Unread => conversation.is_unread(&self.mails),
                 InboxFilter::Starred => conversation.is_starred(&self.mails),
             })
-            .filter(|(_, conversation)| conversation.matches(&self.mails, &self.query))
+            .filter(|(_, conversation)| {
+                conversation.positions.iter().any(|&position| {
+                    candidates.is_none_or(|found| found.contains(&(position as u32)))
+                        && self
+                            .mails
+                            .get(position)
+                            .is_some_and(|mail| mail.matches(&query))
+                })
+            })
             .map(|(index, _)| index)
             .collect()
     }

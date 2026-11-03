@@ -13,7 +13,7 @@ use mail_parser::MimeHeaders;
 use serde::Deserialize;
 
 /// The `[crypto]` table.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CryptoConfig {
     /// The OpenPGP program; `gpg` when unset.
@@ -30,6 +30,27 @@ pub struct CryptoConfig {
     pub smime: bool,
     /// A GnuPG home folder other than the default, passed as `--homedir`.
     pub home: Option<PathBuf>,
+    /// Sends the public key in an `Autocrypt` header and imports the keys others send.
+    pub autocrypt: bool,
+    /// Looks up missing recipient keys at the recipient's domain (Web Key Directory)
+    /// before encrypting.
+    pub wkd: bool,
+}
+
+impl Default for CryptoConfig {
+    fn default() -> Self {
+        Self {
+            gpg: None,
+            gpgsm: None,
+            key: None,
+            sign: false,
+            encrypt: false,
+            smime: false,
+            home: None,
+            autocrypt: false,
+            wkd: true,
+        }
+    }
 }
 
 impl CryptoConfig {
@@ -201,10 +222,7 @@ pub fn open(contents: &[u8], kind: Kind, config: &CryptoConfig) -> Result<Opened
             if let Some(inner_kind) = inner_kind {
                 let verified = open(&inner, inner_kind, config)?;
                 report.signature = Some(verified.status);
-                inner = split(&verified.content).1.to_vec();
-                let mut joined = content_headers_of(&verified.content);
-                joined.extend_from_slice(&inner);
-                inner = joined;
+                inner = verified.content;
             }
             Ok(Opened {
                 content: join(headers, &inner),
@@ -305,10 +323,27 @@ pub fn protect(
     }
     let envelope = crate::message::envelope(contents)?;
     let (headers, body) = split(contents);
-    let mut entity = content_headers_of(contents);
+    let mut entity = if protection.encrypt {
+        protected_headers_of(contents)
+    } else {
+        content_headers_of(contents)
+    };
     entity.extend_from_slice(body);
     let entity = canonical(&entity);
-    let outer = strip_content_headers(headers);
+    let mut outer = strip_content_headers(headers);
+    if protection.encrypt {
+        // The real subject travels inside the encryption (protected headers v1).
+        outer = fields(&outer)
+            .into_iter()
+            .flat_map(|(name, field)| {
+                if name == "subject" {
+                    b"Subject: ...\r\n".to_vec()
+                } else {
+                    field
+                }
+            })
+            .collect();
+    }
     let signer = config.key.clone().unwrap_or_else(|| envelope.from.clone());
     let boundary = format!("termail-{}", crate::storage::unique_name("part"));
     let standard = protection.standard;
@@ -337,6 +372,9 @@ pub fn protect(
             message.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         }
         (Standard::OpenPgp, true) => {
+            if config.wkd {
+                locate_keys(config, &recipients);
+            }
             let mut arguments = vec!["--armor".to_owned(), "--encrypt".to_owned()];
             if protection.sign {
                 arguments.extend([
@@ -622,10 +660,166 @@ fn content_headers_of(contents: &[u8]) -> Vec<u8> {
     output
 }
 
+/// The outer headers with the entity put in. Headers the entity carries itself, such as
+/// a protected subject, replace the outer ones.
 fn join(headers: &[u8], entity: &[u8]) -> Vec<u8> {
-    let mut content = strip_content_headers(headers);
+    let inner: Vec<String> = fields(split(entity).0)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| !is_content_field(name) && !name.is_empty())
+        .collect();
+    let mut content: Vec<u8> = fields(&strip_content_headers(headers))
+        .into_iter()
+        .filter(|(name, _)| !inner.contains(name))
+        .flat_map(|(_, field)| field)
+        .collect();
     content.extend_from_slice(entity);
     content
+}
+
+/// The content headers plus copies of the headers people read, marked so the receiving
+/// client shows these instead of the outer ones.
+fn protected_headers_of(contents: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut typed = false;
+    for (name, field) in fields(split(contents).0) {
+        if name == "content-type" {
+            let text = String::from_utf8_lossy(&field);
+            output.extend_from_slice(
+                format!("{}; protected-headers=\"v1\"\r\n", text.trim_end()).as_bytes(),
+            );
+            typed = true;
+        } else if name.starts_with("content-")
+            || [
+                "subject",
+                "from",
+                "to",
+                "cc",
+                "date",
+                "message-id",
+                "reply-to",
+            ]
+            .contains(&name.as_str())
+        {
+            output.extend_from_slice(&field);
+        }
+    }
+    if !typed {
+        output.extend_from_slice(
+            b"Content-Type: text/plain; charset=utf-8; protected-headers=\"v1\"\r\n",
+        );
+    }
+    output.extend_from_slice(b"\r\n");
+    output
+}
+
+/// Fetches keys of recipients missing from the keyring from their domain's Web Key
+/// Directory. Failures are left for the encryption step to report.
+fn locate_keys(config: &CryptoConfig, addresses: &[String]) {
+    let mut command = Command::new(config.program(Standard::OpenPgp));
+    if let Some(home) = &config.home {
+        command.arg("--homedir").arg(home);
+    }
+    let Ok(mut child) = command
+        .args([
+            "--batch",
+            "--no-tty",
+            "--auto-key-locate",
+            "local,wkd",
+            "--locate-keys",
+        ])
+        .args(addresses)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    // A slow or unreachable domain must not hold the message back for long.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The `Autocrypt` header (autocrypt.org, level 1) with the public key of `address`,
+/// or `None` when the keyring has no key for it.
+pub fn autocrypt_header(config: &CryptoConfig, address: &str) -> Option<String> {
+    let selector = config.key.clone().unwrap_or_else(|| format!("<{address}>"));
+    let (key, _) = run(
+        config,
+        Standard::OpenPgp,
+        &["--export", "--export-options", "export-minimal", &selector],
+        &[],
+        &[],
+    )
+    .ok()?;
+    if key.is_empty() {
+        return None;
+    }
+    let prefer = if config.encrypt {
+        " prefer-encrypt=mutual;"
+    } else {
+        ""
+    };
+    let data = wrap_base64(&key).replace("\r\n", "\r\n ");
+    Some(format!(
+        "Autocrypt: addr={address};{prefer} keydata=\r\n {data}\r\n"
+    ))
+}
+
+/// Imports the key a message carries in its `Autocrypt` header when the header
+/// belongs to the sender. Returns a line for the user when a new key arrived.
+pub fn import_autocrypt(contents: &[u8], config: &CryptoConfig) -> Option<String> {
+    let headers = split(contents).0;
+    let found: Vec<String> = fields(headers)
+        .into_iter()
+        .filter(|(name, _)| name == "autocrypt")
+        .map(|(_, field)| String::from_utf8_lossy(&field).into_owned())
+        .collect();
+    // The standard says to ignore a message with more than one.
+    let [field] = found.as_slice() else {
+        return None;
+    };
+    let value = field.split_once(':')?.1;
+    let mut address = None;
+    let mut keydata = None;
+    for attribute in value.split(';') {
+        let Some((name, value)) = attribute.split_once('=') else {
+            continue;
+        };
+        match name.trim() {
+            "addr" => address = Some(value.trim().to_lowercase()),
+            "keydata" => keydata = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+    let from = crate::mail::email_of(&header_value(headers, "from")?);
+    if address? != from {
+        return None;
+    }
+    let key = decode_base64(keydata?.as_bytes())?;
+    let (_, status) = run(config, Standard::OpenPgp, &["--import"], &key, &[]).ok()?;
+    // IMPORT_OK 0 means the key was already known and nothing changed.
+    status
+        .lines()
+        .filter_map(|line| line.strip_prefix("[GNUPG:] IMPORT_OK "))
+        .any(|rest| !rest.starts_with("0 "))
+        .then(|| format!("Saved the OpenPGP key {from} sent (Autocrypt)."))
+}
+
+/// The subject of an opened message, which may be the protected one.
+pub fn subject_of(content: &[u8]) -> Option<String> {
+    mail_parser::MessageParser::default()
+        .parse(content)?
+        .subject()
+        .map(str::to_owned)
 }
 
 fn header_value(headers: &[u8], name: &str) -> Option<String> {
@@ -801,6 +995,7 @@ mod tests {
         Some((
             CryptoConfig {
                 home: Some(home.clone()),
+                wkd: false,
                 ..CryptoConfig::default()
             },
             home,
@@ -846,6 +1041,52 @@ mod tests {
         assert_eq!(status, "encrypted · not signed");
         let (_, status) = roundtrip(&config, true, true);
         assert!(status.starts_with("encrypted · signed by Ada"), "{status}");
+        // The subject hides behind "..." outside and comes back on opening.
+        let encrypted = protect(
+            &message(),
+            Protection {
+                sign: false,
+                encrypt: true,
+                standard: Standard::OpenPgp,
+            },
+            &config,
+        )
+        .unwrap();
+        let outside = mail_parser::MessageParser::default()
+            .parse(&encrypted)
+            .unwrap();
+        assert_eq!(outside.subject(), Some("..."));
+        let opened = open(&encrypted, Kind::PgpEncrypted, &config).unwrap();
+        assert_eq!(subject_of(&opened.content).as_deref(), Some("hi"));
+        // Autocrypt: the header carries the key and a fresh keyring takes it.
+        let header = autocrypt_header(&config, "ada@example.test").unwrap();
+        assert!(header.starts_with("Autocrypt: addr=ada@example.test; keydata=\r\n "));
+        let mut sent = header.into_bytes();
+        sent.extend_from_slice(&message());
+        let other = std::env::temp_dir().join(crate::storage::unique_name("termail-gnupg"));
+        std::fs::create_dir_all(&other).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let receiver = CryptoConfig {
+            home: Some(other.clone()),
+            ..config.clone()
+        };
+        assert!(import_autocrypt(&sent, &receiver).is_some());
+        assert!(
+            import_autocrypt(&sent, &receiver).is_none(),
+            "known keys stay quiet"
+        );
+        let forged = String::from_utf8_lossy(&sent).replace("From: Ada <ada@", "From: Eve <eve@");
+        assert!(import_autocrypt(forged.as_bytes(), &receiver).is_none());
+        let _ = Command::new("gpgconf")
+            .arg("--homedir")
+            .arg(&other)
+            .args(["--kill", "gpg-agent"])
+            .status();
+        let _ = std::fs::remove_dir_all(other);
         let signed = protect(
             &message(),
             Protection {

@@ -23,6 +23,7 @@ mod oauth;
 mod outbox;
 mod remote;
 mod script;
+mod search;
 mod sender;
 mod settings;
 mod storage;
@@ -202,6 +203,7 @@ pub struct App {
     spinner_tick: u64,
     skipped: usize,
     query: String,
+    search_cache: std::cell::RefCell<search::Cache>,
     searching: bool,
     filter: InboxFilter,
     undo: Option<UndoAction>,
@@ -268,6 +270,8 @@ enum Task {
         /// Records the value instead of comparing it, after the app changed files itself.
         baseline: bool,
     },
+    /// Background work that had nothing to report.
+    Nothing,
     /// Shows a message and optionally reloads the mailbox.
     Done { message: String, reload: bool },
     /// A signed message was checked.
@@ -620,6 +624,7 @@ impl App {
             spinner_tick: 0,
             skipped: 0,
             query: String::new(),
+            search_cache: Default::default(),
             searching: false,
             filter: match settings::with(|ui| ui.start_filter.clone()).as_str() {
                 "unread" => InboxFilter::Unread,
@@ -789,6 +794,7 @@ impl App {
                     self.reload();
                 }
             }
+            Task::Nothing => {}
             Task::Done { message, reload } => {
                 self.notice = Some(message);
                 if reload {

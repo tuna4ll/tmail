@@ -464,6 +464,11 @@ impl App {
                 return;
             }
         };
+        let contents = if send && self.config.crypto.autocrypt {
+            with_autocrypt(contents, &self.config.crypto)
+        } else {
+            contents
+        };
         if send && state.protection.is_active() {
             // Signing may ask for a passphrase, so it runs with the terminal restored.
             self.pending_terminal = Some(TerminalJob::Protect {
@@ -549,4 +554,18 @@ impl App {
             self.refresh_fingerprint();
         }
     }
+}
+
+/// Puts the sender's public key in front of the message, so their mail client can
+/// encrypt replies.
+fn with_autocrypt(contents: Vec<u8>, crypto: &crypto::CryptoConfig) -> Vec<u8> {
+    let Some(header) = crate::message::envelope(&contents)
+        .ok()
+        .and_then(|envelope| crypto::autocrypt_header(crypto, &envelope.from))
+    else {
+        return contents;
+    };
+    let mut message = header.into_bytes();
+    message.extend_from_slice(&contents);
+    message
 }
