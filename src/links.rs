@@ -58,6 +58,15 @@ pub fn assess(url: &str, shown: &str, clean: bool) -> Assessment {
     if clean {
         assessment.url = parts.without_tracking();
     }
+    // A click counter that names where it sends you is skipped, and judged by that.
+    if clean
+        && let Some(destination) = crate::trackers::destination(url)
+        && let Some(inner) = Parts::parse(&destination)
+    {
+        let mut inner_assessment = assess(&destination, shown, clean);
+        inner_assessment.url = inner.without_tracking();
+        return inner_assessment;
+    }
     let host = parts.host.to_ascii_lowercase();
     if parts.userinfo {
         assessment.warnings.push(format!(

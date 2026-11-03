@@ -50,10 +50,12 @@ impl App {
             .and_then(|_| fresh.ui.validate())
             .and_then(|_| fresh.reader.validate())
             .and_then(|_| {
-                ["plain", "html"]
+                ["plain", "html", "markdown"]
                     .contains(&fresh.compose.format.as_str())
                     .then_some(())
-                    .ok_or_else(|| "compose.format must be \"plain\" or \"html\".".to_owned())
+                    .ok_or_else(|| {
+                        "compose.format must be \"plain\", \"html\" or \"markdown\".".to_owned()
+                    })
             })
             .and_then(|_| keymap::Keymap::from_config(&fresh.keys))
             .and_then(|keymap| {

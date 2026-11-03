@@ -24,6 +24,8 @@ pub struct Summary {
 pub enum MessageFormat {
     Plain,
     Html,
+    /// Written in Markdown, sent as HTML with the Markdown as the plain-text part.
+    Markdown,
 }
 
 impl MessageFormat {
@@ -31,6 +33,7 @@ impl MessageFormat {
         match self {
             Self::Plain => "Plain text",
             Self::Html => "HTML",
+            Self::Markdown => "Markdown",
         }
     }
 
@@ -38,13 +41,15 @@ impl MessageFormat {
         match self {
             Self::Plain => "text/plain",
             Self::Html => "text/html",
+            Self::Markdown => "text/markdown",
         }
     }
 
     pub fn toggle(&mut self) {
         *self = match self {
             Self::Plain => Self::Html,
-            Self::Html => Self::Plain,
+            Self::Html => Self::Markdown,
+            Self::Markdown => Self::Plain,
         };
     }
 }
@@ -173,10 +178,10 @@ impl Composer {
             bcc: String::new(),
             subject,
             attachments: String::new(),
-            format: if compose.format == "html" {
-                MessageFormat::Html
-            } else {
-                MessageFormat::Plain
+            format: match compose.format.as_str() {
+                "html" => MessageFormat::Html,
+                "markdown" => MessageFormat::Markdown,
+                _ => MessageFormat::Plain,
             },
             body_path,
             original_draft: None,
@@ -261,7 +266,13 @@ impl Composer {
         if let Some(id) = parsed.message_id() {
             composer.message_id = id.into();
         }
-        let body = if parsed
+        let markdown = parsed
+            .header_raw("X-Termail-Format")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("markdown"));
+        let body = if markdown {
+            composer.format = MessageFormat::Markdown;
+            parsed.body_text(0)
+        } else if parsed
             .html_part(0)
             .is_some_and(|part| matches!(part.body, mail_parser::PartType::Html(_)))
         {
@@ -553,8 +564,16 @@ fn inspect_message(
         format: header_values(headers, "content-type")
             .into_iter()
             .next()
-            .filter(|value| value.to_ascii_lowercase().starts_with("text/html"))
-            .map(|_| MessageFormat::Html)
+            .map(|value| value.to_ascii_lowercase())
+            .map(|value| {
+                if value.starts_with("text/html") {
+                    MessageFormat::Html
+                } else if value.starts_with("text/markdown") {
+                    MessageFormat::Markdown
+                } else {
+                    MessageFormat::Plain
+                }
+            })
             .unwrap_or(MessageFormat::Plain),
         attachments,
         warnings: Vec::new(),
@@ -614,6 +633,14 @@ fn prepare_message(
     builder = match summary.format {
         MessageFormat::Plain => builder.text_body(body),
         MessageFormat::Html => builder.html_body(body),
+        // Drafts keep the Markdown alone, so they open again as Markdown.
+        MessageFormat::Markdown if !require_recipient => builder
+            .header("X-Termail-Format", Text::new("markdown"))
+            .text_body(body),
+        MessageFormat::Markdown => {
+            let html = crate::markdown::to_html(&body).replace('\n', "\r\n");
+            builder.text_body(body).html_body(html)
+        }
     };
     // An invitation reply travels as text/calendar with its method, which calendar
     // servers read to update the organizer's copy.

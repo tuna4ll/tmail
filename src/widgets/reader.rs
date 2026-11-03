@@ -411,6 +411,7 @@ impl Reader {
     fn layout(&mut self, mail: &Mail, width: u16, picker: Option<&Picker>) -> Laid {
         let body = self.body(mail);
         let blocked = body.has_blocked();
+        let privacy = crate::trackers::summary(&body.trackers, &mail.links);
         let mut lines = header_lines(mail, blocked);
         if let Some(kind) = mail.security {
             let status = self.security.clone().unwrap_or_else(|| {
@@ -438,6 +439,16 @@ impl Reader {
                         status,
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
                     ),
+                ]),
+            );
+        }
+        if let Some(text) = privacy {
+            let files = lines.len() - mail.attachments.len();
+            lines.insert(
+                files,
+                Line::from(vec![
+                    Span::styled(format!("{:<8}", "privacy"), theme::muted()),
+                    Span::styled(format!("🛡 {text}"), theme::muted()),
                 ]),
             );
         }

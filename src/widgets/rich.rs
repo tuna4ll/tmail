@@ -114,6 +114,8 @@ pub struct Body {
     pub original_colors: bool,
     /// The parsed HTML, kept so a new width does not parse it again.
     document: Option<super::html::Document>,
+    /// Addresses of the tracking pictures that were left out.
+    pub trackers: Vec<String>,
 }
 
 impl Body {
@@ -146,7 +148,7 @@ impl Body {
         };
         let mut referenced = Vec::new();
         if let Some(html) = message.body_html(0) {
-            let (html, slots) = place_images(&html, |id| {
+            let (html, slots, pixels) = place_images(&html, |id| {
                 message.parts.iter().enumerate().find_map(|(index, part)| {
                     (part.content_id().map(clean_id) == Some(id)).then(|| {
                         referenced.push(index);
@@ -156,6 +158,7 @@ impl Body {
             });
             body.html = Some(html);
             body.slots = slots;
+            body.trackers = pixels;
         }
         for (index, part) in message.parts.iter().enumerate() {
             let is_image = part
@@ -509,15 +512,16 @@ fn clean_id(value: &str) -> &str {
 fn place_images(
     html: &str,
     mut inline: impl FnMut(&str) -> Option<Vec<u8>>,
-) -> (String, Vec<Slot>) {
+) -> (String, Vec<Slot>, Vec<String>) {
     let mut output = String::with_capacity(html.len());
     let mut slots = Vec::new();
+    let mut pixels = Vec::new();
     let mut rest = html;
     while let Some(start) = find_tag(rest, "img") {
         output.push_str(&rest[..start]);
         let Some(length) = tag_length(&rest[start..]) else {
             output.push_str(&rest[start..]);
-            return (output, slots);
+            return (output, slots, pixels);
         };
         let attributes = attributes(&rest[start + 4..start + length - 1]);
         let attribute = |name: &str| {
@@ -533,7 +537,19 @@ fn place_images(
         });
         let alt = attribute("alt").unwrap_or_default().to_owned();
         let src = attribute("src").unwrap_or_default().trim();
-        let picture = if tiny {
+        let remote = src.starts_with("https://") || src.starts_with("http://");
+        // Pictures that only report the opening are never fetched, not even with I.
+        let tracker = remote
+            && crate::trackers::is_pixel(
+                src,
+                attribute("width"),
+                attribute("height"),
+                attribute("style").unwrap_or_default(),
+            );
+        if tracker {
+            pixels.push(src.to_owned());
+        }
+        let picture = if tiny || tracker {
             None
         } else if let Some(id) = src.strip_prefix("cid:") {
             inline(clean_id(id)).map(Picture::Bytes)
@@ -568,7 +584,7 @@ fn place_images(
                 slot.height_px = pixels("height");
                 slots.push(slot);
             }
-            None if !tiny && !alt.trim().is_empty() => {
+            None if !tiny && !tracker && !alt.trim().is_empty() => {
                 output.push('[');
                 output.push_str(&escape(&alt));
                 output.push(']');
@@ -578,7 +594,7 @@ fn place_images(
         rest = &rest[start + length..];
     }
     output.push_str(rest);
-    (output, slots)
+    (output, slots, pixels)
 }
 
 /// Finds the next `<name` opening tag, case-insensitively.
@@ -730,7 +746,7 @@ mod tests {
     fn replaces_images_and_drops_tracking_pixels() {
         let html = r#"<p>Hi<IMG src="cid:logo@x" alt='Logo'><img src="https://t.example/p.gif" width="1" height="1"><img
             alt="Chart &amp; data" src="https://example.test/c.png"/><img src="file:///etc/x" alt="local"></p>"#;
-        let (output, slots) = place_images(html, |id| (id == "logo@x").then(|| vec![1, 2, 3]));
+        let (output, slots, _) = place_images(html, |id| (id == "logo@x").then(|| vec![1, 2, 3]));
         assert_eq!(slots.len(), 2);
         assert_eq!(slots[0].alt, "Logo");
         assert!(matches!(slots[0].picture, Picture::Bytes(ref bytes) if bytes == &[1, 2, 3]));

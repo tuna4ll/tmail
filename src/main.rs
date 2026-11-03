@@ -19,6 +19,7 @@ mod links;
 mod log;
 mod mail;
 mod mailbox;
+mod markdown;
 mod message;
 mod mouse;
 mod oauth;
@@ -31,6 +32,7 @@ mod settings;
 mod storage;
 mod terminal;
 mod theme;
+mod trackers;
 mod widgets;
 
 mod accounts;

@@ -217,8 +217,8 @@ static COMPOSE: RwLock<Option<ComposeConfig>> = RwLock::new(None);
 static READER: RwLock<Option<ReaderConfig>> = RwLock::new(None);
 
 pub fn init_compose(config: ComposeConfig) -> Result<(), String> {
-    if !["plain", "html"].contains(&config.format.as_str()) {
-        return Err("compose.format must be \"plain\" or \"html\".".into());
+    if !["plain", "html", "markdown"].contains(&config.format.as_str()) {
+        return Err("compose.format must be \"plain\", \"html\" or \"markdown\".".into());
     }
     if let Ok(mut compose) = COMPOSE.write() {
         *compose = Some(config);

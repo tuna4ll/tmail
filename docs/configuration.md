@@ -270,7 +270,7 @@ termail also follows the [NO_COLOR](https://no-color.org) convention: when the `
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `format` | `plain` | `plain` or `html` for new messages. You can switch per message. |
+| `format` | `plain` | `plain`, `html` or `markdown` for new messages. You can switch per message with space on the Format line. |
 | `reply_prefix` | `Re: ` | Put in front of the subject of replies. |
 | `forward_prefix` | `Fwd: ` | Put in front of the subject of forwards. |
 | `attribution` | `On {date}, {from} wrote:` | The line above quoted text. |
@@ -278,6 +278,10 @@ termail also follows the [NO_COLOR](https://no-color.org) convention: when the `
 | `large_attachment_mb` | `18` | Warn before sending more than this in attachments. |
 
 A German setup might use `reply_prefix = "AW: "` and `attribution = "{from} schrieb am {date}:"`.
+
+### Writing in Markdown
+
+With the Markdown format you write the body in Markdown and termail sends two versions: an HTML one with headings, lists, tables, task lists, links and quotes laid out properly, and your Markdown text for people who read plain text. Code in a fenced block that names its language, such as ` ```rust `, is coloured. A line break you type stays a line break, as in chat apps, and the signature after `-- ` is left as you wrote it. Drafts keep the Markdown, so they open the same way again.
 
 ## Reading mail: `[reader]`
 
@@ -304,6 +308,10 @@ Remote images are blocked until you press `I`, because they tell the sender when
 Your mail server checks whether a message really comes from the domain it claims (DKIM, SPF and DMARC) and writes down the result. termail shows that result under the sender in the reader. When the check failed, or when the sender's name shows a different address than the one the mail comes from, the reader says so and the conversation gets a `⚠` in the list.
 
 Before a link opens, termail looks at where it really goes. It asks you first when the link text shows one site but leads to another, when the address hides its destination behind an `@`, points at a bare IP address, uses look-alike characters, or is not encrypted. Press `o` to open it anyway, `y` to copy it, or `esc` to leave it. Links that aren't web or mail links, such as `javascript:`, never open.
+
+### Trackers
+
+Many newsletters hide a tiny picture that tells the sender when, where and on which device you opened the message, and send every link through a click counter. termail finds these pictures by their size, by being hidden, or by belonging to a known tracking service such as Mailchimp, HubSpot, SendGrid or Mailtrack, and never loads them, not even when you press `I`. The reader shows what it blocked and which services were involved, under "privacy". When a counted link carries its real destination in the address, termail opens that destination directly, so the click is not counted.
 
 ### Meeting invitations
 
