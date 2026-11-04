@@ -56,9 +56,17 @@ fn connect_with_tls(
     if starttls {
         start_tls(&mut stream)?;
     }
-    let stream = tls
-        .connect(&remote.imap_host, stream)
-        .map_err(|error| tls_failure("IMAP", &remote.imap_host, &error.to_string()))?;
+    let stream = tls.connect(&remote.imap_host, stream).map_err(|error| {
+        tls_failure("IMAP", &remote.imap_host, &error.to_string(), || {
+            crate::certs::fetch(
+                &remote.imap_host,
+                remote.imap_port,
+                crate::certs::Protocol::Imap,
+                starttls,
+            )
+            .is_ok()
+        })
+    })?;
     let mut client = imap::Client::new(stream);
     if !starttls {
         client
@@ -134,8 +142,16 @@ fn start_tls(stream: &mut TcpStream) -> Result<(), String> {
 }
 
 /// A TLS failure, telling an untrusted certificate apart from other problems so the
-/// user can be offered to trust it.
-pub fn tls_failure(protocol: &str, host: &str, detail: &str) -> RemoteError {
+/// user can be offered to trust it. Some TLS libraries, such as Windows' Schannel,
+/// describe a certificate they reject in vague words; `retried` makes a handshake
+/// without checking the certificate, so when that one succeeds, the certificate was
+/// the problem.
+pub fn tls_failure(
+    protocol: &str,
+    host: &str,
+    detail: &str,
+    retried: impl FnOnce() -> bool,
+) -> RemoteError {
     crate::log::write(
         "error",
         format_args!("{protocol} TLS with {host}: {detail}"),
@@ -145,6 +161,7 @@ pub fn tls_failure(protocol: &str, host: &str, detail: &str) -> RemoteError {
         || lower.contains("self signed")
         || lower.contains("self-signed")
         || lower.contains("issuer")
+        || retried()
     {
         RemoteError::certificate(format!(
             "{host} uses a certificate this computer does not trust."
@@ -2206,7 +2223,6 @@ mod tests {
             1,
             "the read message is in the new folder on the server"
         );
-        let _ = session.close();
         // GreenMail starts with only an inbox; real servers come with a Sent folder.
         let _ = session.create("Sent");
         let _ = session.logout();

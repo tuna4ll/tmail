@@ -101,7 +101,7 @@ jobs:
           chmod 644 certs/*
           docker run -d --name greenmail -p 3993:3993 -p 3465:3465 -v "$PWD/certs:/certs" \
             -e GREENMAIL_OPTS="-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=ada:secret@localhost -Dgreenmail.users.login=email -Dgreenmail.tls.keystore.file=/certs/greenmail.p12 -Dgreenmail.tls.keystore.password=changeit" \
-            greenmail/standalone:2.1.2
+            greenmail/standalone:2.1.15
           for _ in $(seq 1 30); do nc -z localhost 3993 && nc -z localhost 3465 && break; sleep 2; done
       - name: Run the round trip
         env:

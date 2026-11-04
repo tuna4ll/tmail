@@ -128,6 +128,15 @@ fn check_transport(
             "SMTP",
             &remote.smtp_host,
             &detail,
+            || {
+                crate::certs::fetch(
+                    &remote.smtp_host,
+                    remote.smtp_port,
+                    crate::certs::Protocol::Smtp,
+                    remote.smtp_security.starttls(remote.smtp_port),
+                )
+                .is_ok()
+            },
         ));
     }
     if let Some(code) = error.status().map(|code| code.to_string()) {
