@@ -10,7 +10,7 @@ pub struct Check {
 
 pub fn run(config: &Config) -> bool {
     let checks = checks(config);
-    println!("termail doctor\n");
+    println!("tmail doctor\n");
     for check in &checks {
         let mark = if check.ok { "ok" } else { "fail" };
         println!("[{mark}] {:<12} {}", check.label, check.detail);
@@ -20,7 +20,7 @@ pub fn run(config: &Config) -> bool {
     if healthy {
         println!("Local setup checked. No server connection was made.");
     } else {
-        println!("Fix the failed checks, then run termail doctor again.");
+        println!("Fix the failed checks, then run tmail doctor again.");
     }
     healthy
 }
@@ -149,7 +149,7 @@ fn account_checks(config: &Config) -> Vec<Check> {
             // The stored secret, not a fresh OAuth2 token: doctor stays offline.
             Ok(()) => match remote.stored_secret().map_err(|error| {
                 if remote.oauth2.is_some() {
-                    format!("{error} Run termail oauth to sign in.")
+                    format!("{error} Run tmail oauth to sign in.")
                 } else {
                     error
                 }
@@ -169,7 +169,7 @@ fn account_checks(config: &Config) -> Vec<Check> {
     } else if config
         .send_command
         .first()
-        .is_some_and(|value| value == "termail-test-sink")
+        .is_some_and(|value| value == "tmail-test-sink")
     {
         Check {
             ok: config.send_command.len() > 1,
@@ -177,7 +177,7 @@ fn account_checks(config: &Config) -> Vec<Check> {
             detail: if config.send_command.len() > 1 {
                 "local test sink".into()
             } else {
-                "termail-test-sink needs an output path.".into()
+                "tmail-test-sink needs an output path.".into()
             },
         }
     } else {

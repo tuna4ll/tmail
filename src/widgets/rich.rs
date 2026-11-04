@@ -446,7 +446,7 @@ pub fn export_html(mail: &Mail) -> std::io::Result<std::path::PathBuf> {
     Ok(path)
 }
 
-const EXPORT_PREFIX: &str = "termail-view";
+const EXPORT_PREFIX: &str = "tmail-view";
 
 /// Removes pages exported for the browser more than a day ago.
 fn prune_exports() {

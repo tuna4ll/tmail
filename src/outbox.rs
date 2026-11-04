@@ -292,14 +292,14 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(storage::unique_name("termail-outbox"));
+            let root = std::env::temp_dir().join(storage::unique_name("tmail-outbox"));
             fs::create_dir(&root).unwrap();
             Self(root)
         }
 
         fn queue(&self) -> Delivery {
             Delivery::queue(MailboxSource::Maildir(self.0.clone()), "personal:me@example.com".into(),
-                vec!["termail-test-sink".into(), self.0.join("sent.log").display().to_string()],
+                vec!["tmail-test-sink".into(), self.0.join("sent.log").display().to_string()],
                 b"From: me@example.com\r\nTo: ada@example.com\r\nBcc: hidden@example.com\r\nSubject: hello\r\n\r\nbody").unwrap()
         }
 

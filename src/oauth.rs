@@ -1,4 +1,4 @@
-//! `termail oauth`: signs in through the provider's web page and stores the refresh
+//! `tmail oauth`: signs in through the provider's web page and stores the refresh
 //! token in the system keyring. Uses PKCE and a one-shot loopback redirect (RFC 8252).
 
 use std::{
@@ -20,7 +20,7 @@ pub fn run(config: &Config, account: Option<&str>) -> Result<(), String> {
     remote.forget_cached();
     println!("Signed in. The refresh token is in the system keyring.");
     if !remote.keyring {
-        println!("Add `keyring = true` to this account's [remote] table so Termail reads it.");
+        println!("Add `keyring = true` to this account's [remote] table so Tmail reads it.");
     }
     Ok(())
 }
@@ -170,14 +170,14 @@ fn wait_for_code(
         } else if let Some(code) = value("code") {
             (
                 "200 OK",
-                "Signed in to termail. You can close this tab.".to_owned(),
+                "Signed in to tmail. You can close this tab.".to_owned(),
                 Some(Ok(code)),
             )
         } else {
             ("404 Not Found", "Waiting for sign-in.".to_owned(), None)
         };
         let page = format!(
-            "<!doctype html><meta charset=utf-8><title>termail</title><p style=\"font:16px system-ui;margin:3em\">{message}</p>"
+            "<!doctype html><meta charset=utf-8><title>tmail</title><p style=\"font:16px system-ui;margin:3em\">{message}</p>"
         );
         let _ = write!(
             stream,

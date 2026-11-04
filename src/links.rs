@@ -47,7 +47,7 @@ pub fn assess(url: &str, shown: &str, clean: bool) -> Assessment {
         assessment.blocked = true;
         assessment
             .warnings
-            .push("This is not a web link, so termail does not open it.".into());
+            .push("This is not a web link, so tmail does not open it.".into());
         return assessment;
     }
     let Some(parts) = Parts::parse(url) else {

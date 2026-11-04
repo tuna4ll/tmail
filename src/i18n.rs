@@ -49,7 +49,7 @@ fn resolve(language: &str) -> String {
 }
 
 /// Loads the language. A file at `<config folder>/locales/<code>.toml` adds to or
-/// replaces the built-in translation, or supplies a language termail lacks.
+/// replaces the built-in translation, or supplies a language tmail lacks.
 pub fn init(language: &str, config_dir: Option<&Path>) -> Result<(), String> {
     let code = resolve(language);
     let table = load(&code, config_dir, language == "auto")?;

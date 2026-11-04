@@ -1,4 +1,4 @@
-//! Applies an edited config.toml while termail runs. Look, keys, scripts and message
+//! Applies an edited config.toml while tmail runs. Look, keys, scripts and message
 //! settings change at once; account connections keep running as they are until a
 //! restart, so signed-in sessions survive.
 

@@ -322,7 +322,7 @@ impl App {
         Ok(terminal)
     }
 
-    /// Edits the body inside termail.
+    /// Edits the body inside tmail.
     pub(crate) fn open_body_editor(&mut self, state: ComposeState) {
         let text = fs::read_to_string(&state.composer.body_path).unwrap_or_default();
         self.overlay = Some(Overlay::BodyEditor {

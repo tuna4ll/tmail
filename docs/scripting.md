@@ -1,8 +1,8 @@
-# Scripting termail with Lua
+# Scripting tmail with Lua
 
-Settings cover the common cases. When you want termail to do something it does not do out of the box, write a little Lua.
+Settings cover the common cases. When you want tmail to do something it does not do out of the box, write a little Lua.
 
-termail runs `init.lua` from the same folder as your config file when it starts. You can point it somewhere else with `script` in the `[ui]` table. Type `:script reload` to run it again after editing, without restarting. It also runs again whenever termail applies an edited config file.
+tmail runs `init.lua` from the same folder as your config file when it starts. You can point it somewhere else with `script` in the `[ui]` table. Type `:script reload` to run it again after editing, without restarting. It also runs again whenever tmail applies an edited config file.
 
 The script uses Lua 5.4. All of the standard library is there, including `io` and `os`, so a script can read files and run programs. Only run scripts you trust.
 
@@ -12,20 +12,20 @@ A working example lives in [examples/init.lua](examples/init.lua).
 
 ```lua
 -- Archive with e, like many other mail clients.
-termail.map("e", "archive")
+tmail.map("e", "archive")
 
 -- Star the selected message and move on to the next conversation.
-termail.map("S", function()
-  local mail = termail.selected()
+tmail.map("S", function()
+  local mail = tmail.selected()
   if mail then
-    termail.mark(mail.id, { starred = true })
-    termail.run("next")
+    tmail.mark(mail.id, { starred = true })
+    tmail.run("next")
   end
 end)
 
 -- A command you can type as :standup
-termail.command("standup", function()
-  termail.compose({
+tmail.command("standup", function()
+  tmail.compose({
     to = "team@example.com",
     subject = "Standup " .. os.date("%Y-%m-%d"),
     body = "Yesterday:\n\nToday:\n\nBlocked on:\n",
@@ -33,11 +33,11 @@ termail.command("standup", function()
 end)
 ```
 
-If something in the script is wrong, termail still starts. The error and its line number show at the bottom of the screen. Anything the script set up before the error keeps working.
+If something in the script is wrong, tmail still starts. The error and its line number show at the bottom of the screen. Anything the script set up before the error keeps working.
 
 ## Keys
 
-`termail.map(key, what, options)`
+`tmail.map(key, what, options)`
 
 `key` is written the same way as in the `[keys]` table: `"e"`, `"ctrl+t"`, `"alt+x"`, `"f5"`.
 
@@ -51,25 +51,25 @@ If something in the script is wrong, termail still starts. The error and its lin
 - `reader` only while a message is open
 
 ```lua
-termail.map("o", ":open maildir ~/Mail/archive")
-termail.map("space", function() termail.run("next") end, { mode = "reader" })
+tmail.map("o", ":open maildir ~/Mail/archive")
+tmail.map("space", function() tmail.run("next") end, { mode = "reader" })
 ```
 
-Script keys are checked before the built-in ones, so you can also take over a key termail already uses.
+Script keys are checked before the built-in ones, so you can also take over a key tmail already uses.
 
 ## Commands
 
-`termail.command(name, function(arguments) ... end)` adds `:name`. Whatever follows the name is passed in as one string.
+`tmail.command(name, function(arguments) ... end)` adds `:name`. Whatever follows the name is passed in as one string.
 
 ```lua
-termail.command("from", function(who)
-  termail.search("from:" .. who)
+tmail.command("from", function(who)
+  tmail.search("from:" .. who)
 end)
 ```
 
 ## Events
 
-`termail.on(event, function(...) ... end)` runs your function when something happens. You can register several functions for the same event.
+`tmail.on(event, function(...) ... end)` runs your function when something happens. You can register several functions for the same event.
 
 | Event | Your function gets |
 | --- | --- |
@@ -83,12 +83,12 @@ end)
 ### Filing new mail
 
 ```lua
-termail.on("new_mail", function(mail)
+tmail.on("new_mail", function(mail)
   if mail.address:match("@github%.com$") then
-    termail.move(mail.id, "GitHub")
+    tmail.move(mail.id, "GitHub")
   elseif mail.list and mail.subject:match("^%[announce%]") then
-    termail.mark(mail.id, { read = true })
-    termail.archive(mail.id)
+    tmail.mark(mail.id, { read = true })
+    tmail.archive(mail.id)
   end
 end)
 ```
@@ -98,7 +98,7 @@ end)
 `before_send` gets a table with `from`, `to`, `cc`, `bcc`, `subject` and `body`. Change any of them and the message is sent with your changes. Return `false` and a reason to stop it; the composer stays open and shows the reason.
 
 ```lua
-termail.on("before_send", function(message)
+tmail.on("before_send", function(message)
   if message.to:match("@competitor%.com") then
     return false, "That address is outside the company."
   end
@@ -120,13 +120,13 @@ Functions that hand you a message give a table with these fields:
 | `address` | Just the sender's address, in lower case. |
 | `to`, `cc` | Lists of recipients. |
 | `subject` | |
-| `body` | The plain text. Not filled in by `termail.mails()`. |
-| `links` | Links found in the message. Not filled in by `termail.mails()`. |
+| `body` | The plain text. Not filled in by `tmail.mails()`. |
+| `links` | Links found in the message. Not filled in by `tmail.mails()`. |
 | `folder` | `INBOX`, `Archive`, `Sent` and so on. |
 | `account` | The account id in the all-accounts view. |
 | `unread`, `starred` | |
 | `time` | Seconds since 1970, for comparing. |
-| `date` | The date as termail shows it. |
+| `date` | The date as tmail shows it. |
 | `attachments` | How many. |
 | `list` | Whether it came from a mailing list. |
 | `html` | Whether it has an HTML part. |
@@ -135,90 +135,90 @@ Functions that hand you a message give a table with these fields:
 
 | Function | |
 | --- | --- |
-| `termail.selected()` | The selected message, or `nil`. |
-| `termail.mails(query)` | Every loaded message that matches a search, such as `"from:ada is:unread"`. Without a query, all of them. Plain words here match anywhere in the text, not only at the start of a word as in the inbox. |
-| `termail.state()` | `{ folder, account, query, count, unread }` |
-| `termail.move(id, folder)` | Moves a message. |
-| `termail.archive(id)`, `termail.trash(id)` | Shortcuts for the two common moves. |
-| `termail.mark(id, { read = true, starred = false })` | Leave out what you do not want to change. |
-| `termail.open(id)` | Opens a message in the reader. |
-| `termail.folder(name)` | Shows a folder. |
-| `termail.search(query)` | Searches the inbox, as if typed after `/`. |
-| `termail.compose({ to, subject, body })` | Opens the composer with these filled in. |
-| `termail.run(name)` | Runs an action by name, or a command such as `":sync"`. |
-| `termail.notice(text)` | Shows a line at the bottom of the screen. |
-| `termail.notify(title, body)` | A desktop notification. |
-| `termail.log(text)` | Writes to the log file, when one is set with `--log`. |
+| `tmail.selected()` | The selected message, or `nil`. |
+| `tmail.mails(query)` | Every loaded message that matches a search, such as `"from:ada is:unread"`. Without a query, all of them. Plain words here match anywhere in the text, not only at the start of a word as in the inbox. |
+| `tmail.state()` | `{ folder, account, query, count, unread }` |
+| `tmail.move(id, folder)` | Moves a message. |
+| `tmail.archive(id)`, `tmail.trash(id)` | Shortcuts for the two common moves. |
+| `tmail.mark(id, { read = true, starred = false })` | Leave out what you do not want to change. |
+| `tmail.open(id)` | Opens a message in the reader. |
+| `tmail.folder(name)` | Shows a folder. |
+| `tmail.search(query)` | Searches the inbox, as if typed after `/`. |
+| `tmail.compose({ to, subject, body })` | Opens the composer with these filled in. |
+| `tmail.run(name)` | Runs an action by name, or a command such as `":sync"`. |
+| `tmail.notice(text)` | Shows a line at the bottom of the screen. |
+| `tmail.notify(title, body)` | A desktop notification. |
+| `tmail.log(text)` | Writes to the log file, when one is set with `--log`. |
 
 Moves and marks made by a script can be undone with `u`, the same as your own.
 
 ## Timers
 
-`termail.every(seconds, function() ... end)` runs a function again and again. The shortest interval is one second.
+`tmail.every(seconds, function() ... end)` runs a function again and again. The shortest interval is one second.
 
 ```lua
 -- Remind me about unread mail every half hour.
-termail.every(1800, function()
-  local unread = #termail.mails("in:INBOX is:unread")
+tmail.every(1800, function()
+  local unread = #tmail.mails("in:INBOX is:unread")
   if unread > 0 then
-    termail.notify("Unread mail", unread .. " messages are waiting")
+    tmail.notify("Unread mail", unread .. " messages are waiting")
   end
 end)
 ```
 
 ## Settings and colors
 
-`termail.set(name, value)` changes any setting from [configuration.md](configuration.md) while termail runs. Names from `[ui]` can be written bare. Settings from the other tables take a prefix: `compose.` or `reader.`.
+`tmail.set(name, value)` changes any setting from [configuration.md](configuration.md) while tmail runs. Names from `[ui]` can be written bare. Settings from the other tables take a prefix: `compose.` or `reader.`.
 
 ```lua
-termail.set("inbox_width", 40)
-termail.set("compose.reply_prefix", "AW: ")
-termail.set("reader.remote_images_from", { "@github.com" })
+tmail.set("inbox_width", 40)
+tmail.set("compose.reply_prefix", "AW: ")
+tmail.set("reader.remote_images_from", { "@github.com" })
 
-termail.notice("Sorted by " .. termail.get("sort"))
+tmail.notice("Sorted by " .. tmail.get("sort"))
 ```
 
 A wrong value is an error with a message that says what was wrong, and the old value stays.
 
 `language` and `accessible` are the exception: they are read when the config is applied, so set them in `config.toml` instead.
 
-`termail.theme(colors)` changes colors the same way the `[theme]` table does:
+`tmail.theme(colors)` changes colors the same way the `[theme]` table does:
 
 ```lua
 -- Dark during the night, light during the day.
 local function by_hour()
   local hour = tonumber(os.date("%H"))
-  termail.theme({ preset = (hour >= 8 and hour < 19) and "light" or "dark" })
+  tmail.theme({ preset = (hour >= 8 and hour < 19) and "light" or "dark" })
 end
 by_hour()
-termail.every(600, by_hour)
+tmail.every(600, by_hour)
 ```
 
 ## Changing what you see
 
 ### The bottom line
 
-`termail.status(function() return text end)` puts your own text at the start of the bottom line. It runs every time the screen is drawn, so keep it quick.
+`tmail.status(function() return text end)` puts your own text at the start of the bottom line. It runs every time the screen is drawn, so keep it quick.
 
 ```lua
-termail.status(function()
-  local state = termail.state()
+tmail.status(function()
+  local state = tmail.state()
   return state.unread .. " unread in " .. state.folder
 end)
 ```
 
 ### Conversation rows
 
-`termail.format(function(row) return title, subtitle end)` decides the two lines of each conversation in the list. `row` has `subject`, `from`, `date`, `time`, `count`, `unread`, `starred`, `folder` and `account`, plus `title` and `subtitle` with termail's own text. Return `nil` for a line to keep termail's version.
+`tmail.format(function(row) return title, subtitle end)` decides the two lines of each conversation in the list. `row` has `subject`, `from`, `date`, `time`, `count`, `unread`, `starred`, `folder` and `account`, plus `title` and `subtitle` with tmail's own text. Return `nil` for a line to keep tmail's version.
 
 ```lua
-termail.format(function(row)
+tmail.format(function(row)
   local count = row.count > 1 and (" (" .. row.count .. ")") or ""
   return row.subject .. count, row.from .. "  " .. row.date
 end)
 ```
 
-termail remembers each result until the conversation changes, so formatting stays fast even in a large mailbox.
+tmail remembers each result until the conversation changes, so formatting stays fast even in a large mailbox.
 
 ## Plugins
 
@@ -233,7 +233,7 @@ description = "Counts unread mail older than a day."
 permissions = ["read", "interface", "commands"]
 ```
 
-`main.lua` is the code. It uses the same `termail` table as a script. A function the plugin did not ask for stops with an error that names the missing permission, so a plugin can never quietly do more than its file says. Type `:plugins` to see what is installed and what each plugin may do. There is a complete example in [examples/plugins/reply-time](examples/plugins/reply-time).
+`main.lua` is the code. It uses the same `tmail` table as a script. A function the plugin did not ask for stops with an error that names the missing permission, so a plugin can never quietly do more than its file says. Type `:plugins` to see what is installed and what each plugin may do. There is a complete example in [examples/plugins/reply-time](examples/plugins/reply-time).
 
 | Permission | Lets the plugin |
 | --- | --- |
@@ -248,7 +248,7 @@ permissions = ["read", "interface", "commands"]
 | `navigate` | `open` messages, show a `folder`, `search` |
 | `settings` | `set`, `get` and `theme` |
 | `send` | change or stop messages in `before_send` |
-| `network` | `termail.fetch` the sites listed in `network` |
+| `network` | `tmail.fetch` the sites listed in `network` |
 | `system` | use `io`, `os` and `require` like your own script |
 
 `notice`, `log`, `every` and the `startup` and `sync` events need no permission.
@@ -263,11 +263,11 @@ network = ["api.github.com", "*.example.com"]
 ```
 
 ```lua
-local response = termail.fetch("https://api.github.com/zen")
+local response = tmail.fetch("https://api.github.com/zen")
 -- response.status is the HTTP status, response.body the text, up to 1 MB
 ```
 
-Your own script can call `termail.fetch` too, for any site.
+Your own script can call `tmail.fetch` too, for any site.
 
 To turn a plugin off without deleting it, name its folder in the config:
 
@@ -280,8 +280,8 @@ Plugins load again together with your script, with `:script reload` and whenever
 
 ## Limits
 
-A script call that runs longer than two seconds is stopped, and the bottom line says so. Calls made while drawing, from `status` and `format`, get 50 milliseconds. This keeps a stuck loop from freezing termail.
+A script call that runs longer than two seconds is stopped, and the bottom line says so. Calls made while drawing, from `status` and `format`, get 50 milliseconds. This keeps a stuck loop from freezing tmail.
 
-Scripts run one at a time on the same thread as the interface, and termail waits while they run. For slow work such as a web request, start it in the background instead of waiting for it, for example `os.execute("long-task &")` on Linux and macOS.
+Scripts run one at a time on the same thread as the interface, and tmail waits while they run. For slow work such as a web request, start it in the background instead of waiting for it, for example `os.execute("long-task &")` on Linux and macOS.
 
-Do not use `print` in a script. termail owns the screen, and printed text lands in the middle of it. Use `termail.notice` or `termail.log` instead.
+Do not use `print` in a script. tmail owns the screen, and printed text lands in the middle of it. Use `tmail.notice` or `tmail.log` instead.

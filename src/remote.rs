@@ -572,7 +572,7 @@ fn refresh_access_token(oauth: &OAuth2Config, refresh: &str) -> Result<(String, 
     let token = response["access_token"]
         .as_str()
         .filter(|token| !token.is_empty())
-        .ok_or("The OAuth2 server returned no access token. Run termail oauth again.")?
+        .ok_or("The OAuth2 server returned no access token. Run tmail oauth again.")?
         .to_owned();
     let lifetime = response["expires_in"].as_u64().unwrap_or(3600);
     Ok((token, Duration::from_secs(lifetime)))
@@ -607,26 +607,41 @@ pub(crate) fn token_request(url: &str, form: &[(&str, &str)]) -> Result<serde_js
             .unwrap_or("request refused");
         crate::log::write("oauth2", format_args!("{status} {reason}"));
         return Err(format!(
-            "OAuth2 sign-in failed ({reason}). Run termail oauth again."
+            "OAuth2 sign-in failed ({reason}). Run tmail oauth again."
         ));
     }
     Ok(body)
 }
 
+/// The keyring service, and the one versions before the rename used.
+const KEYRING_SERVICE: &str = "tmail";
+const LEGACY_KEYRING_SERVICE: &str = "termail";
+
+/// The keyring entry for `user`. A password saved under the old name is copied over
+/// the first time, so nobody has to sign in again after the rename.
+fn entry(user: &str) -> Result<keyring::Entry, String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, user)
+        .map_err(|_| "The system keyring is unavailable.".to_owned())?;
+    if entry.get_password().is_err()
+        && let Ok(legacy) = keyring::Entry::new(LEGACY_KEYRING_SERVICE, user)
+        && let Ok(password) = legacy.get_password()
+        && entry.set_password(&password).is_ok()
+    {
+        let _ = legacy.delete_credential();
+    }
+    Ok(entry)
+}
+
 fn smtp_keyring_entry(remote: &RemoteConfig) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(
-        "termail",
-        &format!("smtp:{}@{}", remote.smtp_login(), remote.smtp_host),
-    )
-    .map_err(|_| "The system keyring is unavailable.".into())
+    entry(&format!(
+        "smtp:{}@{}",
+        remote.smtp_login(),
+        remote.smtp_host
+    ))
 }
 
 fn keyring_entry(remote: &RemoteConfig) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(
-        "termail",
-        &format!("{}@{}", remote.username, remote.imap_host),
-    )
-    .map_err(|_| "The system keyring is unavailable.".into())
+    entry(&format!("{}@{}", remote.username, remote.imap_host))
 }
 
 fn run_password_command(command: &[String]) -> Result<String, String> {
@@ -705,7 +720,7 @@ pub(crate) mod tests {
                 smtp_host: "localhost".into(),
                 smtp_port: self.port,
                 username: "test@example.test".into(),
-                password_env: "TERMAIL_TEST_MISSING_PASSWORD_8D5F".into(),
+                password_env: "TMAIL_TEST_MISSING_PASSWORD_8D5F".into(),
                 timeout_secs: 2,
                 ..Default::default()
             }

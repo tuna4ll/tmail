@@ -345,7 +345,7 @@ pub fn protect(
             .collect();
     }
     let signer = config.key.clone().unwrap_or_else(|| envelope.from.clone());
-    let boundary = format!("termail-{}", crate::storage::unique_name("part"));
+    let boundary = format!("tmail-{}", crate::storage::unique_name("part"));
     let standard = protection.standard;
     let mut recipients = envelope.recipients.clone();
     if !recipients.contains(&envelope.from) {
@@ -585,7 +585,7 @@ struct Temporary(PathBuf);
 
 impl Temporary {
     fn new(contents: &[u8]) -> Result<Self, String> {
-        let path = std::env::temp_dir().join(crate::storage::unique_name("termail-crypto"));
+        let path = std::env::temp_dir().join(crate::storage::unique_name("tmail-crypto"));
         crate::storage::write_new(&path, contents).map_err(|error| error.to_string())?;
         Ok(Self(path))
     }
@@ -932,7 +932,7 @@ mod tests {
 
     /// A throwaway keyring with one OpenPGP key, or `None` when GnuPG is missing.
     fn keyring() -> Option<(CryptoConfig, PathBuf)> {
-        let home = std::env::temp_dir().join(crate::storage::unique_name("termail-gnupg"));
+        let home = std::env::temp_dir().join(crate::storage::unique_name("tmail-gnupg"));
         std::fs::create_dir_all(&home).ok()?;
         #[cfg(unix)]
         {
@@ -1063,7 +1063,7 @@ mod tests {
         assert!(header.starts_with("Autocrypt: addr=ada@example.test; keydata=\r\n "));
         let mut sent = header.into_bytes();
         sent.extend_from_slice(&message());
-        let other = std::env::temp_dir().join(crate::storage::unique_name("termail-gnupg"));
+        let other = std::env::temp_dir().join(crate::storage::unique_name("tmail-gnupg"));
         std::fs::create_dir_all(&other).unwrap();
         #[cfg(unix)]
         {

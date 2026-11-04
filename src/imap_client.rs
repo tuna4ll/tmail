@@ -560,7 +560,7 @@ struct SyncState {
     server: String,
     folders: BTreeMap<String, FolderState>,
     /// Messages that were in the Maildir before the first sync. They stay local until
-    /// the user asks to upload them, so pointing Termail at an existing Maildir never
+    /// the user asks to upload them, so pointing Tmail at an existing Maildir never
     /// copies a whole archive to the server by surprise.
     #[serde(default)]
     held: BTreeSet<String>,
@@ -845,7 +845,7 @@ fn file_stamp(path: &Path) -> (u64, u64) {
         .unwrap_or_default()
 }
 
-/// Finds every message Termail downloaded, wherever it lives in the Maildir now.
+/// Finds every message Tmail downloaded, wherever it lives in the Maildir now.
 fn scan_local(root: &Path) -> HashMap<String, PathBuf> {
     let mut index = HashMap::new();
     let mut folders = vec![root.to_path_buf()];
@@ -1954,7 +1954,7 @@ fn search_server_in<T: Read + Write>(
     }
 }
 
-/// Translates a Termail search into IMAP SEARCH criteria. Filters that only make sense
+/// Translates a Tmail search into IMAP SEARCH criteria. Filters that only make sense
 /// locally (folders, read state) are left out.
 fn server_criteria(query: &str) -> Option<String> {
     let mut criteria = Vec::new();
@@ -2137,13 +2137,13 @@ mod tests {
 
     /// Runs against a real IMAP and SMTP server, such as the GreenMail container the
     /// CI starts. Skipped unless asked for: `cargo test -- --ignored real_server`.
-    /// Settings come from TERMAIL_IT_HOST, _IMAP_PORT, _SMTP_PORT, _USER, _PASSWORD
+    /// Settings come from TMAIL_IT_HOST, _IMAP_PORT, _SMTP_PORT, _USER, _PASSWORD
     /// and _CA (a PEM file to trust).
     #[test]
     #[ignore]
     fn real_server_round_trip() {
         let variable = |name: &str, fallback: &str| {
-            std::env::var(format!("TERMAIL_IT_{name}")).unwrap_or_else(|_| fallback.to_owned())
+            std::env::var(format!("TMAIL_IT_{name}")).unwrap_or_else(|_| fallback.to_owned())
         };
         let user = variable("USER", "ada@localhost");
         let remote = RemoteConfig {
@@ -2152,7 +2152,7 @@ mod tests {
             smtp_host: variable("HOST", "localhost"),
             smtp_port: variable("SMTP_PORT", "3465").parse().unwrap(),
             username: user.clone(),
-            tls_certificate: std::env::var_os("TERMAIL_IT_CA").map(PathBuf::from),
+            tls_certificate: std::env::var_os("TMAIL_IT_CA").map(PathBuf::from),
             sync_interval_secs: 0,
             session_password: Some(std::sync::Arc::new(crate::remote::SessionPassword(
                 zeroize::Zeroizing::new(variable("PASSWORD", "secret")),
@@ -2160,9 +2160,9 @@ mod tests {
             ..Default::default()
         };
         let root = std::env::temp_dir().join(storage::unique_name("real-server"));
-        let subject = storage::unique_name("termail-it");
+        let subject = storage::unique_name("tmail-it");
         let message = format!(
-            "From: {user}\r\nTo: {user}\r\nSubject: {subject}\r\nMessage-ID: <{subject}@termail.test>\r\nDate: Mon, 2 Mar 2026 10:00:00 +0000\r\n\r\nhello from the integration test\r\n"
+            "From: {user}\r\nTo: {user}\r\nSubject: {subject}\r\nMessage-ID: <{subject}@tmail.test>\r\nDate: Mon, 2 Mar 2026 10:00:00 +0000\r\n\r\nhello from the integration test\r\n"
         );
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime
@@ -2187,15 +2187,15 @@ mod tests {
         // Mark it read and file it in a new folder; both must reach the server.
         let read = set_local_flags(&path, "S").unwrap();
         sync(&remote, &root).unwrap();
-        change_folder(&remote, &root, &FolderChange::Create("Termail Test".into())).unwrap();
-        let folder = root.join(local_name("Termail Test"));
+        change_folder(&remote, &root, &FolderChange::Create("Tmail Test".into())).unwrap();
+        let folder = root.join(local_name("Tmail Test"));
         storage::rename(&read, &folder.join("cur").join(read.file_name().unwrap())).unwrap();
         sync(&remote, &root).unwrap();
         let mut session = connect(&remote).unwrap();
         let (folders, _) = discover_layout(&mut session, &remote, false).unwrap();
         let target = folders
             .iter()
-            .find(|candidate| candidate.local == local_name("Termail Test"))
+            .find(|candidate| candidate.local == local_name("Tmail Test"))
             .unwrap();
         session.examine(&target.remote).unwrap();
         let found = session
@@ -2235,7 +2235,7 @@ mod tests {
         change_folder(
             &remote,
             &root,
-            &FolderChange::Delete(local_name("Termail Test")),
+            &FolderChange::Delete(local_name("Tmail Test")),
         )
         .unwrap();
         let _ = fs::remove_dir_all(root);

@@ -1,8 +1,8 @@
-# termail
+# tmail
 
 A fast, keyboard and mouse friendly mail client for the terminal.
 
-termail keeps your mail in a local Maildir, syncs it with any IMAP server in the background and sends over SMTP. Next to the conversation list it draws each thread as a map, so you can see who answered whom at a glance.
+tmail keeps your mail in a local Maildir, syncs it with any IMAP server in the background and sends over SMTP. Next to the conversation list it draws each thread as a map, so you can see who answered whom at a glance.
 
 ![Opening a conversation from the map, replying, reading a newsletter, archiving with the right-click menu and searching](docs/demo.gif)
 
@@ -11,33 +11,33 @@ termail keeps your mail in a local Maildir, syncs it with any IMAP server in the
 **Linux and macOS**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/tuna4ll/termail/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/tuna4ll/tmail/main/install.sh | sh
 ```
 
 **Windows** (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/tuna4ll/termail/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/tuna4ll/tmail/main/install.ps1 | iex
 ```
 
-Both download the latest release for your system, check its checksum and put `termail` on your path: `~/.local/bin` on Linux and macOS, `%LOCALAPPDATA%\Programs\termail` on Windows. Set `TERMAIL_VERSION=v1.0.0` to install a specific release, or `TERMAIL_INSTALL_DIR` to choose the folder. Builds are available for Linux (x86_64, ARM64, glibc), macOS (Intel, Apple silicon) and Windows (x64), and are also attached to every [release](https://github.com/tuna4ll/termail/releases).
+Both download the latest release for your system, check its checksum and put `tmail` on your path: `~/.local/bin` on Linux and macOS, `%LOCALAPPDATA%\Programs\tmail` on Windows. Set `TMAIL_VERSION=v1.0.0` to install a specific release, or `TMAIL_INSTALL_DIR` to choose the folder. Builds are available for Linux (x86_64, ARM64, glibc), macOS (Intel, Apple silicon) and Windows (x64), and are also attached to every [release](https://github.com/tuna4ll/tmail/releases).
 
-**From source**, with a recent Rust toolchain:
+**With Cargo**, from [crates.io](https://crates.io/crates/tmail):
 
 ```sh
-cargo install --git https://github.com/tuna4ll/termail
+cargo install tmail
 ```
 
 Optional: GnuPG for signing and encryption, and a terminal that can show pictures (kitty, Ghostty, WezTerm, foot or iTerm2) for images in HTML mail.
 
 ## Getting started
 
-Run `termail`. The first time, it asks for your email address, finds your provider's servers and checks the account before saving anything. Passwords are kept in your system keyring, and OAuth2 sign-in is supported for providers that need it, such as Gmail and Outlook.
+Run `tmail`. The first time, it asks for your email address, finds your provider's servers and checks the account before saving anything. Passwords are kept in your system keyring, and OAuth2 sign-in is supported for providers that need it, such as Gmail and Outlook.
 
 Want to look around first? Open the built-in sample mailbox:
 
 ```sh
-termail --demo
+tmail --demo
 ```
 
 ## Everyday use
@@ -71,7 +71,7 @@ Press `ctrl+r` while searching to look on the server too, for older mail that is
 
 ## Configuration
 
-Accounts you add in termail are saved to `~/.config/termail/config.toml`. Everything else is optional and takes effect as soon as you save the file:
+Accounts you add in tmail are saved to `~/.config/tmail/config.toml`. Everything else is optional and takes effect as soon as you save the file:
 
 ```toml
 [ui]
@@ -84,18 +84,18 @@ archive = "e"
 preset = "light"
 ```
 
-[docs/configuration.md](docs/configuration.md) lists every setting, and [docs/scripting.md](docs/scripting.md) shows how to add your own keys, commands and rules in Lua. Run `termail doctor` to check your setup.
+[docs/configuration.md](docs/configuration.md) lists every setting, and [docs/scripting.md](docs/scripting.md) shows how to add your own keys, commands and rules in Lua. Run `tmail doctor` to check your setup.
 
 ## Command line
 
 ```
-termail                     start
-termail --demo              open the sample mailbox
-termail --config PATH       use another config file
-termail doctor              check accounts, Maildir, editor and sending
-termail oauth [ACCOUNT]     sign in with OAuth2 again
-termail completions SHELL   print completions for bash, zsh or fish
-termail man                 print the manual page
+tmail                     start
+tmail --demo              open the sample mailbox
+tmail --config PATH       use another config file
+tmail doctor              check accounts, Maildir, editor and sending
+tmail oauth [ACCOUNT]     sign in with OAuth2 again
+tmail completions SHELL   print completions for bash, zsh or fish
+tmail man                 print the manual page
 ```
 
 ## Development
@@ -106,7 +106,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo fmt -- --check
 ```
 
-To publish a release, set the version in `Cargo.toml`, commit, then push a matching tag such as `v1.0.0`. GitHub Actions builds every platform and attaches the binaries and checksums to the release.
+To publish a release, set the version in `Cargo.toml`, commit, then push a matching tag such as `v1.0.0`. GitHub Actions builds every platform, attaches the binaries and checksums to the release and publishes the crate to crates.io.
 
 ## License
 

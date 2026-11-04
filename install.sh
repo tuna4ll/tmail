@@ -1,18 +1,18 @@
 #!/bin/sh
-# Installs termail from the GitHub releases on Linux and macOS.
+# Installs tmail from the GitHub releases on Linux and macOS.
 #
-#   curl -fsSL https://raw.githubusercontent.com/tuna4ll/termail/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/tuna4ll/tmail/main/install.sh | sh
 #
-# TERMAIL_VERSION      a release such as v1.0.0 (default: the latest)
-# TERMAIL_INSTALL_DIR  where the binary goes (default: ~/.local/bin)
+# TMAIL_VERSION      a release such as v1.0.0 (default: the latest)
+# TMAIL_INSTALL_DIR  where the binary goes (default: ~/.local/bin)
 set -eu
 
-repo="tuna4ll/termail"
-version="${TERMAIL_VERSION:-latest}"
-dir="${TERMAIL_INSTALL_DIR:-$HOME/.local/bin}"
+repo="tuna4ll/tmail"
+version="${TMAIL_VERSION:-latest}"
+dir="${TMAIL_INSTALL_DIR:-$HOME/.local/bin}"
 
 fail() {
-    echo "termail: $*" >&2
+    echo "tmail: $*" >&2
     exit 1
 }
 
@@ -34,7 +34,7 @@ if [ "$os" = "unknown-linux-gnu" ] && ldd --version 2>&1 | grep -qi musl; then
     fail "the Linux build needs glibc. On musl systems such as Alpine, use: cargo install --git https://github.com/$repo"
 fi
 
-asset="termail-$arch-$os.tar.gz"
+asset="tmail-$arch-$os.tar.gz"
 if [ "$version" = "latest" ]; then
     base="https://github.com/$repo/releases/latest/download"
 else
@@ -70,10 +70,10 @@ expected="$(cut -d ' ' -f 1 < "$tmp/$asset.sha256")"
 
 tar -xzf "$tmp/$asset" -C "$tmp"
 mkdir -p "$dir"
-install -m 755 "$tmp/termail" "$dir/termail"
-echo "Installed $("$dir/termail" --version) to $dir/termail"
+install -m 755 "$tmp/tmail" "$dir/tmail"
+echo "Installed $("$dir/tmail" --version) to $dir/tmail"
 
 case ":$PATH:" in
-    *":$dir:"*) echo "Run termail to start." ;;
-    *) echo "Add $dir to your PATH, then run termail." ;;
+    *":$dir:"*) echo "Run tmail to start." ;;
+    *) echo "Add $dir to your PATH, then run tmail." ;;
 esac

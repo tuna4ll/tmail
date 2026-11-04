@@ -2,7 +2,7 @@
 //! react to events, change settings and the theme, and format the interface.
 //!
 //! Scripts run on the interface thread. Each call gets a time limit, so a runaway
-//! loop shows an error instead of freezing termail.
+//! loop shows an error instead of freezing tmail.
 
 use std::{
     cell::{Cell, RefCell},
@@ -22,7 +22,7 @@ const TIME_LIMIT: Duration = Duration::from_secs(2);
 /// Calls made while drawing get much less, since they run on every frame.
 const DRAW_LIMIT: Duration = Duration::from_millis(50);
 
-/// Something a script asked termail to do. Applied once the script call returns.
+/// Something a script asked tmail to do. Applied once the script call returns.
 #[derive(Debug)]
 pub enum Effect {
     Notice(String),
@@ -428,7 +428,7 @@ impl Engine {
             lua.create_function(move |_, (title, body): (String, Option<String>)| {
                 let (title, body) = match body {
                     Some(body) => (title, body),
-                    None => ("termail".into(), title),
+                    None => ("tmail".into(), title),
                 };
                 effect(&shared, Effect::Notify { title, body });
                 Ok(())
@@ -629,7 +629,9 @@ impl Engine {
             lua.create_function(move |lua, url: String| fetch(lua, &url, hosts.as_deref()))?,
         )?;
 
-        lua.globals().set("termail", api)?;
+        // Scripts written before the rename call it by its old name.
+        lua.globals().set("termail", api.clone())?;
+        lua.globals().set("tmail", api)?;
         Ok(())
     }
 
@@ -639,13 +641,13 @@ impl Engine {
         let Some(manifest) = &self.plugin else {
             return Ok(());
         };
-        let api: Table = self.lua.globals().get("termail")?;
+        let api: Table = self.lua.globals().get("tmail")?;
         for (function, permission) in GUARDED {
             if manifest.allows(permission) {
                 continue;
             }
             let message = format!(
-                "{} needs the {permission:?} permission for termail.{function}",
+                "{} needs the {permission:?} permission for tmail.{function}",
                 manifest.name
             );
             api.set(
@@ -827,7 +829,7 @@ impl Engine {
             .collect()
     }
 
-    /// Text for the status line from `termail.status`.
+    /// Text for the status line from `tmail.status`.
     pub fn status(&self) -> Option<String> {
         let function = self.shared.status.borrow().clone()?;
         match self.guard(DRAW_LIMIT, || function.call::<Option<String>>(())) {
@@ -843,7 +845,7 @@ impl Engine {
         self.shared.format.borrow().is_some()
     }
 
-    /// A list row from `termail.format`, cached until the conversation changes.
+    /// A list row from `tmail.format`, cached until the conversation changes.
     pub fn format_row(&self, key: String, row: &Row) -> Option<(String, String)> {
         if let Some(cached) = self.rows.borrow().get(&key) {
             return Some(cached.clone());
@@ -887,7 +889,7 @@ impl Engine {
     }
 }
 
-/// One conversation as `termail.format` sees it, with the built-in text.
+/// One conversation as `tmail.format` sees it, with the built-in text.
 /// What a plugin may use, with a line for the user about each.
 pub const PERMISSIONS: &[(&str, &str)] = &[
     ("read", "read your messages"),
@@ -905,7 +907,7 @@ pub const PERMISSIONS: &[(&str, &str)] = &[
     ("system", "use files and programs, like your own script"),
 ];
 
-/// Functions of the `termail` table and the permission each needs.
+/// Functions of the `tmail` table and the permission each needs.
 const GUARDED: &[(&str, &str)] = &[
     ("selected", "read"),
     ("mails", "read"),
@@ -938,7 +940,7 @@ pub struct Manifest {
     pub version: String,
     pub description: String,
     pub permissions: Vec<String>,
-    /// Sites `termail.fetch` may reach, such as `"api.github.com"` or `"*.example.com"`.
+    /// Sites `tmail.fetch` may reach, such as `"api.github.com"` or `"*.example.com"`.
     pub network: Vec<String>,
 }
 
@@ -955,7 +957,7 @@ fn host_allowed(host: &str, allowed: &[String]) -> bool {
     })
 }
 
-/// `termail.fetch(url)`: a short HTTPS GET for scripts and plugins with the network
+/// `tmail.fetch(url)`: a short HTTPS GET for scripts and plugins with the network
 /// permission. Plugins only reach the hosts their manifest lists.
 fn fetch(lua: &Lua, url: &str, hosts: Option<&[String]>) -> mlua::Result<Table> {
     use std::io::Read;
@@ -993,7 +995,7 @@ fn fetch(lua: &Lua, url: &str, hosts: Option<&[String]>) -> mlua::Result<Table> 
         .new_agent();
     let response = agent
         .get(url)
-        .header("User-Agent", "termail")
+        .header("User-Agent", "tmail")
         .call()
         .map_err(|error| mlua::Error::external(format!("fetch failed: {error}")))?;
     let status = response.status().as_u16();
@@ -1105,7 +1107,7 @@ mod tests {
     fn engine(source: &str) -> (Engine, Option<String>) {
         let path = std::env::temp_dir().join(format!(
             "{}.lua",
-            crate::storage::unique_name("termail-script")
+            crate::storage::unique_name("tmail-script")
         ));
         std::fs::write(&path, source).unwrap();
         let loaded = Engine::load(&path);
@@ -1117,9 +1119,9 @@ mod tests {
     fn binds_keys_runs_commands_and_reports_errors_with_lines() {
         let (engine, error) = engine(
             r#"
-            termail.map("e", "archive")
-            termail.map("ctrl+t", function() termail.notice("pressed") end, { mode = "reader" })
-            termail.command("hello", function(name) termail.notice("hi " .. name) end)
+            tmail.map("e", "archive")
+            tmail.map("ctrl+t", function() tmail.notice("pressed") end, { mode = "reader" })
+            tmail.command("hello", function(name) tmail.notice("hi " .. name) end)
             "#,
         );
         assert!(error.is_none(), "{error:?}");
@@ -1142,13 +1144,13 @@ mod tests {
             matches!(engine.take_effects().as_slice(), [Effect::Notice(text)] if text == "hi Ada")
         );
         assert!(engine.command("missing", "").is_none());
-        let (_, error) = self::engine("termail.map('e', 'archive')\nthis is not lua\n");
+        let (_, error) = self::engine("tmail.map('e', 'archive')\nthis is not lua\n");
         assert!(error.unwrap().contains(":2:"), "errors name the line");
     }
 
     #[test]
     fn stops_runaway_scripts() {
-        let (engine, _) = engine(r#"termail.command("spin", function() while true do end end)"#);
+        let (engine, _) = engine(r#"tmail.command("spin", function() while true do end end)"#);
         let started = Instant::now();
         let result = engine.command("spin", "").unwrap();
         assert!(result.unwrap_err().contains("too long"));
@@ -1158,7 +1160,7 @@ mod tests {
     #[test]
     fn before_send_can_change_or_stop_a_message() {
         let (engine, _) = engine(
-            r#"termail.on("before_send", function(m)
+            r#"tmail.on("before_send", function(m)
                 if m.subject == "" then return false, "Add a subject." end
                 m.body = m.body .. "\n-- sent with lua"
             end)"#,
@@ -1182,9 +1184,9 @@ mod tests {
 
     #[test]
     fn settings_are_checked() {
-        let (_, error) = engine(r#"termail.set("sort", "sideways")"#);
+        let (_, error) = engine(r#"tmail.set("sort", "sideways")"#);
         assert!(error.unwrap().contains("ui.sort"));
-        let (_, error) = engine(r#"termail.on("no_such_event", function() end)"#);
+        let (_, error) = engine(r#"tmail.on("no_such_event", function() end)"#);
         assert!(error.unwrap().contains("unknown event"));
     }
 }
@@ -1207,22 +1209,22 @@ mod plugin_tests {
     fn plugins_only_get_what_they_ask_for() {
         let (_, e) = plugin(
             "name = \"a\"",
-            "termail.notice('hi'); local t = os.time(); assert(io == nil); assert(os.execute == nil); assert(dofile == nil)",
+            "tmail.notice('hi'); local t = os.time(); assert(io == nil); assert(os.execute == nil); assert(dofile == nil)",
         );
         assert!(e.is_none());
-        let (_, e) = plugin("name = \"b\"", "termail.mails()");
+        let (_, e) = plugin("name = \"b\"", "tmail.mails()");
         assert!(e.unwrap().contains("\"read\""));
-        let (_, e) = plugin("name = \"c\"", "termail.on('before_send', function() end)");
+        let (_, e) = plugin("name = \"c\"", "tmail.on('before_send', function() end)");
         assert!(e.unwrap().contains("\"send\""));
         let (en, e) = plugin(
             "name = \"d\"\npermissions = [\"read\", \"commands\"]",
-            "termail.command('hello', function() termail.notice(#termail.mails()) end)",
+            "tmail.command('hello', function() tmail.notice(#tmail.mails()) end)",
         );
         assert!(e.is_none());
         assert!(en.command("hello", "").unwrap().is_ok());
         let (_, e) = plugin(
             "name = \"e\"\npermissions = [\"network\"]\nnetwork = [\"api.github.com\"]",
-            "termail.fetch('https://evil.test/')",
+            "tmail.fetch('https://evil.test/')",
         );
         assert!(e.unwrap().contains("not in the plugin's network list"));
         let (_, e) = plugin(

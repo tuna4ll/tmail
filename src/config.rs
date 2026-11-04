@@ -70,6 +70,7 @@ impl Config {
     pub fn load(path: Option<&Path>) -> color_eyre::Result<Self> {
         let explicit = path
             .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("TMAIL_CONFIG").map(PathBuf::from))
             .or_else(|| std::env::var_os("TERMAIL_CONFIG").map(PathBuf::from));
         let path = explicit.clone().or_else(default_path);
         let Some(path) = path else {
@@ -197,7 +198,7 @@ impl Config {
         };
         if current != self.snapshot {
             return Err(
-                "Config changed outside Termail. Restart before saving account settings.".into(),
+                "Config changed outside Tmail. Restart before saving account settings.".into(),
             );
         }
         let mut document = current
@@ -238,7 +239,7 @@ impl Config {
             .map_err(|_| "Unable to serialize account settings.")?;
         let accounts = document["accounts"]
             .as_array_of_tables_mut()
-            .ok_or("Use [[accounts]] tables before editing accounts in Termail.")?;
+            .ok_or("Use [[accounts]] tables before editing accounts in Tmail.")?;
         let existing = accounts.iter().position(|table| {
             table.get("id").and_then(toml_edit::Item::as_str) == Some(&account.id)
         });
@@ -326,7 +327,7 @@ impl Config {
             .map_err(|_| "Unable to read the config file. Check its permissions.")?;
         if Some(&current) != self.snapshot.as_ref() {
             return Err(
-                "Config changed outside Termail. Restart before saving account settings.".into(),
+                "Config changed outside Tmail. Restart before saving account settings.".into(),
             );
         }
         let mut document = current
@@ -335,7 +336,7 @@ impl Config {
         let accounts = document
             .get_mut("accounts")
             .and_then(toml_edit::Item::as_array_of_tables_mut)
-            .ok_or("Use [[accounts]] tables before editing accounts in Termail.")?;
+            .ok_or("Use [[accounts]] tables before editing accounts in Tmail.")?;
         let position = accounts
             .iter()
             .position(|table| table.get("id").and_then(toml_edit::Item::as_str) == Some(id))
@@ -422,7 +423,7 @@ impl Config {
         }
     }
 
-    /// `editor = ["builtin"]` edits bodies inside termail.
+    /// `editor = ["builtin"]` edits bodies inside tmail.
     pub fn uses_builtin_editor(&self) -> bool {
         self.editor
             .first()
@@ -573,8 +574,14 @@ fn resolve_path(path: &mut Option<PathBuf>, base: &Path) {
 }
 
 pub fn default_path() -> Option<PathBuf> {
-    ProjectDirs::from("com", "tunakilic", "termail")
+    let current = ProjectDirs::from("com", "tunakilic", "tmail")?
+        .config_dir()
+        .join("config.toml");
+    // Setups from before the rename keep working where they are.
+    let legacy = ProjectDirs::from("com", "tunakilic", "termail")
         .map(|dirs| dirs.config_dir().join("config.toml"))
+        .filter(|legacy| legacy.exists() && !current.exists());
+    Some(legacy.unwrap_or(current))
 }
 
 #[cfg(test)]
@@ -604,7 +611,7 @@ mod tests {
                     imap_host: "localhost".into(),
                     smtp_host: "localhost".into(),
                     username: format!("{id}@example.test"),
-                    password_env: "TERMAIL_SETUP_TEST_PASSWORD".into(),
+                    password_env: "TMAIL_SETUP_TEST_PASSWORD".into(),
                     session_password: Some(std::sync::Arc::new(crate::remote::SessionPassword(
                         zeroize::Zeroizing::new("fake-password".into()),
                     ))),
@@ -802,7 +809,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("termail-config-{nonce}"));
+        let root = std::env::temp_dir().join(format!("tmail-config-{nonce}"));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("config.toml");
         fs::write(
@@ -824,7 +831,7 @@ mod tests {
         let root = std::env::temp_dir().join(crate::storage::unique_name("remote-config"));
         fs::create_dir(&root).unwrap();
         let path = root.join("config.toml");
-        let contents = "[[accounts]]\nid = 'personal'\nemail = 'me@example.test'\nmaildir = 'mail'\n[accounts.remote]\nimap_host = 'localhost'\nsmtp_host = 'localhost'\nusername = 'me@example.test'\npassword_env = 'TERMAIL_PASSWORD'\n";
+        let contents = "[[accounts]]\nid = 'personal'\nemail = 'me@example.test'\nmaildir = 'mail'\n[accounts.remote]\nimap_host = 'localhost'\nsmtp_host = 'localhost'\nusername = 'me@example.test'\npassword_env = 'TMAIL_PASSWORD'\n";
         fs::write(&path, contents).unwrap();
         let mut config = Config::load(Some(&path)).unwrap();
         assert_eq!(config.maildir, Some(root.join("mail")));
@@ -843,7 +850,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("termail-accounts-{nonce}"));
+        let root = std::env::temp_dir().join(format!("tmail-accounts-{nonce}"));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("config.toml");
         fs::write(

@@ -37,7 +37,7 @@ pub(crate) fn notify(title: &str, body: &str) {
         Command::new("notify-send")
             .args([
                 "--app-name",
-                "termail",
+                "tmail",
                 "--icon",
                 "mail-unread",
                 &title,
@@ -312,7 +312,7 @@ impl App {
                         .find(|account| account.id == id)
                         .map_or_else(|| self.account_label.clone(), config::Account::label);
                     notify(
-                        "termail",
+                        "tmail",
                         &format!(
                             "{} new message{} in {label}",
                             synced.downloaded,
@@ -405,7 +405,7 @@ impl App {
     ) {
         let sender = self.watch_tx.clone();
         let spawned = std::thread::Builder::new()
-            .name(format!("termail-idle-{folder}"))
+            .name(format!("tmail-idle-{folder}"))
             .spawn(move || {
                 let mut backoff = 30;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {

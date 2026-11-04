@@ -1,4 +1,4 @@
-//! Interface settings from the `[ui]` table. Scripts can change them while termail
+//! Interface settings from the `[ui]` table. Scripts can change them while tmail
 //! runs, so they live behind a lock instead of being copied around.
 
 use std::{path::PathBuf, sync::RwLock};
@@ -28,7 +28,7 @@ pub struct UiConfig {
     pub confirm_quit: bool,
     /// Shows key hints in the bottom line.
     pub show_hints: bool,
-    /// Lets termail use the mouse. Turn off to select text with the terminal.
+    /// Lets tmail use the mouse. Turn off to select text with the terminal.
     pub mouse: bool,
     /// `newest` or `oldest` first in the conversation list.
     pub sort: String,

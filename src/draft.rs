@@ -112,7 +112,7 @@ impl Composer {
         identity: Option<&str>,
         signature: Option<&str>,
     ) -> io::Result<Self> {
-        let name = crate::storage::unique_name("termail");
+        let name = crate::storage::unique_name("tmail");
         let body_path = std::env::temp_dir().join(format!("{name}.txt"));
         let own = identity.map(email_of).filter(|value| value.contains('@'));
         let mut body = signature
@@ -267,7 +267,8 @@ impl Composer {
             composer.message_id = id.into();
         }
         let markdown = parsed
-            .header_raw("X-Termail-Format")
+            .header_raw("X-Tmail-Format")
+            .or_else(|| parsed.header_raw("X-Termail-Format"))
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("markdown"));
         let body = if markdown {
             composer.format = MessageFormat::Markdown;
@@ -641,7 +642,7 @@ fn prepare_message(
         MessageFormat::Html => builder.html_body(body),
         // Drafts keep the Markdown alone, so they open again as Markdown.
         MessageFormat::Markdown if !require_recipient => builder
-            .header("X-Termail-Format", Text::new("markdown"))
+            .header("X-Tmail-Format", Text::new("markdown"))
             .text_body(body),
         MessageFormat::Markdown => {
             let html = crate::markdown::to_html(&body).replace('\n', "\r\n");
@@ -806,7 +807,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("termail-draft-test-{nonce}"));
+        let root = std::env::temp_dir().join(format!("tmail-draft-test-{nonce}"));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("notes.txt"), "hello").unwrap();
         let contents = b"To: ada@example.com\nCc: mert@example.com\nBcc: hidden@example.com\nSubject: Report\nAttach: notes.txt\nMIME-Version: 1.0\nContent-Type: text/plain; charset=utf-8\n\nplease review";
@@ -922,7 +923,7 @@ mod tests {
 
     #[test]
     fn resumes_quoted_names_and_unicode_attachments() {
-        let directory = std::env::temp_dir().join(crate::storage::unique_name("termail-mime"));
+        let directory = std::env::temp_dir().join(crate::storage::unique_name("tmail-mime"));
         fs::create_dir(&directory).unwrap();
         let attachment = directory.join("Türkçe rapor.txt");
         fs::write(&attachment, [0, 1, 127, 128, 255]).unwrap();

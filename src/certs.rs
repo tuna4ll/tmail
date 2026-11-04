@@ -56,7 +56,7 @@ pub fn fetch(
             Protocol::Smtp => {
                 expect_line(&mut stream, "220")?;
                 stream
-                    .write_all(b"EHLO termail\r\n")
+                    .write_all(b"EHLO tmail\r\n")
                     .map_err(|e| e.to_string())?;
                 // EHLO answers with several 250- lines and a final "250 ".
                 loop {

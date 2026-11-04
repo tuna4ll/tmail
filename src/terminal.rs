@@ -92,7 +92,7 @@ fn handle_panic(info: &PanicHookInfo<'_>) {
 ///
 /// The query reads the keyboard on a thread of its own until the terminal answers.
 /// tmux drops the query unless `allow-passthrough` is on, and the leftover thread then
-/// swallows the first keys typed, so termail does not ask there. If a terminal still
+/// swallows the first keys typed, so tmail does not ask there. If a terminal still
 /// leaves it waiting, a status request it always answers lets the thread finish.
 pub fn graphics_picker() -> ratatui_image::picker::Picker {
     use ratatui_image::picker::Picker;

@@ -50,7 +50,7 @@ fn key(mail: &Mail) -> String {
         .replace('\n', " ")
 }
 
-const HEADER: &str = "termail-search 2";
+const HEADER: &str = "tmail-search 2";
 
 impl Index {
     pub fn build(mails: &[Mail]) -> Self {

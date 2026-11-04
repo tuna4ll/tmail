@@ -57,7 +57,7 @@ pub(crate) fn parse_options(
             }
             Some("man") => print = Some(crate::completions::man_page()),
             Some("--version" | "-V") => {
-                print = Some(format!("termail {}\n", env!("CARGO_PKG_VERSION")));
+                print = Some(format!("tmail {}\n", env!("CARGO_PKG_VERSION")));
             }
             Some("doctor") => doctor = true,
             Some("oauth") => oauth = Some(None),
@@ -82,13 +82,13 @@ pub(crate) fn parse_options(
 
 pub(crate) fn print_help() {
     println!(
-        "termail [doctor | oauth [ACCOUNT] | completions SHELL | man] [--config PATH] [--log PATH] [--demo | --maildir PATH]"
+        "tmail [doctor | oauth [ACCOUNT] | completions SHELL | man] [--config PATH] [--log PATH] [--demo | --maildir PATH]"
     );
     println!();
     println!("  --demo          open the built-in mailbox");
     println!("  --maildir PATH  open a Maildir mailbox");
     println!("  --config PATH   load a config file");
-    println!("  --log PATH      append connection errors to a file (or set TERMAIL_LOG)");
+    println!("  --log PATH      append connection errors to a file (or set TMAIL_LOG)");
     println!("  doctor          check account, Maildir, editor, and sender setup");
     println!("  oauth [ACCOUNT] sign in through the provider's page and keep the refresh token");
     println!("  completions SHELL  print completions for bash, zsh or fish");

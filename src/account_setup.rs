@@ -521,7 +521,7 @@ impl Form {
                 if client_id.is_empty() {
                     return Err((
                         Field::ClientId,
-                        "Enter the OAuth client ID you created for termail with your provider."
+                        "Enter the OAuth client ID you created for tmail with your provider."
                             .into(),
                     ));
                 }
@@ -627,7 +627,7 @@ impl Form {
                 self.value(Field::ImapHost)
             )
         } else {
-            "Type your address and press tab: termail fills in the servers it can find.\nUsername defaults to your email address.".into()
+            "Type your address and press tab: tmail fills in the servers it can find.\nUsername defaults to your email address.".into()
         };
         frame.render_widget(
             Paragraph::new(crate::i18n::t(&hint))
@@ -697,7 +697,7 @@ impl Form {
         } else if let Some(info) = &self.info {
             info.clone()
         } else if self.sign_in.oauth() {
-            "termail opens the provider's sign-in page when you save. The token stays in the system keyring.".into()
+            "tmail opens the provider's sign-in page when you save. The token stays in the system keyring.".into()
         } else if self.remember {
             "Password is saved in the system keyring.".into()
         } else if self.mode == Mode::Edit {
@@ -838,7 +838,7 @@ pub(crate) mod tests {
     #[test]
     fn validates_fields_and_defaults_username_to_email() {
         let config = Config {
-            path: Some(std::env::temp_dir().join("termail-form-test/config.toml")),
+            path: Some(std::env::temp_dir().join("tmail-form-test/config.toml")),
             ..Default::default()
         };
         let mut form = filled_form(&config);
@@ -865,7 +865,7 @@ pub(crate) mod tests {
     #[test]
     fn editing_cannot_rebind_an_existing_mail_cache() {
         let mut config = Config {
-            path: Some(std::env::temp_dir().join("termail-form-test/config.toml")),
+            path: Some(std::env::temp_dir().join("tmail-form-test/config.toml")),
             ..Default::default()
         };
         config.accounts.push(filled_form(&config).build().unwrap());

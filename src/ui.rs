@@ -34,7 +34,7 @@ impl App {
         if self.onboarding {
             frame.render_widget(Paragraph::new("Connect an account\n\nAdd an email account to read and send mail.\n\nenter  Add account    q  Quit")
                 .style(theme::text()).alignment(Alignment::Center)
-                .block(Block::bordered().title(i18n::t(" termail ")).border_style(theme::border(true))), frame.area());
+                .block(Block::bordered().title(i18n::t(" tmail ")).border_style(theme::border(true))), frame.area());
             if let Some(overlay) = &mut self.overlay {
                 self.overlay_geometry = draw_overlay(frame, overlay, self.cursor_back);
             }
@@ -520,7 +520,7 @@ pub(crate) fn draw_mailbox_state(
     let block = Block::bordered()
         .border_style(theme::border(false))
         .title_style(theme::title(false))
-        .title(i18n::t(" termail "));
+        .title(i18n::t(" tmail "));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let width = inner.width.min(64);
@@ -950,9 +950,9 @@ pub(crate) fn draw_overlay(
         }
         Overlay::Unsubscribe { unsubscribe, .. } => {
             let method = if unsubscribe.one_click && unsubscribe.https().is_some() {
-                "Termail sends a one-click request to the sender. No page opens."
+                "Tmail sends a one-click request to the sender. No page opens."
             } else if unsubscribe.mailto().is_some() {
-                "Termail prepares an unsubscribe email for you to review and send."
+                "Tmail prepares an unsubscribe email for you to review and send."
             } else {
                 "The sender's unsubscribe page opens in the browser."
             };

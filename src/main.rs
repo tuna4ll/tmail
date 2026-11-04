@@ -1014,7 +1014,7 @@ mod tests {
 
     impl TestMailbox {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(crate::storage::unique_name("termail-app"));
+            let root = std::env::temp_dir().join(crate::storage::unique_name("tmail-app"));
             for folder in ["cur", "new", "tmp"] {
                 std::fs::create_dir_all(root.join(folder)).unwrap();
             }
@@ -1389,7 +1389,7 @@ mod tests {
         let mailbox = TestMailbox::new();
         let mut app = mailbox.app();
         let sink = mailbox.0.join("sent.log");
-        app.config.send_command = vec!["termail-test-sink".into(), sink.display().to_string()];
+        app.config.send_command = vec!["tmail-test-sink".into(), sink.display().to_string()];
         finish_load(&mut app).await;
         app.start_draft(crate::draft::Start::New);
         let Some(Overlay::Compose(mut state)) = app.overlay.take() else {
@@ -1442,7 +1442,7 @@ mod tests {
             account: "test".into(),
             source,
             mail,
-            command: vec!["termail-test-sink".into(), sink.display().to_string()],
+            command: vec!["tmail-test-sink".into(), sink.display().to_string()],
         }
         .run()
         .await;
@@ -1496,7 +1496,7 @@ mod tests {
             account: "test".into(),
             source: source.clone(),
             mail: mail.clone(),
-            command: vec!["termail-test-sink".into(), sink.display().to_string()],
+            command: vec!["tmail-test-sink".into(), sink.display().to_string()],
         };
         std::fs::write(mailbox.0.join(".Sent"), "blocked").unwrap();
         let result = delivery().run().await;
@@ -1536,7 +1536,7 @@ mod tests {
             source,
             mail,
             command: vec![
-                "termail-test-sink".into(),
+                "tmail-test-sink".into(),
                 mailbox.0.join("sent.log").display().to_string(),
             ],
         }

@@ -16,7 +16,7 @@ use crate::{App, Task, mail::Mail};
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PatchConfig {
-    /// The repository patches go into; the folder termail started in when unset.
+    /// The repository patches go into; the folder tmail started in when unset.
     pub repo: Option<PathBuf>,
     /// Extra arguments for `git am`; `["-3"]` when unset.
     pub am_args: Option<Vec<String>>,
@@ -115,7 +115,7 @@ pub fn series<'a>(mails: &[&'a Mail]) -> (Vec<&'a Mail>, Option<String>) {
 pub fn mbox(messages: &[Vec<u8>]) -> Vec<u8> {
     let mut output = Vec::new();
     for message in messages {
-        output.extend_from_slice(b"From termail Thu Jan  1 00:00:00 1970\n");
+        output.extend_from_slice(b"From tmail Thu Jan  1 00:00:00 1970\n");
         let text = String::from_utf8_lossy(message).replace("\r\n", "\n");
         for line in text.split_inclusive('\n') {
             if line.trim_start_matches('>').starts_with("From ") {
@@ -220,7 +220,7 @@ pub fn fetch_thread(archive: &str, id: &str, cache: &Path) -> Result<(PathBuf, u
         .new_agent();
     let response = agent
         .get(&url)
-        .header("User-Agent", "termail")
+        .header("User-Agent", "tmail")
         .call()
         .map_err(|error| format!("Unable to fetch the thread: {error}"))?;
     let mut compressed = Vec::new();

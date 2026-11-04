@@ -139,7 +139,7 @@ pub fn init(config: &ThemeConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Changes some colors or the preset while termail runs; unset fields keep their
+/// Changes some colors or the preset while tmail runs; unset fields keep their
 /// current value.
 pub fn update(changes: &ThemeConfig) -> Result<(), String> {
     let mut config = CONFIG

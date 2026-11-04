@@ -437,15 +437,15 @@ async fn send_with_timeout(
     let (program, arguments) = command
         .split_first()
         .ok_or_else(|| SendError::failed("Configure send_command before sending."))?;
-    if program == "termail-test-sink" {
+    if program == "tmail-test-sink" {
         let path = arguments
             .first()
-            .ok_or_else(|| SendError::failed("termail-test-sink needs an output path."))?;
+            .ok_or_else(|| SendError::failed("tmail-test-sink needs an output path."))?;
         return write_test_sink(Path::new(path), &message).map_err(SendError::uncertain);
     }
     if arguments.iter().any(|argument| argument == "--") {
         return Err(SendError::failed(
-            "Remove -- from send_command; Termail supplies the recipient arguments.",
+            "Remove -- from send_command; Tmail supplies the recipient arguments.",
         ));
     }
 
@@ -535,7 +535,7 @@ async fn send_with_timeout(
 fn write_test_sink(path: &Path, message: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(message)?;
-    file.write_all(b"\n\n--- termail message ---\n")?;
+    file.write_all(b"\n\n--- tmail message ---\n")?;
     file.sync_all()
 }
 
@@ -568,9 +568,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("termail-sink-{nonce}.eml"));
+        let path = std::env::temp_dir().join(format!("tmail-sink-{nonce}.eml"));
         send(
-            &["termail-test-sink".into(), path.display().to_string()],
+            &["tmail-test-sink".into(), path.display().to_string()],
             b"From: me@example.com\nTo: ada@example.com\nSubject: hello\n\nbody",
         )
         .await

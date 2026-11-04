@@ -208,7 +208,7 @@ pub fn reply(invite: &Invite, attendee: &str, name: &str, answer: Answer) -> Str
     let mut lines = vec![
         "BEGIN:VCALENDAR".to_owned(),
         "VERSION:2.0".to_owned(),
-        "PRODID:-//termail//EN".to_owned(),
+        "PRODID:-//tmail//EN".to_owned(),
         "METHOD:REPLY".to_owned(),
         "BEGIN:VEVENT".to_owned(),
         format!("UID:{}", invite.uid),

@@ -581,7 +581,7 @@ impl App {
         );
         let path = std::env::temp_dir().join(format!(
             "{}.ics",
-            crate::storage::unique_name("termail-reply")
+            crate::storage::unique_name("tmail-reply")
         ));
         if let Err(error) = crate::storage::write_new(&path, reply.as_bytes()) {
             self.notice = Some(format!("Unable to prepare the reply: {error}"));

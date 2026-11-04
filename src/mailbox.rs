@@ -680,9 +680,9 @@ pub fn change_local_folder(
 
 pub(crate) fn cache_dir() -> Option<PathBuf> {
     if cfg!(test) {
-        return Some(std::env::temp_dir().join("termail-test-cache"));
+        return Some(std::env::temp_dir().join("tmail-test-cache"));
     }
-    ProjectDirs::from("com", "tunakilic", "termail").map(|dirs| dirs.cache_dir().to_path_buf())
+    ProjectDirs::from("com", "tunakilic", "tmail").map(|dirs| dirs.cache_dir().to_path_buf())
 }
 
 /// Adds the saved search index, kept in the cache folder next to the message cache.
@@ -819,7 +819,7 @@ fn move_to_folder(path: &Path, folder: &Path) -> io::Result<MaildirChange> {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let unique = format!("{base}.termail-{nonce}{separator}{flags}");
+        let unique = format!("{base}.tmail-{nonce}{separator}{flags}");
         after = folder.join("cur").join(unique);
     }
     crate::storage::rename(path, &after)?;
@@ -852,7 +852,7 @@ fn save_message(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let name = format!("{nonce}.{}{suffix}", crate::storage::unique_name("termail"));
+    let name = format!("{nonce}.{}{suffix}", crate::storage::unique_name("tmail"));
     let temporary = folder.join("tmp").join(&name);
     let destination = folder.join(location).join(name);
     crate::storage::write_new(&temporary, contents)?;
@@ -1113,7 +1113,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("termail-maildir-{nonce}"));
+        let root = std::env::temp_dir().join(format!("tmail-maildir-{nonce}"));
         fs::create_dir_all(root.join("cur")).unwrap();
         fs::create_dir_all(root.join("new")).unwrap();
         fs::create_dir_all(root.join("tmp")).unwrap();
@@ -1163,7 +1163,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("termail-rich-{nonce}"));
+        let root = std::env::temp_dir().join(format!("tmail-rich-{nonce}"));
         for child in ["cur", "new", "tmp"] {
             fs::create_dir_all(root.join(child)).unwrap();
         }
@@ -1194,7 +1194,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("termail-unified-{nonce}"));
+        let root = std::env::temp_dir().join(format!("tmail-unified-{nonce}"));
         let personal = root.join("personal");
         let work = root.join("work");
         for maildir in [&personal, &work] {

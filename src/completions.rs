@@ -1,5 +1,5 @@
-//! Shell completions and the manual page, printed by `termail completions SHELL` and
-//! `termail man`. Written by hand to match the options in `cli.rs`.
+//! Shell completions and the manual page, printed by `tmail completions SHELL` and
+//! `tmail man`. Written by hand to match the options in `cli.rs`.
 
 pub fn script(shell: &str) -> Option<&'static str> {
     match shell {
@@ -10,8 +10,8 @@ pub fn script(shell: &str) -> Option<&'static str> {
     }
 }
 
-const BASH: &str = r#"# termail completion for bash. Load with: source <(termail completions bash)
-_termail() {
+const BASH: &str = r#"# tmail completion for bash. Load with: source <(tmail completions bash)
+_tmail() {
     local current previous
     current="${COMP_WORDS[COMP_CWORD]}"
     previous="${COMP_WORDS[COMP_CWORD-1]}"
@@ -25,12 +25,12 @@ _termail() {
     esac
     COMPREPLY=($(compgen -W "doctor oauth completions man --demo --maildir --config --log --help --version" -- "$current"))
 }
-complete -o filenames -F _termail termail
+complete -o filenames -F _tmail tmail
 "#;
 
-const ZSH: &str = r#"#compdef termail
-# termail completion for zsh. Save as _termail somewhere in $fpath.
-_termail() {
+const ZSH: &str = r#"#compdef tmail
+# tmail completion for zsh. Save as _tmail somewhere in $fpath.
+_tmail() {
     _arguments \
         '--demo[open the built-in mailbox]' \
         '--maildir[open a Maildir mailbox]:folder:_files -/' \
@@ -45,51 +45,51 @@ _termail() {
             [[ $words[1] == completions ]] && _values shell bash zsh fish ;;
     esac
 }
-_termail "$@"
+_tmail "$@"
 "#;
 
-const FISH: &str = r#"# termail completion for fish. Save as ~/.config/fish/completions/termail.fish
-complete -c termail -f
-complete -c termail -n __fish_use_subcommand -a doctor -d 'check the setup'
-complete -c termail -n __fish_use_subcommand -a oauth -d 'sign in with OAuth2'
-complete -c termail -n __fish_use_subcommand -a completions -d 'print shell completions'
-complete -c termail -n __fish_use_subcommand -a man -d 'print the manual page'
-complete -c termail -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'
-complete -c termail -l demo -d 'open the built-in mailbox'
-complete -c termail -l maildir -r -F -d 'open a Maildir mailbox'
-complete -c termail -l config -r -F -d 'load a config file'
-complete -c termail -l log -r -F -d 'append connection errors to a file'
-complete -c termail -s h -l help -d 'show the options'
-complete -c termail -s V -l version -d 'show the version'
+const FISH: &str = r#"# tmail completion for fish. Save as ~/.config/fish/completions/tmail.fish
+complete -c tmail -f
+complete -c tmail -n __fish_use_subcommand -a doctor -d 'check the setup'
+complete -c tmail -n __fish_use_subcommand -a oauth -d 'sign in with OAuth2'
+complete -c tmail -n __fish_use_subcommand -a completions -d 'print shell completions'
+complete -c tmail -n __fish_use_subcommand -a man -d 'print the manual page'
+complete -c tmail -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'
+complete -c tmail -l demo -d 'open the built-in mailbox'
+complete -c tmail -l maildir -r -F -d 'open a Maildir mailbox'
+complete -c tmail -l config -r -F -d 'load a config file'
+complete -c tmail -l log -r -F -d 'append connection errors to a file'
+complete -c tmail -s h -l help -d 'show the options'
+complete -c tmail -s V -l version -d 'show the version'
 "#;
 
 pub fn man_page() -> String {
     MAN.replace("@VERSION@", env!("CARGO_PKG_VERSION"))
 }
 
-const MAN: &str = r#".TH TERMAIL 1 "" "termail @VERSION@" "User Commands"
+const MAN: &str = r#".TH TMAIL 1 "" "tmail @VERSION@" "User Commands"
 .SH NAME
-termail \- mail in the terminal
+tmail \- mail in the terminal
 .SH SYNOPSIS
-.B termail
+.B tmail
 [\fB\-\-config\fR \fIPATH\fR] [\fB\-\-log\fR \fIPATH\fR] [\fB\-\-demo\fR | \fB\-\-maildir\fR \fIPATH\fR]
 .br
-.B termail doctor
+.B tmail doctor
 .br
-.B termail oauth
+.B tmail oauth
 [\fIACCOUNT\fR]
 .br
-.B termail completions
+.B tmail completions
 \fBbash\fR|\fBzsh\fR|\fBfish\fR
 .br
-.B termail man
+.B tmail man
 .SH DESCRIPTION
-termail reads and sends mail from the terminal. It keeps mail in a Maildir, syncs
+tmail reads and sends mail from the terminal. It keeps mail in a Maildir, syncs
 it with IMAP servers in the background, and sends through SMTP or a program such as
 msmtp. Conversations show as a list and as a map of who answered whom.
 .PP
-With no account set up, termail opens a form that finds the server settings from
-the address. Press \fB?\fR inside termail to see every key.
+With no account set up, tmail opens a form that finds the server settings from
+the address. Press \fB?\fR inside tmail to see every key.
 .SH COMMANDS
 .TP
 .B doctor
@@ -144,33 +144,33 @@ Add the sender to the address book.
 Show every key.
 .SH FILES
 .TP
-.I ~/.config/termail/config.toml
-Settings and accounts. termail notices when it changes and applies it. Run
+.I ~/.config/tmail/config.toml
+Settings and accounts. tmail notices when it changes and applies it. Run
 \fB:reload config\fR to do that by hand.
 .TP
-.I ~/.config/termail/init.lua
+.I ~/.config/tmail/init.lua
 A Lua script that can add keys, commands and rules.
 .TP
-.I ~/.config/termail/contacts.vcf
+.I ~/.config/tmail/contacts.vcf
 The address book, as vCard.
 .TP
-.I ~/.config/termail/locales/LANG.toml
+.I ~/.config/tmail/locales/LANG.toml
 A translation of the interface, or changes to a built-in one.
 .PP
-On macOS the folder is \fI~/Library/Application Support/com.tunakilic.termail\fR.
+On macOS the folder is \fI~/Library/Application Support/com.tunakilic.tmail\fR.
 .SH ENVIRONMENT
 .TP
-.B TERMAIL_CONFIG
+.B TMAIL_CONFIG
 The config file when \fB\-\-config\fR is not given.
 .TP
-.B TERMAIL_LOG
+.B TMAIL_LOG
 The log file when \fB\-\-log\fR is not given.
 .TP
 .B EDITOR
 The editor for message bodies, unless the config names one.
 .TP
 .B NO_COLOR
-When set, termail uses the terminal's own colours unless the config picks a theme.
+When set, tmail uses the terminal's own colours unless the config picks a theme.
 .TP
 .BR LANG ", " LC_ALL ", " LC_MESSAGES
 Pick the interface language when \fBui.language\fR is \fBauto\fR.
