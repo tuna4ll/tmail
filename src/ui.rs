@@ -541,9 +541,8 @@ pub(crate) fn draw_mailbox_state(
             );
             if !settings::with(|ui| ui.accessible) {
                 frame.render_widget(
-                    FluxSpinner::new(spinner_tick)
-                        .width(6)
-                        .color(theme::accent()),
+                    Paragraph::new(loading_bar(spinner_tick, spinner_area.width))
+                        .style(ratatui::style::Style::default().fg(theme::accent())),
                     spinner_area,
                 );
             }
@@ -1350,4 +1349,32 @@ pub(crate) fn clamp_rect(rect: Rect, screen: Rect) -> Rect {
     let x = rect.x.clamp(screen.x, screen.right() - width);
     let y = rect.y.clamp(screen.y, screen.bottom() - height);
     Rect::new(x, y, width, height)
+}
+
+/// A light that slides back and forth across `width` cells while mail loads.
+fn loading_bar(tick: u64, width: u16) -> String {
+    let width = i64::from(width.max(1));
+    let span = (width - 1).max(1) * 2;
+    let step = i64::try_from(tick % span as u64).unwrap_or(0);
+    let head = if step < width { step } else { span - step };
+    (0..width)
+        .map(|cell| {
+            ['█', '▓', '▒', '░']
+                .get((cell - head).unsigned_abs() as usize)
+                .copied()
+                .unwrap_or(' ')
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod loading_tests {
+    #[test]
+    fn the_light_bounces_between_the_ends() {
+        let frames: Vec<String> = (0..12).map(|tick| super::loading_bar(tick, 6)).collect();
+        assert_eq!(frames[0], "█▓▒░  ");
+        assert_eq!(frames[5], "  ░▒▓█");
+        assert_eq!(frames[10], frames[0]);
+        assert!(frames.iter().all(|frame| frame.chars().count() == 6));
+    }
 }

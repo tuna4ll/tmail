@@ -83,7 +83,6 @@ use ratatui::{
         Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
     },
 };
-use ratatui_spinner::FluxSpinner;
 use tokio::{sync::mpsc, time::interval};
 
 #[tokio::main]
