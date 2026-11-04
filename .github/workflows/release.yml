@@ -28,7 +28,7 @@ jobs:
           fi
 
   build:
-    name: build ${{ matrix.target }}
+    name: build ${{ matrix.name }}
     needs: check
     runs-on: ${{ matrix.os }}
     strategy:
@@ -36,57 +36,73 @@ jobs:
       matrix:
         include:
           # The oldest supported Ubuntu keeps the glibc requirement low.
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            cross: true
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            targets: x86_64-unknown-linux-gnu
+          - name: linux-arm64
+            os: ubuntu-22.04-arm
+            targets: aarch64-unknown-linux-gnu
+          # Both Mac builds share one machine: macOS runners are the scarce ones,
+          # and a job that waits too long for one is cancelled.
+          - name: macos
+            os: macos-latest
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+          - name: windows-x64
+            os: windows-latest
+            targets: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-      - name: Build
-        run: cargo build --locked --release --features static --target ${{ matrix.target }}
-      - name: Smoke test
-        if: ${{ !matrix.cross }}
+      - name: Install Rust
         shell: bash
         run: |
-          bin="target/${{ matrix.target }}/release/tmail"
-          "$bin" --version
-          "$bin" --help > /dev/null
+          rustup toolchain install stable --profile minimal
+          for target in ${{ matrix.targets }}; do rustup target add "$target"; done
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - name: Build
+        shell: bash
+        run: |
+          for target in ${{ matrix.targets }}; do
+            cargo build --locked --release --features static --target "$target"
+          done
+      - name: Smoke test
+        shell: bash
+        run: |
+          case "$(uname -m)" in arm64 | aarch64) host=aarch64 ;; *) host=x86_64 ;; esac
+          for target in ${{ matrix.targets }}; do
+            # Binaries for another processor are built, not run.
+            case "$target" in "$host"-*) ;; *) continue ;; esac
+            "target/$target/release/tmail" --version
+            "target/$target/release/tmail" --help > /dev/null
+          done
       - name: Package
         shell: bash
         run: |
-          dir="target/${{ matrix.target }}/release"
           mkdir -p dist
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            asset="tmail-${{ matrix.target }}.zip"
-            cp LICENSE README.md "$dir/"
-            (cd "$dir" && 7z a "../../../dist/$asset" tmail.exe LICENSE README.md > /dev/null)
-          else
-            asset="tmail-${{ matrix.target }}.tar.gz"
-            tar -czf "dist/$asset" -C "$dir" tmail -C "$GITHUB_WORKSPACE" LICENSE README.md
-          fi
-          cd dist
-          if command -v sha256sum > /dev/null; then
-            sha256sum "$asset" > "$asset.sha256"
-          else
-            shasum -a 256 "$asset" > "$asset.sha256"
-          fi
-          cat "$asset.sha256"
+          for target in ${{ matrix.targets }}; do
+            dir="target/$target/release"
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              asset="tmail-$target.zip"
+              cp LICENSE README.md "$dir/"
+              (cd "$dir" && 7z a "../../../dist/$asset" tmail.exe LICENSE README.md > /dev/null)
+            else
+              asset="tmail-$target.tar.gz"
+              tar -czf "dist/$asset" -C "$dir" tmail -C "$GITHUB_WORKSPACE" LICENSE README.md
+            fi
+            (
+              cd dist
+              if command -v sha256sum > /dev/null; then
+                sha256sum "$asset" > "$asset.sha256"
+              else
+                shasum -a 256 "$asset" > "$asset.sha256"
+              fi
+              cat "$asset.sha256"
+            )
+          done
       - uses: actions/upload-artifact@v7
         with:
-          name: tmail-${{ matrix.target }}
+          name: tmail-${{ matrix.name }}
           path: dist/*
           if-no-files-found: error
 

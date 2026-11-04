@@ -702,9 +702,18 @@ pub(crate) mod tests {
         pub port: u16,
     }
 
-    /// A certificate for localhost that every platform's TLS library accepts. macOS
-    /// wants a server certificate to say what it is for and to last at most 825 days.
+    /// A certificate for localhost that every platform's TLS library accepts, made
+    /// once for all tests: on Windows, importing a fresh key for every test server
+    /// while the tests run in parallel makes handshakes fail now and then.
     fn identity() -> (String, native_tls::Identity) {
+        static SHARED: std::sync::OnceLock<(String, native_tls::Identity)> =
+            std::sync::OnceLock::new();
+        SHARED.get_or_init(make_identity).clone()
+    }
+
+    /// macOS wants a server certificate to say what it is for and to last at most
+    /// 825 days.
+    fn make_identity() -> (String, native_tls::Identity) {
         use chrono::Datelike;
         let year = chrono::Utc::now().year();
         let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
@@ -741,7 +750,12 @@ pub(crate) mod tests {
             let port = listener.local_addr().unwrap().port();
             Self {
                 listener,
-                acceptor: native_tls::TlsAcceptor::new(identity).unwrap(),
+                acceptor: native_tls::TlsAcceptor::builder(identity)
+                    // Schannel's TLS 1.3 server fails at random with an in-memory key
+                    // ("The Local Security Authority cannot be contacted").
+                    .max_protocol_version(cfg!(windows).then_some(native_tls::Protocol::Tlsv12))
+                    .build()
+                    .unwrap(),
                 pem,
                 port,
             }
