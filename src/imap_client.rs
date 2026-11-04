@@ -2206,6 +2206,8 @@ mod tests {
             1,
             "the read message is in the new folder on the server"
         );
+        // GreenMail starts with only an inbox; real servers come with a Sent folder.
+        let _ = session.create("Sent");
         let _ = session.logout();
         // The Sent copy is saved once, and IDLE notices new mail.
         copy_sent(&remote, message.as_bytes(), true)

@@ -685,15 +685,41 @@ pub(crate) mod tests {
         pub port: u16,
     }
 
+    /// A certificate for localhost that every platform's TLS library accepts. macOS
+    /// wants a server certificate to say what it is for and to last at most 825 days.
+    fn identity() -> (String, native_tls::Identity) {
+        use chrono::Datelike;
+        let year = chrono::Utc::now().year();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        params.subject_alt_names.push(rcgen::SanType::IpAddress(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+        ));
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "localhost");
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        params.not_before = rcgen::date_time_ymd(year - 1, 6, 1);
+        params.not_after = rcgen::date_time_ymd(year + 1, 1, 1);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let pem = cert.pem();
+        // Secure Transport and Schannel only read keys from PKCS#12; OpenSSL 3 no
+        // longer reads the legacy PKCS#12 those two expect.
+        let identity = if cfg!(any(target_os = "macos", windows)) {
+            let der = p12::PFX::new(cert.der(), &key.serialize_der(), None, "tmail", "localhost")
+                .unwrap()
+                .to_der();
+            native_tls::Identity::from_pkcs12(&der, "tmail").unwrap()
+        } else {
+            native_tls::Identity::from_pkcs8(pem.as_bytes(), key.serialize_pem().as_bytes())
+                .unwrap()
+        };
+        (pem, identity)
+    }
+
     impl Server {
         pub fn new() -> Self {
-            let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-            let pem = key.cert.pem();
-            let identity = native_tls::Identity::from_pkcs8(
-                pem.as_bytes(),
-                key.signing_key.serialize_pem().as_bytes(),
-            )
-            .unwrap();
+            let (pem, identity) = identity();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             Self {
