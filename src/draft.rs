@@ -328,7 +328,7 @@ impl Composer {
                 return Err(DraftError("From must contain exactly one address.".into()));
             }
             for (field, value) in [("To", &self.to), ("Cc", &self.cc), ("Bcc", &self.bcc)] {
-                crate::message::addresses(value, field).map_err(DraftError)?;
+                crate::message::addresses(without_separator(value), field).map_err(DraftError)?;
             }
             if self.subject.chars().any(char::is_control) {
                 return Err(DraftError("Subject contains a control character.".into()));
@@ -346,9 +346,9 @@ impl Composer {
         })?;
         let mut headers = vec![
             format!("From: {}", one_line(&self.from)),
-            format!("To: {}", one_line(&self.to)),
-            format!("Cc: {}", one_line(&self.cc)),
-            format!("Bcc: {}", one_line(&self.bcc)),
+            format!("To: {}", one_line(without_separator(&self.to))),
+            format!("Cc: {}", one_line(without_separator(&self.cc))),
+            format!("Bcc: {}", one_line(without_separator(&self.bcc))),
             format!("Subject: {}", one_line(&self.subject)),
         ];
         headers.extend(
@@ -511,6 +511,12 @@ fn warnings(summary: &Summary, subject: &str, body: &str) -> Vec<String> {
         ));
     }
     warnings
+}
+
+/// A recipient field without the separator the composer leaves after an accepted
+/// suggestion, ready for the next name.
+fn without_separator(value: &str) -> &str {
+    value.trim_end_matches([',', ';', ' '])
 }
 
 fn one_line(value: &str) -> String {
@@ -762,6 +768,16 @@ mod tests {
         assert!(message.contains("Subject: Re: Update"));
         assert!(message.contains("In-Reply-To: <first@example.com>"));
         assert!(message.contains("<root@example.com> <first@example.com>"));
+        composer.remove_body().unwrap();
+    }
+
+    #[test]
+    fn an_accepted_suggestion_leaves_a_valid_recipient() {
+        let mut composer = Composer::new(None, Some("tuna@example.com"), None).unwrap();
+        composer.to = "Ada <ada@example.com>, ".into();
+        fs::write(&composer.body_path, "hi").unwrap();
+        let message = String::from_utf8(composer.message(Path::new(".")).unwrap()).unwrap();
+        assert!(message.contains("ada@example.com"), "{message}");
         composer.remove_body().unwrap();
     }
 

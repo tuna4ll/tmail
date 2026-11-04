@@ -147,7 +147,10 @@ impl Body {
             return body;
         };
         let mut referenced = Vec::new();
-        if let Some(html) = message.body_html(0) {
+        if let Some(html) = message
+            .body_html(0)
+            .filter(|_| crate::mailbox::has_html(&message))
+        {
             let (html, slots, pixels) = place_images(&html, |id| {
                 message.parts.iter().enumerate().find_map(|(index, part)| {
                     (part.content_id().map(clean_id) == Some(id)).then(|| {

@@ -476,7 +476,7 @@ fn load_maildir(path: &Path) -> Result<LoadReport, LoadError> {
             let reply_address = parsed.reply_to().map(format_addresses).unwrap_or_default();
             let unread = entry.unread;
             let starred = entry.starred;
-            let html = parsed.html_body_count() > 0;
+            let html = has_html(&parsed);
             let html_body = parsed.body_html(0);
             let body = parsed
                 .body_text(0)
@@ -1002,6 +1002,16 @@ fn format_address(address: &mail_parser::Addr<'_>) -> String {
     }
 }
 
+/// Whether the message has a real HTML part. mail-parser also lists plain text among
+/// the HTML bodies of a message without one, converted on request.
+pub(crate) fn has_html(message: &mail_parser::Message<'_>) -> bool {
+    (0..message.html_body_count()).any(|index| {
+        message
+            .html_part(index as u32)
+            .is_some_and(|part| matches!(part.body, mail_parser::PartType::Html(_)))
+    })
+}
+
 fn extract_links(html: &str) -> Vec<String> {
     let lower = html.to_ascii_lowercase();
     let mut links = Vec::new();
@@ -1078,7 +1088,16 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{MailboxSource, readable_html};
+    use super::{MailboxSource, MessageParser, has_html, readable_html};
+
+    #[test]
+    fn plain_text_is_not_html() {
+        let parse = |text: &'static [u8]| MessageParser::default().parse(text).unwrap();
+        assert!(!has_html(&parse(b"Content-Type: text/plain\r\n\r\nhi")));
+        assert!(has_html(&parse(
+            b"Content-Type: text/html\r\n\r\n<p>hi</p>"
+        )));
+    }
 
     #[test]
     fn keeps_html_blocks_readable() {
