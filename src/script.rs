@@ -13,7 +13,7 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use mlua::{Function, HookTriggers, Lua, LuaSerdeExt, Table, Value, VmState};
+use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 
 use crate::mail::Mail;
 
@@ -101,6 +101,8 @@ pub struct Engine {
     lua: Lua,
     shared: Rc<Shared>,
     path: PathBuf,
+    /// For a plugin, its manifest; `None` for the user's own script.
+    plugin: Option<Manifest>,
     /// Formatted list rows by conversation state, so formatting runs once per change.
     rows: RefCell<HashMap<String, (String, String)>>,
 }
@@ -140,10 +142,117 @@ impl Engine {
             lua: Lua::new(),
             shared: Rc::new(Shared::default()),
             path: path.to_path_buf(),
+            plugin: None,
             rows: RefCell::default(),
         };
+        engine.run(path)
+    }
+
+    /// Loads a plugin folder: `plugin.toml` says what it may do and `main.lua` runs
+    /// with only that. Without the `system` permission there is no `io`, no `os`
+    /// beyond the clock, and no way to load other files.
+    pub fn load_plugin(folder: &Path) -> Result<(Self, Option<String>), String> {
+        let manifest_path = folder.join("plugin.toml");
+        let text = std::fs::read_to_string(&manifest_path)
+            .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+        let mut manifest: Manifest = toml::from_str(&text)
+            .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+        if manifest.name.is_empty() {
+            manifest.name = folder
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+        }
+        for permission in &manifest.permissions {
+            if !PERMISSIONS.iter().any(|(name, _)| name == permission) {
+                return Err(format!(
+                    "{}: unknown permission {permission:?}",
+                    manifest.name
+                ));
+            }
+        }
+        let system = manifest.allows("system");
+        let lua = if system {
+            Lua::new()
+        } else {
+            Lua::new_with(
+                StdLib::STRING
+                    | StdLib::TABLE
+                    | StdLib::MATH
+                    | StdLib::UTF8
+                    | StdLib::COROUTINE
+                    | StdLib::OS,
+                LuaOptions::default(),
+            )
+            .map_err(|error| error.to_string())?
+        };
+        let engine = Self {
+            lua,
+            shared: Rc::new(Shared::default()),
+            path: folder.join("main.lua"),
+            plugin: Some(manifest),
+            rows: RefCell::default(),
+        };
+        if !system {
+            engine.sandbox().map_err(|error| describe(&error))?;
+        }
+        let path = engine.path.clone();
+        Ok(engine.run(&path))
+    }
+
+    /// Removes what reaches outside the plugin: files, programs and the environment.
+    fn sandbox(&self) -> mlua::Result<()> {
+        let globals = self.lua.globals();
+        for name in ["dofile", "loadfile", "require", "package", "debug", "io"] {
+            globals.set(name, Value::Nil)?;
+        }
+        if let Ok(os) = globals.get::<Table>("os") {
+            for name in [
+                "execute",
+                "exit",
+                "getenv",
+                "remove",
+                "rename",
+                "tmpname",
+                "setlocale",
+            ] {
+                os.set(name, Value::Nil)?;
+            }
+        }
+        // Crafted bytecode can break out of the sandbox, so only source text loads.
+        let load: Function = globals.get("load")?;
+        globals.set(
+            "load",
+            self.lua.create_function(
+                move |_, (chunk, name, _mode, env): (Value, Value, Value, Value)| {
+                    load.call::<mlua::MultiValue>((chunk, name, "t", env))
+                },
+            )?,
+        )?;
+        if let Ok(string) = globals.get::<Table>("string") {
+            string.set("dump", Value::Nil)?;
+        }
+        self.lua.set_memory_limit(64 * 1024 * 1024)?;
+        Ok(())
+    }
+
+    pub fn plugin(&self) -> Option<&Manifest> {
+        self.plugin.as_ref()
+    }
+
+    /// A short name for errors: the plugin's name, or "Script".
+    pub fn label(&self) -> String {
+        match &self.plugin {
+            Some(manifest) => format!("Plugin {}", manifest.name),
+            None => "Script".into(),
+        }
+    }
+
+    fn run(self, path: &Path) -> (Self, Option<String>) {
+        let engine = self;
         let error = engine
             .install()
+            .and_then(|()| engine.restrict())
             .and_then(|()| {
                 let source = std::fs::read_to_string(path).map_err(|error| {
                     mlua::Error::external(format!("{}: {error}", path.display()))
@@ -511,7 +620,64 @@ impl Engine {
             })?,
         )?;
 
+        let hosts = self
+            .plugin
+            .as_ref()
+            .map(|manifest| manifest.network.clone());
+        api.set(
+            "fetch",
+            lua.create_function(move |lua, url: String| fetch(lua, &url, hosts.as_deref()))?,
+        )?;
+
         lua.globals().set("termail", api)?;
+        Ok(())
+    }
+
+    /// For a plugin, replaces every function it did not ask for with one that says
+    /// which permission is missing, and checks events as they are registered.
+    fn restrict(&self) -> mlua::Result<()> {
+        let Some(manifest) = &self.plugin else {
+            return Ok(());
+        };
+        let api: Table = self.lua.globals().get("termail")?;
+        for (function, permission) in GUARDED {
+            if manifest.allows(permission) {
+                continue;
+            }
+            let message = format!(
+                "{} needs the {permission:?} permission for termail.{function}",
+                manifest.name
+            );
+            api.set(
+                *function,
+                self.lua
+                    .create_function(move |_, _: mlua::MultiValue| -> mlua::Result<()> {
+                        Err(mlua::Error::external(message.clone()))
+                    })?,
+            )?;
+        }
+        let original: Function = api.get("on")?;
+        let allowed: Vec<String> = manifest.permissions.clone();
+        let name = manifest.name.clone();
+        api.set(
+            "on",
+            self.lua
+                .create_function(move |_, (event, function): (String, Function)| {
+                    let needed = match event.as_str() {
+                        "open" | "new_mail" | "folder" => Some("read"),
+                        "before_send" => Some("send"),
+                        _ => None,
+                    };
+                    if let Some(needed) = needed
+                        && !allowed.iter().any(|permission| permission == needed)
+                    {
+                        return Err(mlua::Error::external(format!(
+                            "{name} needs the {needed:?} permission for the {event} event"
+                        )));
+                    }
+                    original.call::<()>((event, function))
+                })?,
+        )?;
         Ok(())
     }
 
@@ -722,6 +888,128 @@ impl Engine {
 }
 
 /// One conversation as `termail.format` sees it, with the built-in text.
+/// What a plugin may use, with a line for the user about each.
+pub const PERMISSIONS: &[(&str, &str)] = &[
+    ("read", "read your messages"),
+    ("keys", "add keys"),
+    ("commands", "add : commands"),
+    ("interface", "change the status line and list rows"),
+    ("notify", "show desktop notifications"),
+    ("organize", "move, archive and mark messages"),
+    ("compose", "open the composer"),
+    ("actions", "run any action or command"),
+    ("navigate", "open messages and folders, search"),
+    ("settings", "change settings and colours"),
+    ("send", "change or stop messages before they are sent"),
+    ("network", "talk to the sites it lists"),
+    ("system", "use files and programs, like your own script"),
+];
+
+/// Functions of the `termail` table and the permission each needs.
+const GUARDED: &[(&str, &str)] = &[
+    ("selected", "read"),
+    ("mails", "read"),
+    ("state", "read"),
+    ("map", "keys"),
+    ("command", "commands"),
+    ("status", "interface"),
+    ("format", "interface"),
+    ("notify", "notify"),
+    ("move", "organize"),
+    ("archive", "organize"),
+    ("trash", "organize"),
+    ("mark", "organize"),
+    ("compose", "compose"),
+    ("run", "actions"),
+    ("open", "navigate"),
+    ("folder", "navigate"),
+    ("search", "navigate"),
+    ("set", "settings"),
+    ("get", "settings"),
+    ("theme", "settings"),
+    ("fetch", "network"),
+];
+
+/// `plugin.toml`.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Manifest {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub permissions: Vec<String>,
+    /// Sites `termail.fetch` may reach, such as `"api.github.com"` or `"*.example.com"`.
+    pub network: Vec<String>,
+}
+
+impl Manifest {
+    pub fn allows(&self, permission: &str) -> bool {
+        self.permissions.iter().any(|granted| granted == permission)
+    }
+}
+
+fn host_allowed(host: &str, allowed: &[String]) -> bool {
+    allowed.iter().any(|entry| match entry.strip_prefix("*.") {
+        Some(domain) => host == domain || host.ends_with(&format!(".{domain}")),
+        None => host == entry,
+    })
+}
+
+/// `termail.fetch(url)`: a short HTTPS GET for scripts and plugins with the network
+/// permission. Plugins only reach the hosts their manifest lists.
+fn fetch(lua: &Lua, url: &str, hosts: Option<&[String]>) -> mlua::Result<Table> {
+    use std::io::Read;
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| mlua::Error::external("fetch only takes https:// addresses"))?;
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if let Some(hosts) = hosts
+        && !host_allowed(&host, hosts)
+    {
+        return Err(mlua::Error::external(format!(
+            "{host} is not in the plugin's network list"
+        )));
+    }
+    let agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .build(),
+        )
+        .http_status_as_error(false)
+        // Scripts run on the interface thread, so the wait stays short.
+        .timeout_global(Some(Duration::from_millis(1500)))
+        .build()
+        .new_agent();
+    let response = agent
+        .get(url)
+        .header("User-Agent", "termail")
+        .call()
+        .map_err(|error| mlua::Error::external(format!("fetch failed: {error}")))?;
+    let status = response.status().as_u16();
+    let mut body = String::new();
+    response
+        .into_body()
+        .into_reader()
+        .take(1024 * 1024)
+        .read_to_string(&mut body)
+        .map_err(|error| mlua::Error::external(format!("fetch failed: {error}")))?;
+    let table = lua.create_table()?;
+    table.set("status", status)?;
+    table.set("body", body)?;
+    Ok(table)
+}
+
 pub struct Row {
     pub subject: String,
     pub from: String,
@@ -898,5 +1186,61 @@ mod tests {
         assert!(error.unwrap().contains("ui.sort"));
         let (_, error) = engine(r#"termail.on("no_such_event", function() end)"#);
         assert!(error.unwrap().contains("unknown event"));
+    }
+}
+#[cfg(test)]
+mod plugin_tests {
+    use super::*;
+    fn try_plugin(manifest: &str, code: &str) -> Result<(Engine, Option<String>), String> {
+        let dir = std::env::temp_dir().join(crate::storage::unique_name("plugin"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
+        std::fs::write(dir.join("main.lua"), code).unwrap();
+        let loaded = Engine::load_plugin(&dir);
+        let _ = std::fs::remove_dir_all(dir);
+        loaded
+    }
+    fn plugin(manifest: &str, code: &str) -> (Engine, Option<String>) {
+        try_plugin(manifest, code).unwrap()
+    }
+    #[test]
+    fn plugins_only_get_what_they_ask_for() {
+        let (_, e) = plugin(
+            "name = \"a\"",
+            "termail.notice('hi'); local t = os.time(); assert(io == nil); assert(os.execute == nil); assert(dofile == nil)",
+        );
+        assert!(e.is_none());
+        let (_, e) = plugin("name = \"b\"", "termail.mails()");
+        assert!(e.unwrap().contains("\"read\""));
+        let (_, e) = plugin("name = \"c\"", "termail.on('before_send', function() end)");
+        assert!(e.unwrap().contains("\"send\""));
+        let (en, e) = plugin(
+            "name = \"d\"\npermissions = [\"read\", \"commands\"]",
+            "termail.command('hello', function() termail.notice(#termail.mails()) end)",
+        );
+        assert!(e.is_none());
+        assert!(en.command("hello", "").unwrap().is_ok());
+        let (_, e) = plugin(
+            "name = \"e\"\npermissions = [\"network\"]\nnetwork = [\"api.github.com\"]",
+            "termail.fetch('https://evil.test/')",
+        );
+        assert!(e.unwrap().contains("not in the plugin's network list"));
+        let (_, e) = plugin(
+            "name = \"f\"",
+            "assert(string.dump == nil); assert(load('\\27Lua') == nil); assert(load('return 1')() == 1)",
+        );
+        assert!(e.is_none(), "{e:?}");
+        assert!(try_plugin("permissions = [\"root\"]", "").is_err());
+        let (_, e) = plugin(
+            "name = \"g\"",
+            "local t = {} while true do t[#t+1] = string.rep('x', 1000000) end",
+        );
+        assert!(e.is_some());
+        let (_, e) = plugin(
+            "name = \"h\"\npermissions = [\"system\"]",
+            "assert(io ~= nil and os.getenv ~= nil)",
+        );
+        assert!(e.is_none());
+        assert!(Engine::load_plugin(std::path::Path::new("/nonexistent")).is_err());
     }
 }

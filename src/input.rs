@@ -835,20 +835,20 @@ impl App {
                 self.load_script();
                 if let Some(engine) = self.script.as_ref().filter(|_| self.notice.is_none()) {
                     self.notice = Some(format!("Script reloaded · {}", engine.path().display()));
-                } else if self.script.is_none() {
+                } else if self.script.is_none() && self.notice.is_none() {
                     self.notice = Some("No init.lua found next to the config.".into());
                 }
             }
+            "plugins" => self.describe_plugins(),
             "" => {}
             _ if self.run_script_command(command) => {}
             _ => {
-                let scripted = self
-                    .script
-                    .as_ref()
-                    .map(script::Engine::command_names)
-                    .filter(|names| !names.is_empty())
-                    .map(|names| format!(" Script commands: {}.", names.join(", ")))
-                    .unwrap_or_default();
+                let names = self.script_command_names();
+                let scripted = if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Script commands: {}.", names.join(", "))
+                };
                 self.notice = Some(format!(
                     "Unknown command: {command}. Press ? to view commands.{scripted}"
                 ));

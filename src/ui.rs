@@ -171,8 +171,8 @@ impl App {
                     }
                     _ => sender,
                 };
-                let (subject, sender) = match &self.script {
-                    Some(engine) if engine.formats_rows() => {
+                let (subject, sender) = match self.row_formatter() {
+                    Some(engine) => {
                         let mails = conversation.mails(&self.mails);
                         let latest = mails
                             .iter()

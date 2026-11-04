@@ -4,29 +4,93 @@
 use super::*;
 
 impl App {
-    /// Loads `init.lua`, or reloads it. Errors show in the status line.
+    /// The user's script first, then the plugins.
+    fn engines(&self) -> impl Iterator<Item = &script::Engine> {
+        self.script.iter().chain(&self.plugins)
+    }
+
+    /// Loads `init.lua` and the plugins, or reloads them. Errors show in the status
+    /// line.
     pub(crate) fn load_script(&mut self) {
-        let Some(path) = script::path(&self.config) else {
-            self.script = None;
-            return;
-        };
-        let (engine, error) = script::Engine::load(&path);
-        self.script = Some(engine);
-        if let Some(error) = error {
-            self.notice = Some(format!("Script error · {error}"));
-            crate::log::write("script", &error);
+        let mut errors = Vec::new();
+        self.script = script::path(&self.config).map(|path| {
+            let (engine, error) = script::Engine::load(&path);
+            errors.extend(error.map(|error| format!("Script error · {error}")));
+            engine
+        });
+        self.plugins.clear();
+        for folder in self.plugin_folders() {
+            match script::Engine::load_plugin(&folder) {
+                Ok((engine, error)) => {
+                    errors.extend(error.map(|error| format!("{} · {error}", engine.label())));
+                    self.plugins.push(engine);
+                }
+                Err(error) => errors.push(format!("Plugin error · {error}")),
+            }
+        }
+        for error in &errors {
+            crate::log::write("script", error);
+        }
+        if let Some(error) = errors.into_iter().next() {
+            self.notice = Some(error);
         }
         self.apply_script_effects();
         self.update_script_mailbox();
         self.emit_event("startup", &[]);
     }
 
-    /// Shares the loaded messages with the script, without their bodies.
-    pub(crate) fn update_script_mailbox(&mut self) {
-        let Some(engine) = &self.script else {
-            return;
+    /// Folders in `plugins/` next to the config, minus the ones `[plugins]` turns off.
+    fn plugin_folders(&self) -> Vec<PathBuf> {
+        let Some(base) = self.config.path.as_deref().and_then(Path::parent) else {
+            return Vec::new();
         };
-        let mails = self
+        let Ok(entries) = fs::read_dir(base.join("plugins")) else {
+            return Vec::new();
+        };
+        let mut folders: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.join("plugin.toml").is_file())
+            .filter(|path| {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                !self.config.plugins.disabled.contains(&name)
+            })
+            .collect();
+        folders.sort();
+        folders
+    }
+
+    /// `:plugins`: what is installed and what each may do.
+    pub(crate) fn describe_plugins(&mut self) {
+        if self.plugins.is_empty() {
+            self.notice = Some("No plugins. Put them in plugins/ next to the config.".into());
+            return;
+        }
+        let list: Vec<String> = self
+            .plugins
+            .iter()
+            .filter_map(script::Engine::plugin)
+            .map(|manifest| {
+                let permissions = if manifest.permissions.is_empty() {
+                    "no permissions".to_owned()
+                } else {
+                    manifest.permissions.join(", ")
+                };
+                format!("{} {} ({permissions})", manifest.name, manifest.version)
+            })
+            .collect();
+        self.notice = Some(format!("Plugins · {}", list.join(" · ")));
+    }
+
+    /// Shares the loaded messages with the scripts, without their bodies.
+    pub(crate) fn update_script_mailbox(&mut self) {
+        if self.script.is_none() && self.plugins.is_empty() {
+            return;
+        }
+        let mails: Vec<Mail> = self
             .mails
             .iter()
             .map(|mail| Mail {
@@ -35,23 +99,27 @@ impl App {
                 ..mail.clone()
             })
             .collect();
-        engine.context().mails = mails;
-        engine.forget_rows();
+        for engine in self.engines() {
+            engine.context().mails = mails.clone();
+            engine.forget_rows();
+        }
     }
 
     fn update_script_context(&self) {
-        let Some(engine) = &self.script else {
+        if self.script.is_none() && self.plugins.is_empty() {
             return;
-        };
+        }
         let selected = self
             .active_mail_id()
             .and_then(|id| self.mails.iter().find(|mail| mail.id == id))
             .cloned();
-        let mut context = engine.context();
-        context.selected = selected;
-        context.folder = self.active_folder.clone();
-        context.account = self.account_label.clone();
-        context.query = self.query.clone();
+        for engine in self.engines() {
+            let mut context = engine.context();
+            context.selected = selected.clone();
+            context.folder = self.active_folder.clone();
+            context.account = self.account_label.clone();
+            context.query = self.query.clone();
+        }
     }
 
     fn script_mode(&self) -> &'static str {
@@ -68,89 +136,86 @@ impl App {
     pub(crate) fn run_script_key(&mut self, key: KeyEvent) -> bool {
         self.update_script_context();
         let mode = self.script_mode();
-        let Some(result) = self
-            .script
-            .as_ref()
-            .and_then(|engine| engine.binding(key, mode))
+        let Some((label, result)) = self
+            .engines()
+            .find_map(|engine| Some((engine.label(), engine.binding(key, mode)?)))
         else {
             return false;
         };
         match result {
             Ok(Some(action)) => self.run_named(&action),
             Ok(None) => {}
-            Err(error) => self.notice = Some(format!("Script error · {error}")),
+            Err(error) => self.notice = Some(format!("{label} error · {error}")),
         }
         self.apply_script_effects();
         true
     }
 
-    /// Runs a `:` command a script defined. Returns whether one did.
+    /// Runs a `:` command a script or plugin defined. Returns whether one did.
     pub(crate) fn run_script_command(&mut self, command: &str) -> bool {
         let (name, arguments) = command.split_once(' ').unwrap_or((command, ""));
         self.update_script_context();
-        let Some(result) = self
-            .script
-            .as_ref()
-            .and_then(|engine| engine.command(name, arguments.trim()))
+        let Some((label, result)) = self
+            .engines()
+            .find_map(|engine| Some((engine.label(), engine.command(name, arguments.trim())?)))
         else {
             return false;
         };
         if let Err(error) = result {
-            self.notice = Some(format!("Script error · {error}"));
+            self.notice = Some(format!("{label} error · {error}"));
         }
         self.apply_script_effects();
         true
     }
 
-    /// Tells the script about an event with plain fields.
+    pub(crate) fn script_command_names(&self) -> Vec<String> {
+        self.engines()
+            .flat_map(script::Engine::command_names)
+            .collect()
+    }
+
+    /// Tells the scripts about an event with plain fields.
     pub(crate) fn emit_event(&mut self, event: &str, fields: &[(&str, String)]) {
-        let Some(engine) = &self.script else {
-            return;
-        };
-        if !engine.has(event) {
+        if !self.engines().any(|engine| engine.has(event)) {
             return;
         }
         self.update_script_context();
-        if let Some(Err(error)) = self
-            .script
-            .as_ref()
-            .map(|engine| engine.emit(event, fields))
-        {
-            self.notice = Some(format!("Script error in {event} · {error}"));
+        let error = self.engines().find_map(|engine| {
+            engine
+                .emit(event, fields)
+                .err()
+                .map(|error| format!("{} error in {event} · {error}", engine.label()))
+        });
+        if let Some(error) = error {
+            self.notice = Some(error);
         }
         self.apply_script_effects();
     }
 
-    /// Tells the script about an event concerning one message.
+    /// Tells the scripts about an event concerning one message.
     pub(crate) fn emit_mail_event(&mut self, event: &str, mail_id: &str) {
-        let Some(engine) = &self.script else {
-            return;
-        };
-        if !engine.has(event) {
+        if !self.engines().any(|engine| engine.has(event)) {
             return;
         }
         let Some(mail) = self.mails.iter().find(|mail| mail.id == mail_id).cloned() else {
             return;
         };
         self.update_script_context();
-        if let Some(Err(error)) = self
-            .script
-            .as_ref()
-            .map(|engine| engine.emit_mail(event, &mail))
-        {
-            self.notice = Some(format!("Script error in {event} · {error}"));
+        let error = self.engines().find_map(|engine| {
+            engine
+                .emit_mail(event, &mail)
+                .err()
+                .map(|error| format!("{} error in {event} · {error}", engine.label()))
+        });
+        if let Some(error) = error {
+            self.notice = Some(error);
         }
         self.apply_script_effects();
     }
 
     /// Calls `new_mail` for unread messages that were not loaded before.
     pub(crate) fn emit_new_mail(&mut self, before: &std::collections::HashSet<String>) {
-        if before.is_empty()
-            || !self
-                .script
-                .as_ref()
-                .is_some_and(|engine| engine.has("new_mail"))
-        {
+        if before.is_empty() || !self.engines().any(|engine| engine.has("new_mail")) {
             return;
         }
         let arrived: Vec<String> = self
@@ -165,12 +230,10 @@ impl App {
         }
     }
 
-    /// Lets the script change or stop a message before it is sent.
+    /// Lets the scripts change or stop a message before it is sent, one after the
+    /// other.
     pub(crate) fn script_before_send(&mut self, state: &mut ComposeState) -> Result<(), String> {
-        let Some(engine) = &self.script else {
-            return Ok(());
-        };
-        if !engine.has("before_send") {
+        if !self.engines().any(|engine| engine.has("before_send")) {
             return Ok(());
         }
         self.update_script_context();
@@ -184,10 +247,13 @@ impl App {
             body: fs::read_to_string(&composer.body_path).unwrap_or_default(),
         };
         let original_body = draft.body.clone();
-        let result = self
-            .script
-            .as_ref()
-            .map_or(Ok(()), |engine| engine.before_send(&mut draft));
+        let mut result = Ok(());
+        for engine in self.script.iter().chain(&self.plugins) {
+            if let Err(error) = engine.before_send(&mut draft) {
+                result = Err(error);
+                break;
+            }
+        }
         self.apply_script_effects();
         result?;
         composer.from = draft.from;
@@ -202,23 +268,32 @@ impl App {
     }
 
     pub(crate) fn run_script_timers(&mut self) {
-        if self.script.is_none() {
+        if self.script.is_none() && self.plugins.is_empty() {
             return;
         }
         self.update_script_context();
-        let errors = self
-            .script
-            .as_ref()
-            .map(script::Engine::run_timers)
-            .unwrap_or_default();
-        if let Some(error) = errors.into_iter().next() {
-            self.notice = Some(format!("Script error in a timer · {error}"));
+        let error = self.engines().find_map(|engine| {
+            engine
+                .run_timers()
+                .into_iter()
+                .next()
+                .map(|error| format!("{} error in a timer · {error}", engine.label()))
+        });
+        if let Some(error) = error {
+            self.notice = Some(error);
         }
         self.apply_script_effects();
     }
 
     pub(crate) fn script_status(&self) -> Option<String> {
-        self.script.as_ref()?.status()
+        let parts: Vec<String> = self.engines().filter_map(script::Engine::status).collect();
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    /// The engine that formats list rows: the script, or else the first plugin that
+    /// does.
+    pub(crate) fn row_formatter(&self) -> Option<&script::Engine> {
+        self.engines().find(|engine| engine.formats_rows())
     }
 
     /// Runs a built-in action by name, or a `:` command.
@@ -239,11 +314,10 @@ impl App {
     /// Carries out what scripts asked for during their last calls.
     pub(crate) fn apply_script_effects(&mut self) {
         for _ in 0..8 {
-            let effects = self
-                .script
-                .as_ref()
-                .map(script::Engine::take_effects)
-                .unwrap_or_default();
+            let effects: Vec<script::Effect> = self
+                .engines()
+                .flat_map(script::Engine::take_effects)
+                .collect();
             if effects.is_empty() {
                 return;
             }
@@ -328,7 +402,7 @@ impl App {
                     self.inbox_width = ui.inbox_width;
                     self.reader_width = ui.reader_width;
                 });
-                if let Some(engine) = &self.script {
+                for engine in self.engines() {
                     engine.forget_rows();
                 }
                 self.rebuild_mailbox(self.active_mail_id().as_deref());

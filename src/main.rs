@@ -256,6 +256,8 @@ pub struct App {
     auth_failed: std::collections::HashSet<String>,
     address_book: Vec<contacts::Contact>,
     script: Option<script::Engine>,
+    /// Plugins from `plugins/` next to the config, each with only its permissions.
+    plugins: Vec<script::Engine>,
     /// The folder the script last heard about.
     script_folder: String,
     /// Decrypted or verified content by message, kept only in memory.
@@ -680,6 +682,7 @@ impl App {
             auth_failed: Default::default(),
             address_book: Vec::new(),
             script: None,
+            plugins: Vec::new(),
             script_folder: String::new(),
             overlay: None,
             config,

@@ -220,6 +220,64 @@ end)
 
 termail remembers each result until the conversation changes, so formatting stays fast even in a large mailbox.
 
+## Plugins
+
+`init.lua` is your own code and can do anything you can. Plugins are for code you got from someone else: each one runs on its own, sees only what it asked for, and cannot touch your files or run programs unless you allow it.
+
+A plugin is a folder in `plugins/` next to your config, with two files. `plugin.toml` says what it is and what it needs:
+
+```toml
+name = "reply-time"
+version = "1.0"
+description = "Counts unread mail older than a day."
+permissions = ["read", "interface", "commands"]
+```
+
+`main.lua` is the code. It uses the same `termail` table as a script. A function the plugin did not ask for stops with an error that names the missing permission, so a plugin can never quietly do more than its file says. Type `:plugins` to see what is installed and what each plugin may do. There is a complete example in [examples/plugins/reply-time](examples/plugins/reply-time).
+
+| Permission | Lets the plugin |
+| --- | --- |
+| `read` | read your messages: `selected`, `mails`, `state`, and the `open`, `new_mail` and `folder` events |
+| `keys` | add keys with `map` |
+| `commands` | add `:` commands |
+| `interface` | change the status line and list rows: `status`, `format` |
+| `notify` | show desktop notifications |
+| `organize` | `move`, `archive`, `trash` and `mark` messages |
+| `compose` | open the composer with `compose` |
+| `actions` | run any action or command with `run` |
+| `navigate` | `open` messages, show a `folder`, `search` |
+| `settings` | `set`, `get` and `theme` |
+| `send` | change or stop messages in `before_send` |
+| `network` | `termail.fetch` the sites listed in `network` |
+| `system` | use `io`, `os` and `require` like your own script |
+
+`notice`, `log`, `every` and the `startup` and `sync` events need no permission.
+
+Without `system`, a plugin has no `io`, no way to load other files, and from `os` only `time`, `date`, `clock` and `difftime`. It may use up to 64 MB of memory, and the same time limit as scripts applies.
+
+For the network, list the sites the plugin may reach. Only HTTPS works, and a request gives up after a second and a half because plugins run on the interface thread:
+
+```toml
+permissions = ["network", "interface"]
+network = ["api.github.com", "*.example.com"]
+```
+
+```lua
+local response = termail.fetch("https://api.github.com/zen")
+-- response.status is the HTTP status, response.body the text, up to 1 MB
+```
+
+Your own script can call `termail.fetch` too, for any site.
+
+To turn a plugin off without deleting it, name its folder in the config:
+
+```toml
+[plugins]
+disabled = ["reply-time"]
+```
+
+Plugins load again together with your script, with `:script reload` and whenever the config file changes.
+
 ## Limits
 
 A script call that runs longer than two seconds is stopped, and the bottom line says so. Calls made while drawing, from `status` and `format`, get 50 milliseconds. This keeps a stuck loop from freezing termail.

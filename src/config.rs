@@ -33,12 +33,21 @@ pub struct Config {
     pub compose: crate::settings::ComposeConfig,
     pub reader: crate::settings::ReaderConfig,
     pub patch: crate::patch::PatchConfig,
+    pub plugins: PluginsConfig,
     #[serde(skip)]
     pub(crate) active_account: Option<String>,
     #[serde(skip)]
     pub(crate) path: Option<PathBuf>,
     #[serde(skip)]
     pub(crate) snapshot: Option<String>,
+}
+
+/// The `[plugins]` table.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PluginsConfig {
+    /// Plugin folders to leave out.
+    pub disabled: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

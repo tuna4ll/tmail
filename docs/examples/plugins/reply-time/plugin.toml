@@ -1,0 +1,4 @@
+name = "reply-time"
+version = "1.0"
+description = "Shows how many unread messages are older than a day, and :overdue to find them."
+permissions = ["read", "interface", "commands", "navigate"]
