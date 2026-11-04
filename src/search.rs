@@ -43,8 +43,9 @@ fn key(mail: &Mail) -> String {
         .as_deref()
         .and_then(Path::file_name)
         .map(|name| {
-            let name = name.to_string_lossy();
-            name.split(':').next().unwrap_or_default().to_owned()
+            crate::storage::maildir_info(&name.to_string_lossy())
+                .0
+                .to_owned()
         })
         .unwrap_or_else(|| mail.id.clone())
         .replace('\n', " ")

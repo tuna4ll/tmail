@@ -678,6 +678,23 @@ pub(crate) mod tests {
         thread::JoinHandle,
     };
 
+    /// What the server of a refused connection may see: no handshake at all, or on
+    /// platforms that check the certificate after the handshake, a connection that
+    /// closes before a password or a login command arrives.
+    pub fn refused(stream: Option<native_tls::TlsStream<TcpStream>>) {
+        use std::io::Read;
+        let Some(mut stream) = stream else {
+            return;
+        };
+        let mut received = Vec::new();
+        let _ = stream.read_to_end(&mut received);
+        let text = String::from_utf8_lossy(&received).to_ascii_uppercase();
+        assert!(
+            !text.contains("LOGIN") && !text.contains("AUTH") && !text.contains("FAKE-PASSWORD"),
+            "credentials reached a server that was not trusted: {text}"
+        );
+    }
+
     pub struct Server {
         listener: TcpListener,
         acceptor: native_tls::TlsAcceptor,

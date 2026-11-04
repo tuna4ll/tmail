@@ -2206,6 +2206,7 @@ mod tests {
             1,
             "the read message is in the new folder on the server"
         );
+        let _ = session.close();
         // GreenMail starts with only an inbox; real servers come with a Sent folder.
         let _ = session.create("Sent");
         let _ = session.logout();
@@ -2458,11 +2459,11 @@ mod tests {
         let files = cache.files("");
         let one = files
             .iter()
-            .find(|name| name.contains(&format!("-{first}:")))
+            .find(|name| name.contains(&format!("-{first}{}", &storage::MAILDIR_SEPARATOR[..1])))
             .unwrap();
         let two = files
             .iter()
-            .find(|name| name.contains(&format!("-{second}:")))
+            .find(|name| name.contains(&format!("-{second}{}", &storage::MAILDIR_SEPARATOR[..1])))
             .unwrap();
         let source = MailboxPath(cache.0.clone());
         source.flag(one, 'S');
@@ -2519,7 +2520,10 @@ mod tests {
             .messages
             .retain(|message| message.uid != 1);
         let local = cache.files("");
-        let two = local.iter().find(|name| name.contains("-2:")).unwrap();
+        let two = local
+            .iter()
+            .find(|name| name.contains(&format!("-2{}", &storage::MAILDIR_SEPARATOR[..1])))
+            .unwrap();
         fs::remove_file(cache.0.join("cur").join(two)).unwrap();
         run(&remote, &tls, &cache);
         let state_now = state.lock().unwrap();
@@ -2540,10 +2544,14 @@ mod tests {
             .lock()
             .unwrap()
             .deliver("INBOX.Sent", &sent, &["\\Seen"]);
-        storage::write_new(&cache.0.join(".Sent/cur/123.local:2,S"), &sent).unwrap();
+        let sent_name = format!("123.local{}S", storage::MAILDIR_SEPARATOR);
+        storage::write_new(&cache.0.join(".Sent/cur").join(sent_name), &sent).unwrap();
         fs::create_dir_all(cache.0.join(".Drafts/cur")).unwrap();
         storage::write_new(
-            &cache.0.join(".Drafts/cur/124.local:2,"),
+            &cache
+                .0
+                .join(".Drafts/cur")
+                .join(format!("124.local{}", storage::MAILDIR_SEPARATOR)),
             &mail("draft@example.test", "draft"),
         )
         .unwrap();
@@ -2631,7 +2639,7 @@ mod tests {
     fn rejects_untrusted_tls_before_login() {
         let server = Server::new();
         let remote = server.remote();
-        let worker = server.spawn(|stream| assert!(stream.is_none()));
+        let worker = server.spawn(crate::remote::tests::refused);
         let error = connect_with_tls(
             &remote,
             "fake-password",

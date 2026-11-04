@@ -374,7 +374,7 @@ mod smtp_tests {
     fn rejects_untrusted_tls() {
         let server = Server::new();
         let transport = transport(&server, false);
-        let worker = server.spawn(|stream| assert!(stream.is_none()));
+        let worker = server.spawn(crate::remote::tests::refused);
         let error = smtp_with_transport(&transport, MESSAGE).unwrap_err();
         assert_eq!(error.kind, FailureKind::Configuration);
         worker.join().unwrap();

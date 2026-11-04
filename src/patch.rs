@@ -259,7 +259,10 @@ pub fn fetch_thread(archive: &str, id: &str, cache: &Path) -> Result<(PathBuf, u
     }
     for (index, message) in messages.iter().enumerate() {
         fs::write(
-            root.join("cur").join(format!("{index:05}.lore:2,S")),
+            root.join("cur").join(format!(
+                "{index:05}.lore{}S",
+                crate::storage::MAILDIR_SEPARATOR
+            )),
             message,
         )
         .map_err(|error| error.to_string())?;
