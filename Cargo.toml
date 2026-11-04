@@ -19,7 +19,7 @@ directories = "6.0.0"
 futures = "0.3.32"
 email_address = "0.2.9"
 mail-builder = "0.4.4"
-mail-parser = "0.11.9"
+mail-parser = "1.0.0"
 imap = { version = "=3.0.0-alpha.15", default-features = false, features = ["native-tls"] }
 imap-proto = "0.16"
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "native-tls"] }
