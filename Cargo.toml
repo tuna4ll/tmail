@@ -1,11 +1,14 @@
 [package]
 name = "termail"
-version = "0.2.0"
+version = "1.0.0"
 description = "A terminal email client with a spatial workspace for conversations."
 authors = ["Tuna Kılıç <tuna@tunakilic.com>"]
 license = "MIT"
 repository = "https://github.com/tuna4ll/termail"
 readme = "README.md"
+keywords = ["email", "mail", "imap", "tui", "terminal"]
+categories = ["command-line-utilities", "email"]
+exclude = ["docs/demo.gif", "sandbox/", ".github/", "install.sh", "install.ps1"]
 edition = "2024"
 
 [dependencies]
@@ -25,7 +28,6 @@ mime_guess = "2.0.5"
 opener = "0.8.5"
 rataflow = "0.1.0"
 ratatui = "0.30.2"
-ratatui-spinner = { git = "https://github.com/ratatui/ratatui-spinner", rev = "4489de894e1a29460b5976508b1a25499c3ba3b0" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10.9"

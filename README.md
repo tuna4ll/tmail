@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/tuna4ll/termail/main/install.sh | s
 irm https://raw.githubusercontent.com/tuna4ll/termail/main/install.ps1 | iex
 ```
 
-Both download the latest release for your system, check its checksum and put `termail` on your path: `~/.local/bin` on Linux and macOS, `%LOCALAPPDATA%\Programs\termail` on Windows. Set `TERMAIL_VERSION=v0.2.0` to install a specific release, or `TERMAIL_INSTALL_DIR` to choose the folder. Builds are available for Linux (x86_64, ARM64, glibc), macOS (Intel, Apple silicon) and Windows (x64), and are also attached to every [release](https://github.com/tuna4ll/termail/releases).
+Both download the latest release for your system, check its checksum and put `termail` on your path: `~/.local/bin` on Linux and macOS, `%LOCALAPPDATA%\Programs\termail` on Windows. Set `TERMAIL_VERSION=v1.0.0` to install a specific release, or `TERMAIL_INSTALL_DIR` to choose the folder. Builds are available for Linux (x86_64, ARM64, glibc), macOS (Intel, Apple silicon) and Windows (x64), and are also attached to every [release](https://github.com/tuna4ll/termail/releases).
 
 **From source**, with a recent Rust toolchain:
 
@@ -106,7 +106,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo fmt -- --check
 ```
 
-To publish a release, set the version in `Cargo.toml`, commit, then push a matching tag such as `v0.2.0`. GitHub Actions builds every platform and attaches the binaries and checksums to the release.
+To publish a release, set the version in `Cargo.toml`, commit, then push a matching tag such as `v1.0.0`. GitHub Actions builds every platform and attaches the binaries and checksums to the release.
 
 ## License
 

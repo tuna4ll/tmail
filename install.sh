@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/tuna4ll/termail/main/install.sh | sh
 #
-# TERMAIL_VERSION      a release such as v0.2.0 (default: the latest)
+# TERMAIL_VERSION      a release such as v1.0.0 (default: the latest)
 # TERMAIL_INSTALL_DIR  where the binary goes (default: ~/.local/bin)
 set -eu
 

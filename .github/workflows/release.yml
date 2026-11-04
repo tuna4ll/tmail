@@ -114,3 +114,27 @@ jobs:
             gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
               --title "termail $GITHUB_REF_NAME" --generate-notes --verify-tag
           fi
+
+  crates:
+    # Publishes to crates.io with Trusted Publishing, so no token is stored here.
+    # Turn it on with the repository variable PUBLISH_CRATE = true once the crate
+    # exists on crates.io and this workflow is listed as its trusted publisher.
+    name: crates.io
+    needs: build
+    if: vars.PUBLISH_CRATE == 'true'
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

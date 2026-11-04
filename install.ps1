@@ -2,7 +2,7 @@
 #
 #   irm https://raw.githubusercontent.com/tuna4ll/termail/main/install.ps1 | iex
 #
-# $env:TERMAIL_VERSION      a release such as v0.2.0 (default: the latest)
+# $env:TERMAIL_VERSION      a release such as v1.0.0 (default: the latest)
 # $env:TERMAIL_INSTALL_DIR  where the binary goes (default: %LOCALAPPDATA%\Programs\termail)
 
 # A script block of its own, so nothing leaks into the session that ran irm | iex.
