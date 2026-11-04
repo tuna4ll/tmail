@@ -87,3 +87,37 @@ fn handle_panic(info: &PanicHookInfo<'_>) {
         report(info);
     }
 }
+
+/// Asks the terminal which graphics protocol it speaks; half blocks work everywhere.
+///
+/// The query reads the keyboard on a thread of its own until the terminal answers.
+/// tmux drops the query unless `allow-passthrough` is on, and the leftover thread then
+/// swallows the first keys typed, so termail does not ask there. If a terminal still
+/// leaves it waiting, a status request it always answers lets the thread finish.
+pub fn graphics_picker() -> ratatui_image::picker::Picker {
+    use ratatui_image::picker::Picker;
+    if std::env::var_os("TMUX").is_some() && !tmux_passthrough() {
+        return Picker::halfblocks();
+    }
+    let started = std::time::Instant::now();
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    if started.elapsed() >= std::time::Duration::from_millis(1500) {
+        use std::io::Write;
+        let mut out = stdout();
+        let _ = out.write_all(b"\x1b[5n");
+        let _ = out.flush();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    picker
+}
+
+fn tmux_passthrough() -> bool {
+    std::process::Command::new("tmux")
+        .args(["show", "-gv", "allow-passthrough"])
+        .output()
+        .ok()
+        .is_some_and(|output| {
+            let value = String::from_utf8_lossy(&output.stdout);
+            matches!(value.trim(), "on" | "all")
+        })
+}

@@ -26,6 +26,8 @@ pub struct LoadReport {
     pub folders: Vec<String>,
     pub skipped: Vec<String>,
     pub attempted: usize,
+    /// The search index for `mails`, built or brought up to date while loading.
+    pub index: Option<crate::search::Index>,
 }
 
 #[derive(Debug)]
@@ -153,9 +155,13 @@ impl MailboxSource {
                 folders: Vec::new(),
                 skipped: Vec::new(),
                 attempted: 7,
+                index: None,
             }),
-            Self::Maildir(path) => load_maildir(path),
-            Self::Unified(accounts) => load_unified(accounts),
+            Self::Maildir(path) => load_maildir(path).map(|report| with_index(report, &[path])),
+            Self::Unified(accounts) => load_unified(accounts).map(|report| {
+                let paths: Vec<&PathBuf> = accounts.iter().map(|(_, path)| path).collect();
+                with_index(report, &paths)
+            }),
         }
     }
 
@@ -585,6 +591,7 @@ fn load_maildir(path: &Path) -> Result<LoadReport, LoadError> {
         folders,
         skipped,
         attempted,
+        index: None,
     })
 }
 
@@ -594,6 +601,7 @@ fn load_unified(accounts: &[(String, PathBuf)]) -> Result<LoadReport, LoadError>
         folders: Vec::new(),
         skipped: Vec::new(),
         attempted: 0,
+        index: None,
     };
     for (account, path) in accounts {
         let loaded = load_maildir(path)?;
@@ -677,6 +685,18 @@ pub(crate) fn cache_dir() -> Option<PathBuf> {
     ProjectDirs::from("com", "tunakilic", "termail").map(|dirs| dirs.cache_dir().to_path_buf())
 }
 
+/// Adds the saved search index, kept in the cache folder next to the message cache.
+fn with_index(mut report: LoadReport, roots: &[&PathBuf]) -> LoadReport {
+    let mut hasher = DefaultHasher::new();
+    roots.hash(&mut hasher);
+    if let Some(path) =
+        cache_dir().map(|dir| dir.join(format!("search-v2-{:016x}.idx", hasher.finish())))
+    {
+        report.index = Some(crate::search::Index::load_or_build(&path, &report.mails));
+    }
+    report
+}
+
 fn cache_path(maildir: &Path) -> Option<PathBuf> {
     let mut hasher = DefaultHasher::new();
     maildir.hash(&mut hasher);
@@ -695,7 +715,8 @@ pub fn prune_caches() {
             .ok()
             .and_then(|time| time.elapsed().ok())
             .is_some_and(|age| age > CACHE_LIFETIME);
-        if stale && entry.file_name().to_string_lossy().starts_with("maildir-") {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if stale && (name.starts_with("maildir-") || name.starts_with("search-")) {
             let _ = fs::remove_file(entry.path());
         }
     }

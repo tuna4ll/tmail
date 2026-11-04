@@ -145,14 +145,11 @@ async fn main() -> color_eyre::Result<()> {
         }
     }
 
+    let picker = terminal::graphics_picker();
     let terminal = terminal::enter()?;
 
     let mut app = App::new(source, config);
-    // Ask the terminal which graphics protocol it speaks; half blocks work everywhere.
-    app.picker = Some(
-        ratatui_image::picker::Picker::from_query_stdio()
-            .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks()),
-    );
+    app.picker = Some(picker);
     app.prepare_accounts(needs_setup, explicit_source);
     app.load_script();
     let result = app.run(terminal).await;

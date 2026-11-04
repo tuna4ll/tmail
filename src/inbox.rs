@@ -271,6 +271,9 @@ impl App {
                 let before: std::collections::HashSet<String> =
                     self.mails.iter().map(|mail| mail.id.clone()).collect();
                 self.mails = report.mails;
+                self.search_cache
+                    .get_mut()
+                    .set_index(report.index, self.mails.len());
                 self.folders = report.folders;
                 for mail in &mut self.mails {
                     if let Some(Ok((content, _))) = self.opened.get(&mail.id)

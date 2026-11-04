@@ -367,7 +367,7 @@ For keys that run your own code, use a script.
 
 ## Searching
 
-Type `/` in the inbox. Each word finds messages with a word that starts with it, in the sender, recipients, subject or body: `pay` finds "payment" and "Paying", but not "repay". Results appear as you type, even in very large mailboxes, because termail keeps an index of every word. You can also narrow it down:
+Type `/` in the inbox. Each word finds messages with a word that starts with it, in the sender, recipients, subject or body: `pay` finds "payment" and "Paying", but not "repay". Results appear as you type, even in very large mailboxes, because termail keeps an index of every word. The index is saved in termail's cache folder and updated in the background as mail arrives, so even the first search after a start is instant. You can also narrow it down:
 
 ```
 from:ada  to:team  subject:invoice  body:"exact words"

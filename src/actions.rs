@@ -174,6 +174,7 @@ impl App {
         };
         if let Some(mails) = undo.demo_mails {
             self.mails = mails;
+            self.search_cache.get_mut().set_index(None, 0);
             self.rebuild_mailbox(None);
             self.notice = Some(format!("Undid {}", undo.label.to_lowercase()));
             return;
