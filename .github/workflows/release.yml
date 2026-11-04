@@ -1,5 +1,7 @@
 name: Release
 
+# Push a tag such as v0.2.0 to build every platform and publish a release.
+# The tag must match the version in Cargo.toml.
 on:
   push:
     tags:
@@ -12,70 +14,103 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  check:
+    name: check version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag matches Cargo.toml
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+            exit 1
+          fi
+
   build:
     name: build ${{ matrix.target }}
+    needs: check
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # The oldest supported Ubuntu keeps the glibc requirement low.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
+            cross: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v7
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
-      - name: Test
-        run: cargo test --locked --target ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - name: Build
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --features static --target ${{ matrix.target }}
+      - name: Smoke test
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/termail"
+          "$bin" --version
+          "$bin" --help > /dev/null
       - name: Package
         shell: bash
         run: |
-          name="termail-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir "$name"
-          cp LICENSE README.md "$name/"
+          dir="target/${{ matrix.target }}/release"
+          mkdir -p dist
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "target/${{ matrix.target }}/release/termail.exe" "$name/"
-            7z a "$name.zip" "$name" >/dev/null
-            echo "ASSET=$name.zip" >> "$GITHUB_ENV"
+            asset="termail-${{ matrix.target }}.zip"
+            cp LICENSE README.md "$dir/"
+            (cd "$dir" && 7z a "../../../dist/$asset" termail.exe LICENSE README.md > /dev/null)
           else
-            cp "target/${{ matrix.target }}/release/termail" "$name/"
-            tar czf "$name.tar.gz" "$name"
-            echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+            asset="termail-${{ matrix.target }}.tar.gz"
+            tar -czf "dist/$asset" -C "$dir" termail -C "$GITHUB_WORKSPACE" LICENSE README.md
           fi
-      - name: Checksum
-        shell: bash
-        run: |
-          if command -v sha256sum >/dev/null; then sha256sum "$ASSET" > "$ASSET.sha256"; else shasum -a 256 "$ASSET" > "$ASSET.sha256"; fi
-      - uses: actions/upload-artifact@v4
+          cd dist
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+          cat "$asset.sha256"
+      - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.target }}
-          path: |
-            ${{ env.ASSET }}
-            ${{ env.ASSET }}.sha256
+          name: termail-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
 
   publish:
+    name: publish
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
+          path: dist
           merge-multiple: true
-      - name: Create release
+      - name: Checksums
+        run: |
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes termail-*
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "termail $GITHUB_REF_NAME" --generate-notes --verify-tag
+          fi

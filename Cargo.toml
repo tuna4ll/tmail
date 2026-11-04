@@ -4,6 +4,8 @@ version = "0.2.0"
 description = "A terminal email client with a spatial workspace for conversations."
 authors = ["Tuna Kılıç <tuna@tunakilic.com>"]
 license = "MIT"
+repository = "https://github.com/tuna4ll/termail"
+readme = "README.md"
 edition = "2024"
 
 [dependencies]
@@ -42,6 +44,11 @@ mlua = { version = "0.12", features = ["lua54", "vendored", "serialize"] }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy", "html"] }
 flate2 = "1"
+
+[features]
+# Builds OpenSSL and libdbus into the binary, so a release runs on any Linux
+# without matching library versions. No effect on macOS and Windows.
+static = ["native-tls/vendored", "keyring/vendored"]
 
 [dev-dependencies]
 rcgen = "0.14.5"
