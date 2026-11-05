@@ -484,10 +484,12 @@ impl App {
                     let _ = state.composer.remove_body();
                     // A draft autosave made for this message goes too; a draft that
                     // existed before keeps its last saved version.
-                    if state.autosave.created
-                        && let Some(path) = &state.composer.original_draft
-                    {
-                        let _ = fs::remove_file(path);
+                    if state.autosave.created {
+                        if let Some(path) = &state.composer.original_draft {
+                            let _ = fs::remove_file(path);
+                        }
+                        let (source, _) = self.compose_context(state.account);
+                        let _ = source.delete_drafts(state.composer.message_id());
                     }
                     self.notice = Some("Draft discarded".into());
                     self.reload();

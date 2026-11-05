@@ -412,9 +412,9 @@ impl App {
             return;
         };
         let (source, _) = self.compose_context(state.account);
-        let saved = match &composer.original_draft {
-            Some(path) if path.exists() => source.update_draft(path, &contents),
-            _ => source
+        let saved = match current_draft(&source, composer) {
+            Some(path) => source.update_draft(&path, &contents),
+            None => source
                 .save_draft(&contents)
                 .inspect(|_| state.autosave.created = true),
         };
@@ -504,10 +504,23 @@ impl App {
                     return;
                 }
             };
-            if let Some(original) = &state.composer.original_draft
-                && let Err(error) = fs::remove_file(original)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
+            // Sync may have renamed the draft since it was opened, so every copy is
+            // found by its Message-ID.
+            let removed = match &state.composer.original_draft {
+                Some(original) => match fs::remove_file(original) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        Err(error.to_string())
+                    }
+                    _ => Ok(()),
+                },
+                None => Ok(()),
+            }
+            .and_then(|()| {
+                source
+                    .delete_drafts(state.composer.message_id())
+                    .map_err(|error| error.to_string())
+            });
+            if let Err(error) = removed {
                 self.notice = Some(format!(
                     "Message queued but not sent: unable to remove the original draft: {error}. Retry from Outbox."
                 ));
@@ -517,9 +530,9 @@ impl App {
             self.mark_answered(state.composer.replying_to(), state.account);
             self.start_delivery(delivery);
         } else {
-            let saved = match &state.composer.original_draft {
-                Some(path) if path.exists() => source.update_draft(path, &contents),
-                _ => source.save_draft(&contents),
+            let saved = match current_draft(&source, &state.composer) {
+                Some(path) => source.update_draft(&path, &contents),
+                None => source.save_draft(&contents),
             };
             match saved {
                 Ok(_) => {
@@ -568,4 +581,19 @@ fn with_autocrypt(contents: Vec<u8>, crypto: &crypto::CryptoConfig) -> Vec<u8> {
     let mut message = header.into_bytes();
     message.extend_from_slice(&contents);
     message
+}
+
+/// The draft file of the message being written: the one it was opened or saved as, or,
+/// once sync has renamed that file, the draft with the same Message-ID.
+fn current_draft(source: &MailboxSource, composer: &draft::Composer) -> Option<PathBuf> {
+    composer
+        .original_draft
+        .clone()
+        .filter(|path| path.exists())
+        .or_else(|| {
+            source
+                .drafts_with_id(composer.message_id())
+                .into_iter()
+                .next()
+        })
 }

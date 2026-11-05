@@ -217,7 +217,43 @@ impl MailboxSource {
             });
         }
         fs::remove_file(path)?;
+        crate::imap_client::remember_deleted(root, path);
         crate::storage::sync_parent(path).map_err(Into::into)
+    }
+
+    /// The drafts holding `message_id`, wherever sync has renamed them since they were
+    /// saved.
+    pub fn drafts_with_id(&self, message_id: &str) -> Vec<PathBuf> {
+        let Self::Maildir(root) = self else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        for child in ["cur", "new"] {
+            let Ok(entries) = fs::read_dir(root.join(".Drafts").join(child)) else {
+                continue;
+            };
+            for path in entries.flatten().map(|entry| entry.path()) {
+                if header_message_id(&path).as_deref() == Some(message_id) {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// Deletes every draft of a message, here and through sync on the server.
+    pub fn delete_drafts(&self, message_id: &str) -> Result<(), LoadError> {
+        let Self::Maildir(root) = self else {
+            return Ok(());
+        };
+        for path in self.drafts_with_id(message_id) {
+            match fs::remove_file(&path) {
+                Ok(()) => crate::imap_client::remember_deleted(root, &path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     /// Moves a message to a folder by its display name, such as `INBOX` or `Work.Clients`.
@@ -1002,6 +1038,42 @@ fn format_address(address: &mail_parser::Addr<'_>) -> String {
     }
 }
 
+/// The Message-ID of a message file, without angle brackets, read from its headers.
+fn header_message_id(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(64 * 1024)
+        .read_to_end(&mut head)
+        .ok()?;
+    let text = String::from_utf8_lossy(&head);
+    let mut lines = text
+        .lines()
+        .take_while(|line| !line.trim().is_empty())
+        .peekable();
+    while let Some(line) = lines.next() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("message-id") {
+            continue;
+        }
+        let mut value = value.trim().to_owned();
+        // The ID may continue on the next line.
+        while let Some(next) = lines.next_if(|next| next.starts_with([' ', '\t'])) {
+            value.push_str(next.trim());
+        }
+        let id = value
+            .trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .trim();
+        return (!id.is_empty()).then(|| id.to_owned());
+    }
+    None
+}
+
 /// Whether the message has a real HTML part. mail-parser also lists plain text among
 /// the HTML bodies of a message without one, converted on request.
 pub(crate) fn has_html(message: &mail_parser::Message<'_>) -> bool {
@@ -1089,6 +1161,42 @@ mod tests {
     };
 
     use super::{MailboxSource, MessageParser, has_html, readable_html};
+
+    #[test]
+    fn drafts_are_found_by_message_id_after_sync_renamed_them() {
+        let root = std::env::temp_dir().join(crate::storage::unique_name("tmail-drafts"));
+        for folder in [
+            "cur",
+            "new",
+            "tmp",
+            ".Drafts/cur",
+            ".Drafts/new",
+            "termail-sync",
+        ] {
+            fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        let draft = |id: &str| {
+            format!("From: me@example.test\r\nMessage-ID:\r\n <{id}>\r\nSubject: x\r\n\r\nbody\r\n")
+        };
+        let renamed = root.join(".Drafts/cur").join(format!(
+            "termail-imap-abc-1-7{}DS",
+            crate::storage::MAILDIR_SEPARATOR
+        ));
+        fs::write(&renamed, draft("mine@example.test")).unwrap();
+        fs::write(root.join(".Drafts/new/other"), draft("other@example.test")).unwrap();
+        let source = MailboxSource::Maildir(root.clone());
+        assert_eq!(
+            source.drafts_with_id("mine@example.test"),
+            vec![renamed.clone()]
+        );
+        source.delete_drafts("mine@example.test").unwrap();
+        assert!(!renamed.exists());
+        assert!(root.join(".Drafts/new/other").exists(), "other drafts stay");
+        // Sync is told, so the server copy goes as well.
+        let recorded = fs::read_to_string(root.join("termail-sync/deleted")).unwrap();
+        assert_eq!(recorded.trim(), "termail-imap-abc-1-7");
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn plain_text_is_not_html() {

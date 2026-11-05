@@ -893,6 +893,36 @@ impl App {
 mod tests {
 
     #[tokio::test]
+    async fn a_message_to_yourself_opens_in_the_reader_not_the_composer() {
+        let mailbox = TestMailbox::new();
+        let message = "From: me@example.test\r\nTo: me@example.test\r\nMessage-ID: <self@example.test>\r\nSubject: note to self\r\n\r\nhello\r\n";
+        std::fs::write(mailbox.0.join("cur/self:2,"), message).unwrap();
+        // The draft it was written in, left behind after sending.
+        for folder in ["cur", "new", "tmp"] {
+            std::fs::create_dir_all(mailbox.0.join(".Drafts").join(folder)).unwrap();
+        }
+        std::fs::write(mailbox.0.join(".Drafts/cur/draft:2,D"), message).unwrap();
+        let mut app = mailbox.app();
+        app.mails = MailboxSource::Maildir(mailbox.0.clone())
+            .load()
+            .unwrap()
+            .mails;
+        app.active_folder = "INBOX".into();
+        app.rebuild_mailbox(None);
+        app.open_mail("self@example.test");
+        assert!(app.overlay.is_none(), "INBOX opens the message");
+        assert!(app.reader.is_some());
+        app.reader = None;
+        app.active_folder = "Drafts".into();
+        app.rebuild_mailbox(None);
+        app.open_mail("self@example.test");
+        assert!(
+            matches!(app.overlay, Some(Overlay::Compose(_))),
+            "Drafts resumes the draft"
+        );
+    }
+
+    #[tokio::test]
     async fn rejected_passwords_open_sign_in_and_stop_retrying() {
         let mailbox = TestMailbox::new();
         let remote = crate::remote::RemoteConfig {
