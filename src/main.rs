@@ -896,12 +896,18 @@ mod tests {
     async fn a_message_to_yourself_opens_in_the_reader_not_the_composer() {
         let mailbox = TestMailbox::new();
         let message = "From: me@example.test\r\nTo: me@example.test\r\nMessage-ID: <self@example.test>\r\nSubject: note to self\r\n\r\nhello\r\n";
-        std::fs::write(mailbox.0.join("cur/self:2,"), message).unwrap();
+        let named =
+            |base: &str, flags: &str| format!("{base}{}{flags}", crate::storage::MAILDIR_SEPARATOR);
+        std::fs::write(mailbox.0.join("cur").join(named("self", "")), message).unwrap();
         // The draft it was written in, left behind after sending.
         for folder in ["cur", "new", "tmp"] {
             std::fs::create_dir_all(mailbox.0.join(".Drafts").join(folder)).unwrap();
         }
-        std::fs::write(mailbox.0.join(".Drafts/cur/draft:2,D"), message).unwrap();
+        std::fs::write(
+            mailbox.0.join(".Drafts/cur").join(named("draft", "D")),
+            message,
+        )
+        .unwrap();
         let mut app = mailbox.app();
         app.mails = MailboxSource::Maildir(mailbox.0.clone())
             .load()
