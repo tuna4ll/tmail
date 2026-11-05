@@ -687,6 +687,72 @@ fn state_path(root: &Path) -> PathBuf {
     root.join("termail-sync").join("state.json")
 }
 
+/// Messages the user deleted for good in tmail, by Maildir name, until the next sync
+/// has deleted them on the server too.
+fn deleted_path(root: &Path) -> PathBuf {
+    root.join("termail-sync").join("deleted")
+}
+
+/// Records a permanent deletion made in tmail. Sync holds back deletions when most of
+/// a folder vanishes at once, in case the local copy was wiped by accident; a folder
+/// emptied on purpose, such as Trash, must still be emptied on the server.
+pub fn remember_deleted(root: &Path, file: &Path) {
+    use std::io::Write;
+    let Some(name) = file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return;
+    };
+    if !root.join("termail-sync").is_dir() {
+        return;
+    }
+    let base = storage::maildir_info(&name).0;
+    if let Ok(mut list) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(deleted_path(root))
+    {
+        let _ = writeln!(list, "{base}");
+    }
+}
+
+fn deleted_bases(root: &Path) -> std::collections::HashSet<String> {
+    fs::read_to_string(deleted_path(root))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Forgets recorded deletions that sync has carried out.
+fn prune_deleted(root: &Path, state: &SyncState) {
+    let path = deleted_path(root);
+    let Ok(text) = fs::read_to_string(&path) else {
+        return;
+    };
+    let pending: std::collections::HashSet<String> = state
+        .folders
+        .iter()
+        .flat_map(|(folder, entry)| {
+            entry
+                .messages
+                .keys()
+                .map(|uid| base_name(&state.server, folder, entry.validity, *uid))
+        })
+        .collect();
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| pending.contains(*line))
+        .collect();
+    if kept.is_empty() {
+        let _ = fs::remove_file(&path);
+    } else {
+        let _ = fs::write(&path, kept.join("\n") + "\n");
+    }
+}
+
 /// Loads the sync state, reporting whether this is the account's first sync.
 fn load_state(root: &Path, remote: &RemoteConfig) -> Result<(SyncState, bool), String> {
     let mut state: SyncState = match fs::read(state_path(root)) {
@@ -1004,6 +1070,7 @@ fn sync_session<T: Read + Write>(
         fetch_new(session, &mut state, folder, &context, &mut report)?;
         save_state(&state_path, &state)?;
     }
+    prune_deleted(root, &state);
     report.held = state.held.len();
     let mut summary = format!("Synced · {} new messages", report.downloaded);
     if report.changed + report.removed + report.uploaded > 0 {
@@ -1143,11 +1210,13 @@ fn reconcile<T: Read + Write>(
         mailbox.highest_mod_seq,
         capabilities.condstore,
     )?;
+    let deleted = deleted_bases(root);
     let missing = entry
         .messages
         .iter()
         .filter(|(uid, value)| {
             value.size > 0
+                && !deleted.contains(&base_name(&server, &folder.remote, validity, **uid))
                 && current.contains_key(uid)
                 && !index.contains_key(&base_name(&server, &folder.remote, validity, **uid))
         })
@@ -1176,7 +1245,7 @@ fn reconcile<T: Read + Write>(
             continue;
         };
         let Some(path) = local else {
-            if synced.size == 0 || mass_missing {
+            if synced.size == 0 || mass_missing && !deleted.contains(&base) {
                 forget.push(*uid);
                 continue;
             }
@@ -2547,6 +2616,38 @@ mod tests {
         assert_eq!(state_now.folders["INBOX.Trash"].messages.len(), 1);
         drop(state_now);
         assert_eq!(cache.files("").len(), 1);
+    }
+
+    #[test]
+    fn emptying_trash_in_tmail_empties_it_on_the_server() {
+        // More than the mass-deletion guard allows, all deleted on purpose.
+        let state = standard();
+        for index in 0..(MASS_DELETE_LIMIT + 5) {
+            state.lock().unwrap().deliver(
+                "INBOX.Trash",
+                &mail(&format!("trash-{index}@example.test"), "old"),
+                &["\\Seen"],
+            );
+        }
+        let (remote, tls) = start(&state);
+        let cache = Cache::new();
+        run(&remote, &tls, &cache);
+        let source = crate::mailbox::MailboxSource::Maildir(cache.0.clone());
+        for name in cache.files(".Trash") {
+            let mut message = crate::mail::Mail::new(&name, "a@example.test", "old", "", None);
+            message.source_path = Some(cache.0.join(".Trash/cur").join(&name));
+            source.delete(&message).unwrap();
+        }
+        run(&remote, &tls, &cache);
+        assert!(
+            state.lock().unwrap().folders["INBOX.Trash"]
+                .messages
+                .is_empty()
+        );
+        // Nothing comes back as new mail, and the record of deletions is cleared.
+        run(&remote, &tls, &cache);
+        assert!(cache.files(".Trash").is_empty());
+        assert!(!deleted_path(&cache.0).exists());
     }
 
     #[test]

@@ -66,10 +66,20 @@ impl App {
     }
 
     pub(crate) fn open_mail(&mut self, mail_id: &str) {
-        let mail = self
+        // A message sent to yourself, or a sent message with a draft left behind, has
+        // copies with the same Message-ID in several folders. The copy in the folder on
+        // screen decides: only a draft opened from Drafts goes back to the composer.
+        let copies: Vec<&Mail> = self
             .mails
             .iter()
-            .find(|mail| mail.id == mail_id && mail_folder(mail) == "Drafts");
+            .filter(|mail| mail.id == mail_id)
+            .collect();
+        let mail = copies
+            .iter()
+            .find(|mail| mail_folder(mail) == self.active_folder)
+            .or(copies.first())
+            .copied()
+            .filter(|mail| mail_folder(mail) == "Drafts");
         if mail.is_some() && !matches!(self.source, MailboxSource::Demo) {
             let path = mail.and_then(|mail| mail.source_path.clone());
             let account = mail.and_then(|mail| self.account_index(mail));

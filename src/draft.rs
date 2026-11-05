@@ -306,6 +306,11 @@ impl Composer {
         prepare_message(self.source()?.as_bytes(), base, false)
     }
 
+    /// The Message-ID the draft and the sent message share, without angle brackets.
+    pub fn message_id(&self) -> &str {
+        &self.message_id
+    }
+
     pub fn body_stats(&self) -> io::Result<(usize, usize)> {
         let body = fs::read_to_string(&self.body_path)?;
         Ok((body.lines().count(), body.chars().count()))
