@@ -283,7 +283,7 @@ impl Composer {
             parsed.body_text(0)
         }
         .unwrap_or_default();
-        fs::write(&composer.body_path, body.as_bytes())?;
+        fs::write(&composer.body_path, unix_lines(&body).as_bytes())?;
         composer.extract_attachments(&parsed)?;
         composer.original_draft = Some(path.to_path_buf());
         Ok(composer)
@@ -475,7 +475,7 @@ fn forwarded(mail: &Mail) -> String {
     format!(
         "---------- Forwarded message ----------\n{}\n\n{}\n",
         headers.join("\n"),
-        mail.body.trim_end()
+        unix_lines(&mail.body).trim_end()
     )
 }
 
@@ -691,11 +691,25 @@ fn prepare_message(
         .map_err(|error| DraftError(error.to_string()))
 }
 
+/// Splits a message at the first blank line, as RFC 5322 does. The headers tmail
+/// writes end with "\n\n", while a forwarded or reopened body may use "\r\n"; looking
+/// for one kind of blank line before the other would cut inside the body and read its
+/// lines as headers.
 fn split_message(message: &str) -> (&str, &str) {
-    message
-        .split_once("\r\n\r\n")
-        .or_else(|| message.split_once("\n\n"))
-        .unwrap_or((message, ""))
+    let mut start = 0;
+    for line in message.split_inclusive('\n') {
+        if line == "\n" || line == "\r\n" {
+            let headers = message[..start].trim_end_matches(['\r', '\n']);
+            return (headers, &message[start + line.len()..]);
+        }
+        start += line.len();
+    }
+    (message, "")
+}
+
+/// Text with "\n" line endings, the way the composer and editors expect a body.
+fn unix_lines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn header_values(headers: &str, name: &str) -> Vec<String> {
@@ -740,7 +754,7 @@ mod tests {
 
     use crate::mail::Mail;
 
-    use super::{Composer, MessageFormat, inspect, prepare};
+    use super::{Composer, MessageFormat, Start, inspect, prepare};
 
     #[test]
     fn keeps_headers_out_of_the_body_editor() {
@@ -785,6 +799,90 @@ mod tests {
         let message = String::from_utf8(composer.message(Path::new(".")).unwrap()).unwrap();
         assert!(message.contains("ada@example.com"), "{message}");
         composer.remove_body().unwrap();
+    }
+
+    #[test]
+    fn forwarding_mail_with_crlf_paragraphs_keeps_one_sender_and_its_recipients() {
+        // Real mail ends its lines with CRLF; a blank line inside the forwarded body
+        // must not be taken for the end of the headers.
+        let original = Mail::new(
+            "orig@example.test",
+            "Ada <ada@example.test>",
+            "Plans",
+            "Hi Sam,\r\n\r\nSee below.\r\n",
+            None,
+        )
+        .with_recipients(&["Sam <sam@example.test>"], &["Boss <boss@example.test>"]);
+        let mut composer = Composer::start(
+            Start::Forward,
+            Some(&original),
+            Some("Me <me@example.test>"),
+            None,
+        )
+        .unwrap();
+        composer.to = "friend@example.test".into();
+        let message = composer.message(Path::new(".")).unwrap();
+        let envelope = crate::message::envelope(&message).unwrap();
+        assert_eq!(envelope.from, "me@example.test");
+        assert_eq!(envelope.recipients, ["friend@example.test"]);
+        let parsed = mail_parser::MessageParser::default()
+            .parse(&message)
+            .unwrap();
+        let body = parsed.body_text(0).unwrap();
+        assert!(body.contains("From: Ada <ada@example.test>") && body.contains("Hi Sam,"));
+        composer.remove_body().unwrap();
+    }
+
+    #[test]
+    fn a_reopened_draft_is_sent_with_every_paragraph() {
+        let mut composer = Composer::new(None, Some("Me <me@example.test>"), None).unwrap();
+        composer.to = "friend@example.test".into();
+        fs::write(
+            &composer.body_path,
+            "First paragraph.\n\nSecond paragraph.\n",
+        )
+        .unwrap();
+        // Drafts are saved with CRLF, so the reopened body has CRLF blank lines.
+        let saved = composer.draft_message(Path::new(".")).unwrap();
+        composer.remove_body().unwrap();
+        let path = std::env::temp_dir().join(crate::storage::unique_name("reopened"));
+        fs::write(&path, &saved).unwrap();
+        let reopened = Composer::resume(&path).unwrap();
+        let sent = reopened.message(Path::new(".")).unwrap();
+        let parsed = mail_parser::MessageParser::default().parse(&sent).unwrap();
+        let body = parsed.body_text(0).unwrap();
+        assert!(
+            body.contains("First paragraph.") && body.contains("Second paragraph."),
+            "{body}"
+        );
+        reopened.remove_body().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn header_lines_in_a_body_stay_in_the_body() {
+        // A message written elsewhere can carry lines that look like tmail's own
+        // headers; only the lines above the first blank line are headers.
+        let base = std::env::temp_dir().join(crate::storage::unique_name("secret"));
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("secret.txt"), "private").unwrap();
+        let mut composer = Composer::new(None, Some("Me <me@example.test>"), None).unwrap();
+        composer.to = "friend@example.test".into();
+        fs::write(
+            &composer.body_path,
+            "Hello\r\nAttach: secret.txt\r\nBcc: spy@example.test\r\n\r\nBye\r\n",
+        )
+        .unwrap();
+        let message = composer.message(&base).unwrap();
+        let envelope = crate::message::envelope(&message).unwrap();
+        assert_eq!(envelope.recipients, ["friend@example.test"]);
+        let parsed = mail_parser::MessageParser::default()
+            .parse(&message)
+            .unwrap();
+        assert_eq!(parsed.attachments().count(), 0);
+        assert!(parsed.body_text(0).unwrap().contains("Attach: secret.txt"));
+        composer.remove_body().unwrap();
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
