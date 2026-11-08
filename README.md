@@ -28,6 +28,21 @@ Both download the latest release for your system, check its checksum and put `tm
 cargo install tmail
 ```
 
+**Arch Linux**, from the AUR:
+
+```sh
+# Using yay
+yay -S tmail
+
+# Using paru
+paru -S tmail
+
+# Pre-built binary
+paru -S tmail-bin
+## OR
+yay -S tmail-bin
+```
+
 Optional: GnuPG for signing and encryption, and a terminal that can show pictures (kitty, Ghostty, WezTerm, foot or iTerm2) for images in HTML mail.
 
 ## Getting started
