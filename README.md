@@ -62,6 +62,7 @@ tmail --demo
 | `j` `k` or arrows | Move through the list |
 | `enter` / `esc` | Open / close a message |
 | `tab` | Switch between the list and the conversation map |
+| `shift`+arrows or `alt`+`hjkl` | Pan the conversation map |
 | `c` `r` `A` `F` | Write, reply, reply all, forward |
 | `a` `d` | Archive, move to Trash |
 | `m` `s` | Mark read or unread, star |

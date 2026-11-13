@@ -156,6 +156,20 @@ impl App {
         if self.run_script_key(key) {
             return;
         }
+        // Vim-style panning for the workspace map. Taking alt+hjkl here, before
+        // the keymap rewrites custom bindings, leaves shift+J and shift+K for
+        // spam and contacts.
+        let vim_pan = key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(
+                key.code,
+                KeyCode::Char('h' | 'H' | 'j' | 'J' | 'k' | 'K' | 'l' | 'L')
+            );
+        if self.focus == Pane::Workspace && self.reader.is_none() && vim_pan {
+            if let Some(workspace) = &mut self.workspace {
+                workspace.handle_key(key);
+            }
+            return;
+        }
         let key = self.keymap.translate(key);
 
         match key.code {
@@ -415,7 +429,7 @@ impl App {
                 | KeyCode::Char('h' | 'j' | 'k' | 'l' | '+' | '=' | '-' | '_' | '0' | 'f' | 'c'),
             ) if self.focus == Pane::Workspace => {
                 if let Some(workspace) = &mut self.workspace {
-                    workspace.handle_key(key.code);
+                    workspace.handle_key(key);
                 }
                 self.sync_inbox_selection();
             }
