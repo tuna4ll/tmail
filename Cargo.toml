@@ -1,6 +1,6 @@
 [package]
 name = "tmail"
-version = "1.0.2"
+version = "1.0.3"
 description = "A terminal email client with a spatial workspace for conversations."
 authors = ["Tuna Kılıç <tuna@tunakilic.com>"]
 license = "MIT"
