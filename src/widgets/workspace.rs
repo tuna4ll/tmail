@@ -5,7 +5,7 @@ use crate::{
     theme,
     widgets::mail_card::MailCard,
 };
-use crossterm::event::{KeyCode, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use rataflow::{
     Background, BackgroundVariant, Edge, EdgeStyle, FitViewOptions, Flow, FlowEvent,
     HandlePosition, MiniMap, MiniMapPosition, Node, SelectionReveal, StepEdge, Sugiyama,
@@ -20,6 +20,8 @@ use ratatui::{
 const CARD_WIDTH: usize = 40;
 const CARD_HEIGHT: usize = 9;
 const HORIZONTAL_LAYOUT_WIDTH: u16 = 104;
+/// Columns the viewport moves for each shift+arrow press.
+const PAN_STEP: f64 = 6.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FlowLayout {
@@ -32,6 +34,27 @@ pub struct Workspace {
     mails: Vec<Mail>,
     selected_mail_id: String,
     layout: FlowLayout,
+}
+
+/// The viewport delta for a pan key, if this key pans.
+fn pan_offset(key: KeyEvent) -> Option<(f64, f64)> {
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    match key.code {
+        KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::ALT) => {
+            match character.to_ascii_lowercase() {
+                'h' => Some((PAN_STEP, 0.0)),
+                'l' => Some((-PAN_STEP, 0.0)),
+                'k' => Some((0.0, PAN_STEP)),
+                'j' => Some((0.0, -PAN_STEP)),
+                _ => None,
+            }
+        }
+        KeyCode::Left if shift => Some((PAN_STEP, 0.0)),
+        KeyCode::Right if shift => Some((-PAN_STEP, 0.0)),
+        KeyCode::Up if shift => Some((0.0, PAN_STEP)),
+        KeyCode::Down if shift => Some((0.0, -PAN_STEP)),
+        _ => None,
+    }
 }
 
 impl Workspace {
@@ -112,8 +135,15 @@ impl Workspace {
         clicked
     }
 
-    pub fn handle_key(&mut self, key: KeyCode) {
-        match key {
+    /// Moves the viewport with shift+arrows or alt+hjkl, so a large
+    /// conversation can be read without a mouse, and selects nodes with the
+    /// plain keys.
+    pub fn handle_key(&mut self, key: KeyEvent) {
+        if let Some((dx, dy)) = pan_offset(key) {
+            self.flow.pan(dx, dy);
+            return;
+        }
+        match key.code {
             KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
                 self.flow.select_prev_node();
             }
@@ -344,6 +374,83 @@ mod tests {
 
         assert!(flow.edge("reply-branch").is_some());
         assert!(flow.node("project-1").is_some());
+    }
+
+    #[test]
+    fn shifts_the_viewport_with_shift_arrows() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mails = demo_mails();
+        let mut workspace = Workspace::new(&mails, "project-3");
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| workspace.draw(frame, frame.area(), true))
+            .unwrap();
+
+        let before = workspace.flow.viewport.offset();
+        workspace.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        let after = workspace.flow.viewport.offset();
+
+        assert!(
+            after.x < before.x,
+            "shift+right should reveal the right side"
+        );
+        assert_eq!(workspace.selected_mail_id().as_deref(), Some("project-3"));
+    }
+
+    #[test]
+    fn pans_with_alt_hjkl() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mails = demo_mails();
+        let mut workspace = Workspace::new(&mails, "project-3");
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| workspace.draw(frame, frame.area(), true))
+            .unwrap();
+
+        let before = workspace.flow.viewport.offset();
+        workspace.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT));
+        let after_h = workspace.flow.viewport.offset();
+        workspace.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT));
+        let after_l = workspace.flow.viewport.offset();
+        // Alt+shift+h arrives as an uppercase letter on some terminals.
+        workspace.handle_key(KeyEvent::new(
+            KeyCode::Char('H'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ));
+        let after_shift = workspace.flow.viewport.offset();
+
+        assert!(after_h.x > before.x, "alt+h should reveal the left side");
+        assert!(after_l.x < after_h.x, "alt+l should reveal the right side");
+        assert!(
+            after_shift.x > after_l.x,
+            "alt+shift+h should still pan left"
+        );
+        assert_eq!(workspace.selected_mail_id().as_deref(), Some("project-3"));
+    }
+
+    #[test]
+    fn leaves_shift_j_and_shift_k_alone() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mails = demo_mails();
+        let mut workspace = Workspace::new(&mails, "project-3");
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| workspace.draw(frame, frame.area(), true))
+            .unwrap();
+
+        let before = workspace.flow.viewport.offset();
+        workspace.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT));
+        workspace.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT));
+        let after = workspace.flow.viewport.offset();
+
+        assert_eq!(after.x, before.x);
+        assert_eq!(after.y, before.y);
     }
 
     #[test]
