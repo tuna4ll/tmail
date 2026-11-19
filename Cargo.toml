@@ -33,7 +33,7 @@ serde_json = "1.0.151"
 sha2 = "0.10.9"
 tokio = { version = "1.52.3", features = ["full"] }
 toml = "1.1.6"
-toml_edit = "0.22.27"
+toml_edit = "0.25.15"
 zeroize = "1.9.1"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
